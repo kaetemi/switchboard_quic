@@ -5,6 +5,7 @@ Copyright (C) 2018-2026  Jan BOON (Kaetemi)
 Authors:
   Jan Boon <jan.boon@kaetemi.be>
   Claude Opus 5.5 <noreply@anthropic.com>
+  GPT-6 Astra <noreply@openai.com>
 */
 
 import 'dart:typed_data';
@@ -66,8 +67,8 @@ class RecordReader {
         }
         throw ProtocolException('FIN inside a record header');
       }
-      if (chunk.length > quicRecordHeaderSize - have) {
-        throw StateError('the provider returned more than was asked');
+      if (chunk.isEmpty || chunk.length > quicRecordHeaderSize - have) {
+        throw StateError('the provider returned an invalid read chunk');
       }
       _header.setRange(have, have + chunk.length, chunk);
       have += chunk.length;
@@ -88,24 +89,27 @@ class RecordReader {
     if (first.length == length) {
       return QuicRecord(command, first);
     }
-    final body = Uint8List(length)..setRange(0, first.length, first);
+    // Allocate in proportion to bytes received. A header and one body
+    // byte must not allocate an entire (possibly very large) limit.
+    final body = BytesBuilder()..add(first);
     var filled = first.length;
     while (filled < length) {
       final chunk = await _read(length - filled);
-      body.setRange(filled, filled + chunk.length, chunk);
+      body.add(chunk);
       filled += chunk.length;
     }
-    return QuicRecord(command, body);
+    return QuicRecord(command, body.takeBytes());
   }
 
   /// Up to [wanted] bytes of a body; FIN is a protocol error.
   Future<Uint8List> _read(int wanted) async {
-    final chunk = await stream.read(wanted < maxChunk ? wanted : maxChunk);
+    final max = wanted < maxChunk ? wanted : maxChunk;
+    final chunk = await stream.read(max);
     if (chunk == null) {
       throw ProtocolException('FIN inside a record');
     }
-    if (chunk.length > wanted) {
-      throw StateError('the provider returned more than was asked');
+    if (chunk.isEmpty || chunk.length > max) {
+      throw StateError('the provider returned an invalid read chunk');
     }
     return chunk;
   }

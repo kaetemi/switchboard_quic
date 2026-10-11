@@ -5,6 +5,7 @@ Copyright (C) 2018-2026  Jan BOON (Kaetemi)
 Authors:
   Jan Boon <jan.boon@kaetemi.be>
   Claude Opus 5.5 <noreply@anthropic.com>
+  GPT-6 Astra <noreply@openai.com>
 */
 
 import 'dart:async';
@@ -87,7 +88,7 @@ class QuicSwitchboardBinding extends SwitchboardBinding {
   /// `serverCertificateHashes`). True by default, as a browser does.
   final bool webTransportCertificateVerified;
 
-  /// Every connection this binding dialled, for diagnostics and tests.
+  /// The most recent 64 connections dialled, for diagnostics and tests.
   final List<QuicBindingConnection> dialled = [];
 
   @override
@@ -180,6 +181,7 @@ class QuicSwitchboardBinding extends SwitchboardBinding {
             : Status.of(StatusCode.unavailable, '$endpoint: $status'),
       );
     }
+    if (dialled.length == 64) dialled.removeAt(0);
     dialled.add(connection);
     return connection;
   }
@@ -258,7 +260,7 @@ class QuicSwitchboardListener {
   /// `IDENT` verified.
   final bool identifyInReturn;
 
-  /// Every connection accepted so far, for diagnostics and tests.
+  /// The most recent 64 accepted connections, for diagnostics and tests.
   final List<QuicBindingConnection> accepted = [];
 
   StreamSubscription<QuicSession>? _subscription;
@@ -270,7 +272,7 @@ class QuicSwitchboardListener {
 
   Future<void> _accept(QuicSession session) async {
     if (_closed) {
-      unawaited(session.close(StatusCode.goingAway.code, 'not accepting'));
+      session.close(StatusCode.goingAway.code, 'not accepting').ignore();
       return;
     }
     final QuicBindingConnection connection;
@@ -286,14 +288,20 @@ class QuicSwitchboardListener {
       );
     } on Object catch (e) {
       _log.warning('cannot start a connection from ${session.remote}: $e');
-      unawaited(session.close(StatusCode.internal.code, 'internal error'));
+      session.close(StatusCode.internal.code, 'internal error').ignore();
       return;
     }
+    if (_closed) {
+      await connection.close();
+      return;
+    }
+    if (accepted.length == 64) accepted.removeAt(0);
     accepted.add(connection);
     try {
       await node.adopt(connection, policy: policy, remote: session.remote);
     } on Object catch (e) {
       _log.fine('connection from ${session.remote} not adopted: $e');
+      await connection.close();
       return;
     }
     if (identifyInReturn && node.credential != null) {

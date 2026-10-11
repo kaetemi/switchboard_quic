@@ -5,6 +5,7 @@ Copyright (C) 2018-2026  Jan BOON (Kaetemi)
 Authors:
   Jan Boon <jan.boon@kaetemi.be>
   Claude Opus 5.5 <noreply@anthropic.com>
+  GPT-6 Astra <noreply@openai.com>
 */
 
 import 'package:meta/meta.dart';
@@ -44,7 +45,7 @@ class QuicIdentityRules {
   /// credential, [hasCredential], or verifies the peer's,
   /// [verifiesCredentials]), it neither sends nor accepts nonce-bound
   /// `IDENT`s and closes the connection with `UNAUTHENTICATED` when a
-  /// `HELLO` lacks `EXPORTER`; with a credential it also waits for the
+  /// `HELLO` lacks `EXPORTER`; while identity is in use it waits for the
   /// acceptor's exporter-bound `IDENT` naming it before using the
   /// connection; and a bearer credential goes only to an authenticated
   /// end. A verified certificate authenticates the acceptor, and nothing
@@ -60,7 +61,7 @@ class QuicIdentityRules {
     final inUse = hasCredential || verifiesCredentials;
     return QuicIdentityRules(
       requireExporterBinding: inUse,
-      awaitPeerIdentity: hasCredential,
+      awaitPeerIdentity: inUse,
       bearerOnlyToAuthenticatedPeer: true,
     );
   }
@@ -171,6 +172,7 @@ class QuicBindingOptions {
     this.openStreamTimeout = const Duration(seconds: 10),
     this.controlOutputMark = 64 * 1024,
     this.maxHeldControlMessages = 1024,
+    this.maxPendingStreams = 128,
     this.writeBatchBytes = 64 * 1024,
   });
 
@@ -185,8 +187,8 @@ class QuicBindingOptions {
   /// The identification rules; see [QuicIdentityRules].
   final QuicIdentityRules identity;
 
-  /// Acceptor: how long after the connection started it waits for the
-  /// control stream before closing the connection with `PROTOCOL_ERROR`.
+  /// How long after the connection started either side waits for the
+  /// peer's first HELLO before closing the connection with `PROTOCOL_ERROR`.
   /// Null, the default: `MuxOptions.keepAliveInterval`, or 10 s without
   /// keep-alive. [Duration.zero] waits without bound.
   final Duration? controlStreamTimeout;
@@ -207,6 +209,11 @@ class QuicBindingOptions {
   /// the connection ends with `RESOURCE_EXHAUSTED`. Default 1024.
   final int maxHeldControlMessages;
 
+  /// Streams whose first OPEN record is still being read. Further streams
+  /// are stopped and reset with RESOURCE_EXHAUSTED. Their reads are also
+  /// bounded by [openStreamTimeout], as are outgoing stream opens.
+  final int maxPendingStreams;
+
   /// Records waiting on a stream are handed to the provider together, in
   /// one write of up to this many bytes (a record larger than it goes
   /// alone). Default 64 KiB.
@@ -220,6 +227,7 @@ class QuicBindingOptions {
     Duration? openStreamTimeout,
     int? controlOutputMark,
     int? maxHeldControlMessages,
+    int? maxPendingStreams,
     int? writeBatchBytes,
   }) => QuicBindingOptions(
     recordLimit: recordLimit ?? this.recordLimit,
@@ -229,6 +237,7 @@ class QuicBindingOptions {
     controlOutputMark: controlOutputMark ?? this.controlOutputMark,
     maxHeldControlMessages:
         maxHeldControlMessages ?? this.maxHeldControlMessages,
+    maxPendingStreams: maxPendingStreams ?? this.maxPendingStreams,
     writeBatchBytes: writeBatchBytes ?? this.writeBatchBytes,
   );
 }

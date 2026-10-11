@@ -5,6 +5,7 @@ Copyright (C) 2018-2026  Jan BOON (Kaetemi)
 Authors:
   Jan Boon <jan.boon@kaetemi.be>
   Claude Opus 5.5 <noreply@anthropic.com>
+  GPT-6 Astra <noreply@openai.com>
 */
 
 // QuicBindingConnection and QuicChannel over the fake provider: channel
@@ -22,6 +23,7 @@ import 'package:test/test.dart';
 
 import 'fake_provider.dart';
 import 'harness.dart';
+import 'review_cases.dart';
 
 /// Every channel of [connection] delivered to [into].
 void collect(QuicBindingConnection connection, List<MuxChannel> into) =>
@@ -59,6 +61,7 @@ class HeldVerifier extends CredentialVerifier {
 }
 
 void main() {
+  reviewCases();
   setUpAll(() async {
     authority = await CredentialIssuer.ed25519FromSeed(
       Name('auth1'),
@@ -680,6 +683,11 @@ void main() {
       await until(() => atBinding.length == 2);
       unawaited(connection.goAway());
       await raw.nextControlOf(MuxControlType.goAway.code);
+      final bulkPending = Completer<void>();
+      connection.retainForDrain(2, bulkPending.future);
+      addTearDown(() {
+        if (!bulkPending.isCompleted) bulkPending.complete();
+      });
       // The parent's close overtakes its bulk stream.
       await parent.write(encodeCloseRecord(Status.ok));
       await parent.finish();

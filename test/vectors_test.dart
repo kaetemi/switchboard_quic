@@ -5,6 +5,7 @@ Copyright (C) 2018-2026  Jan BOON (Kaetemi)
 Authors:
   Jan Boon <jan.boon@kaetemi.be>
   Claude Opus 5.5 <noreply@anthropic.com>
+  GPT-6 Astra <noreply@openai.com>
 */
 
 // The test vectors of the wiki page "Polyverse Switchboard QUIC and
@@ -80,6 +81,9 @@ class _ScriptedStream implements QuicStream {
 
   @override
   Future<int?> get stopped => Completer<int?>().future;
+
+  @override
+  Future<int?> get resetReceived => Completer<int?>().future;
 }
 
 Future<QuicRecord?> decode(String bytes, {int limit = 1 << 20}) =>

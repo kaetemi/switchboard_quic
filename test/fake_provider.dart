@@ -5,6 +5,7 @@ Copyright (C) 2018-2026  Jan BOON (Kaetemi)
 Authors:
   Jan Boon <jan.boon@kaetemi.be>
   Claude Opus 5.5 <noreply@anthropic.com>
+  GPT-6 Astra <noreply@openai.com>
 */
 
 // An in-memory stream provider for the tests of the binding: sessions with
@@ -182,6 +183,8 @@ class FakeQuicListener implements QuicListener {
   final FakeQuicNetwork network;
   final FakeEndConfig config;
   final StreamController<QuicSession> _sessions = StreamController();
+
+  void acceptSession(QuicSession session) => _sessions.add(session);
   bool _closed = false;
 
   @override
@@ -244,6 +247,27 @@ class FakeQuicSession implements QuicSession {
 
   late final FakeQuicSession peer;
   late final StreamController<QuicStream> _incoming;
+  final Completer<void> _draining = Completer<void>();
+  final StreamController<QuicReceiveStream> _unidirectional =
+      StreamController();
+
+  @override
+  Future<void> get draining => _draining.future;
+
+  @override
+  Stream<QuicReceiveStream> get incomingUnidirectionalStreams =>
+      _unidirectional.stream;
+
+  void drainPeer() {
+    if (!peer._draining.isCompleted) peer._draining.complete();
+  }
+
+  FakeReceiveStream openUnidirectional() {
+    final stream = FakeReceiveStream();
+    peer._unidirectional.add(stream);
+    return stream;
+  }
+
   final Completer<QuicSessionEnd> _done = Completer<QuicSessionEnd>();
   final Queue<Completer<void>> _streamWaiters = Queue<Completer<void>>();
   final Set<_Direction> _blocked = {};
@@ -286,6 +310,11 @@ class FakeQuicSession implements QuicSession {
 
   /// The labels the exporter was asked for.
   final List<String> exporterLabels = [];
+  int exporterXor = 0;
+  Object? exporterFailure;
+  Completer<void>? exporterGate;
+  Object? openFailure;
+  void failIncoming(Object error) => _incoming.addError(error);
 
   @override
   Future<Uint8List?> exportKeyingMaterial(
@@ -294,6 +323,9 @@ class FakeQuicSession implements QuicSession {
     int length,
   ) async {
     exporterLabels.add(label);
+    await exporterGate?.future;
+    final failure = exporterFailure;
+    if (failure != null) throw failure;
     if (!config.exporter) {
       return null;
     }
@@ -305,13 +337,19 @@ class FakeQuicSession implements QuicSession {
     return Uint8List.fromList(
       List.generate(
         length,
-        (i) => _secret[i % _secret.length] ^ ((h >> ((i % 4) * 8)) & 0xFF) ^ i,
+        (i) =>
+            _secret[i % _secret.length] ^
+            ((h >> ((i % 4) * 8)) & 0xFF) ^
+            i ^
+            exporterXor,
       ),
     );
   }
 
   @override
   Future<QuicStream> openStream() async {
+    final failure = openFailure;
+    if (failure != null) throw failure;
     if (ended) {
       throw const QuicException(
         QuicExceptionKind.sessionEnded,
@@ -417,6 +455,7 @@ class FakeQuicSession implements QuicSession {
       waiter.complete();
     }
     unawaited(_incoming.close());
+    unawaited(_unidirectional.close());
   }
 
   @override
@@ -450,6 +489,7 @@ class _Direction {
     this.shared,
   ) : window = to.config.streamWindow {
     stopped.future.ignore();
+    resetReceived.future.ignore();
   }
 
   final _Shared shared;
@@ -478,6 +518,7 @@ class _Direction {
   int? stopCode;
   bool stopReceived = false;
   final Completer<int?> stopped = Completer<int?>();
+  final Completer<int?> resetReceived = Completer<int?>();
 
   // Receiver side.
   final Queue<Uint8List> buffer = Queue<Uint8List>();
@@ -630,7 +671,7 @@ class _Direction {
     finish.complete();
   }
 
-  void resetDirection(int code) {
+  void resetDirection(int? code) {
     if (resetSent || from.ended) {
       return;
     }
@@ -673,13 +714,14 @@ class _Direction {
     _checkClosed();
   }
 
-  void _receiveReset(int code) {
+  void _receiveReset(int? code) {
     to._announce(receiver);
     if (reset) {
       return;
     }
     reset = true;
     resetCode = code;
+    if (!resetReceived.isCompleted) resetReceived.complete(code);
     var dropped = 0;
     for (final chunk in buffer) {
       dropped += chunk.length;
@@ -762,7 +804,7 @@ class _Direction {
   /// This side's read direction ends at once: a pending read and every
   /// later one fail with a reset of [code]; STOP_SENDING goes to the
   /// sender, whose confirming reset is not observable here.
-  void stop(int code) {
+  void stop(int? code) {
     if (stopSent || reset || finRead || to.ended) {
       return;
     }
@@ -786,7 +828,7 @@ class _Direction {
   }
 
   /// On the sender's side: the peer asked it to stop.
-  void _receiveStop(int code) {
+  void _receiveStop(int? code) {
     if (stopReceived) {
       return;
     }
@@ -797,7 +839,11 @@ class _Direction {
     _finish = null;
     finish?.completeError(QuicStreamStopped(code));
     if (!stopped.isCompleted) {
-      stopped.complete(code);
+      if (code == null) {
+        stopped.completeError(const QuicStreamStopped(null));
+      } else {
+        stopped.complete(code);
+      }
     }
     // The stack answers with a reset of the same code, unless everything
     // arrived already.
@@ -833,6 +879,7 @@ class _Direction {
 
   /// The receiver's session ended: its pending read fails.
   void receiverEnded() {
+    if (!resetReceived.isCompleted) resetReceived.completeError(_ended);
     final read = _read;
     _read = null;
     read?.completeError(_ended);
@@ -864,11 +911,24 @@ class FakeQuicStream implements QuicStream {
   @override
   Future<Uint8List?> read(int max) => _in!.read(max);
 
-  @override
-  Future<void> write(Uint8List bytes) => _out!.write(bytes);
+  Object? writeFailure;
+  Object? finishFailure;
+
+  void resetWithoutCode() => _out!.resetDirection(null);
+  void stopWithoutCode() => _in!.stop(null);
+  void failRead(Object error) {
+    final reading = _in!._read;
+    _in!._read = null;
+    reading?.completeError(error);
+  }
 
   @override
-  Future<void> finish() => _out!.finish();
+  Future<void> write(Uint8List bytes) =>
+      writeFailure == null ? _out!.write(bytes) : Future.error(writeFailure!);
+
+  @override
+  Future<void> finish() =>
+      finishFailure == null ? _out!.finish() : Future.error(finishFailure!);
 
   @override
   void reset(int code) {
@@ -887,6 +947,9 @@ class FakeQuicStream implements QuicStream {
 
   @override
   Future<int?> get stopped => _out!.stopped.future;
+
+  @override
+  Future<int?> get resetReceived => _in!.resetReceived.future;
 
   void _sessionEnded() {
     _out?.senderEnded();
@@ -922,4 +985,13 @@ String _truncate(String text, int max) {
     cut--;
   }
   return utf8.decode(bytes.sublist(0, cut));
+}
+
+/// A peer-created unidirectional receive direction.
+class FakeReceiveStream implements QuicReceiveStream {
+  final Completer<int> stopped = Completer<int>();
+  @override
+  void stop(int code) {
+    if (!stopped.isCompleted) stopped.complete(code);
+  }
 }

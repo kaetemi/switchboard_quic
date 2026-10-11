@@ -6,6 +6,7 @@ Authors:
   Jan Boon <jan.boon@kaetemi.be>
   Claude Fable 5.1 <noreply@anthropic.com>
   Claude Opus 5.5 <noreply@anthropic.com>
+  GPT-6 Astra <noreply@openai.com>
 */
 
 /// The stream provider contract of the QUIC and WebTransport binding.
@@ -77,6 +78,15 @@ abstract interface class QuicSession {
   /// order is guaranteed between streams).
   Stream<QuicStream> get incomingStreams;
 
+  /// Peer-created unidirectional streams, for applications to accept or
+  /// refuse by stopping them. Never includes HTTP/3's own control streams.
+  Stream<QuicReceiveStream> get incomingUnidirectionalStreams;
+
+  /// Completes when the peer or underlying HTTP/3 connection starts
+  /// draining this session. Never fails; remains pending on raw QUIC and
+  /// when no draining signal arrived before [done].
+  Future<void> get draining;
+
   /// How many streams opened by the peer this side accepts at once (the
   /// `MAX_STREAMS` grant); null where the stack decides (browsers).
   int? get maxIncomingStreams;
@@ -113,6 +123,13 @@ abstract interface class QuicSession {
   Future<QuicSessionEnd> get done;
 }
 
+/// The receive direction of a peer-created unidirectional stream.
+abstract interface class QuicReceiveStream {
+  /// Stops this direction with the application's error code, discarding
+  /// unread bytes. Idempotent, including after the session ended.
+  void stop(int code);
+}
+
 /// One bidirectional stream.
 abstract interface class QuicStream {
   /// Reads the next chunk, at least one and at most [max] bytes; null at the
@@ -120,6 +137,13 @@ abstract interface class QuicStream {
   /// when the peer reset its direction (the code is the status), and again
   /// on every read after it. Only one read may be pending at a time.
   Future<Uint8List?> read(int max);
+
+  /// Completes on the peer's RESET_STREAM, even while no [read] is
+  /// pending, with its application code (null when none was delivered).
+  /// A paused reader must still be able to observe an abort. FIN does not
+  /// complete this future: unread bytes may contain an application close.
+  /// Fails with `sessionEnded` when the session ends first.
+  Future<int?> get resetReceived;
 
   /// Writes [bytes]; completes once the stack has accepted them (they are
   /// copied; the buffer must not change until then, and may be reused
@@ -158,7 +182,9 @@ abstract interface class QuicStream {
 
   /// Completes when the peer's `STOP_SENDING` arrived (with its code) or
   /// when every byte of this side's direction was acknowledged after
-  /// [finish] (null); with null at once when this side [reset] its
+  /// [finish] (null). A STOP_SENDING without an application code fails
+  /// with [QuicStreamStopped] whose code is null, distinguishing it from
+  /// acknowledgement. With null at once when this side [reset] its
   /// direction. A provider answers a `STOP_SENDING` itself by resetting its
   /// direction with the same code (RFC 9000 section 3.5).
   Future<int?> get stopped;

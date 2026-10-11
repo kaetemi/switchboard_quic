@@ -5,6 +5,7 @@ Copyright (C) 2018-2026  Jan BOON (Kaetemi)
 Authors:
   Jan Boon <jan.boon@kaetemi.be>
   Claude Opus 5.5 <noreply@anthropic.com>
+  GPT-6 Astra <noreply@openai.com>
 */
 
 /// The connection and channel of the QUIC and WebTransport binding (wiki
@@ -117,21 +118,48 @@ class QuicBindingConnection extends BindingConnection {
         'must be $quicDefaultRecordLimit to $quicMaxRecordLength',
       );
     }
+    if (quicOptions.maxPendingStreams < 1 ||
+        quicOptions.controlOutputMark < 1 ||
+        quicOptions.writeBatchBytes < 1 ||
+        quicOptions.maxHeldControlMessages < 1 ||
+        options.initialWindow < 1 ||
+        options.initialWindow > 0xFFFFFFFF ||
+        options.bulkChunkSize < 1) {
+      throw ArgumentError('binding limits and windows must be positive');
+    }
     Uint8List? exporter;
+    Object? exporterFailure;
     try {
-      exporter = await session.exportKeyingMaterial(
-        isWebTransport ? webTransportIdentLabel : rawQuicExporterLabel,
-        Uint8List(0),
-        quicExporterLength,
-      );
+      final exporting = Future.any<Uint8List?>([
+        session.exportKeyingMaterial(
+          isWebTransport ? webTransportIdentLabel : rawQuicExporterLabel,
+          Uint8List(0),
+          quicExporterLength,
+        ),
+        session.done.then(
+          (_) => throw const QuicException(
+            QuicExceptionKind.sessionEnded,
+            'session ended during export',
+          ),
+        ),
+      ]);
+      final timeout =
+          quicOptions.controlStreamTimeout ??
+          options.keepAliveInterval ??
+          const Duration(seconds: 10);
+      exporter = await (timeout > Duration.zero
+          ? exporting.timeout(timeout)
+          : exporting);
     } on Object catch (e) {
-      _log.fine('no exporter from the session: $e');
+      exporterFailure = e;
+      _log.fine('session exporter failed: $e');
     }
     if (exporter != null && exporter.length != quicExporterLength) {
       _log.warning(
         'the session exported ${exporter.length} bytes instead of '
-        '$quicExporterLength; not binding identification to it',
+        '$quicExporterLength',
       );
+      exporterFailure = StateError('invalid exporter length');
       exporter = null;
     }
     final connection = QuicBindingConnection._(
@@ -142,6 +170,11 @@ class QuicBindingConnection extends BindingConnection {
       isWebTransport: isWebTransport,
     )..localIdentity = localIdentity;
     connection._begin();
+    if (exporterFailure != null && !isSessionEnd(exporterFailure)) {
+      connection._fail(
+        Status.of(StatusCode.internal, 'session exporter failed'),
+      );
+    }
     await connection._ready.future;
     return connection;
   }
@@ -174,16 +207,12 @@ class QuicBindingConnection extends BindingConnection {
   final Queue<QuicChannel> _undelivered = Queue<QuicChannel>();
   final Set<QuicChannel> _payloads = {};
   int _openPayloadBytes = 0;
-  // The highest id of the peer's parity this side admitted, and, once it
-  // sent GOAWAY, the marks under which a `_bulk` stream continues work
-  // admitted before it.
-  int _highestPeerId = -1;
-  int _goAwayPeerMark = -1;
-  int _goAwayOwnMark = -1;
   int _nextId;
   bool _incomingScheduled = false;
   bool _incomingCancelled = false;
   StreamSubscription<QuicStream>? _streams;
+  final Set<QuicStream> _pendingStreams = {};
+  StreamSubscription<QuicReceiveStream>? _unidirectional;
 
   // The control stream.
   QuicStream? _control;
@@ -289,6 +318,9 @@ class QuicBindingConnection extends BindingConnection {
   @override
   int get openPayloadBytes => _openPayloadBytes;
 
+  @override
+  int get heldOutputBytes => _closing ? 0 : _controlQueued;
+
   /// What the channels hold for their listeners, plus the open payloads
   /// held for the channels the peer opened.
   @override
@@ -341,8 +373,34 @@ class QuicBindingConnection extends BindingConnection {
         .ignore();
     _streams = session.incomingStreams.listen(
       _onIncomingStream,
-      onError: (Object e) => _log.fine('$this: incoming streams: $e'),
+      onError: (Object e) {
+        if (!isSessionEnd(e)) _lost('incoming streams failed');
+      },
     );
+    session.draining.then((_) {
+      if (!_closing) _onPeerGoAway(Status.of(StatusCode.goingAway));
+    }).ignore();
+    _unidirectional = session.incomingUnidirectionalStreams.listen(
+      (stream) => _guarded(() => stream.stop(StatusCode.unsupported.code)),
+      onError: (Object e) {
+        if (!isSessionEnd(e)) _lost('incoming unidirectional streams failed');
+      },
+    );
+    final timeout =
+        quicOptions.controlStreamTimeout ??
+        options.keepAliveInterval ??
+        const Duration(seconds: 10);
+    if (timeout > Duration.zero) {
+      _controlTimer = Timer(timeout, () {
+        if (_peerHello == null && !_closing) {
+          _protocolError('no control HELLO within $timeout');
+        }
+      });
+    }
+    if (session.protocol != null && session.protocol != 'switchboard') {
+      _fail(Status.of(StatusCode.unsupported, 'unsupported session protocol'));
+      return;
+    }
     final rules = quicOptions.identity;
     if (isInitiator) {
       if (rules.requireExporterBinding && _exporter == null) {
@@ -362,20 +420,11 @@ class QuicBindingConnection extends BindingConnection {
         _fail(_unauthenticated);
         return;
       }
-      unawaited(_openControl());
+      _openControl().catchError((Object e) {
+        if (!isSessionEnd(e)) _lost('control stream setup failed');
+      }).ignore();
     } else {
       _ready.complete();
-      final timeout =
-          quicOptions.controlStreamTimeout ??
-          options.keepAliveInterval ??
-          const Duration(seconds: 10);
-      if (timeout > Duration.zero) {
-        _controlTimer = Timer(timeout, () {
-          if (_control == null && !_closing) {
-            _protocolError('no control stream within $timeout');
-          }
-        });
-      }
     }
     _startKeepAlive();
   }
@@ -406,7 +455,7 @@ class QuicBindingConnection extends BindingConnection {
       stream = await session.openStream();
     } on Object catch (e) {
       _log.fine('$this: cannot open the control stream: $e');
-      _lost('cannot open the control stream');
+      if (!isSessionEnd(e)) _lost('cannot open the control stream');
       if (!_ready.isCompleted) {
         _ready.complete();
       }
@@ -436,8 +485,6 @@ class QuicBindingConnection extends BindingConnection {
 
   /// Acceptor: the stream whose OPEN record names channel 0 arrived.
   void _onControlStream(QuicStream stream, RecordReader reader) {
-    _controlTimer?.cancel();
-    _controlTimer = null;
     stream.priority = quicControlPriority;
     final hello = encodeDataRecord(_hello().toControlMessage().encode());
     _controlQueue.addFirst(hello);
@@ -448,12 +495,35 @@ class QuicBindingConnection extends BindingConnection {
   void _attachControl(QuicStream stream, RecordReader reader) {
     _control = stream;
     _controlReader = reader;
-    stream.stopped.then((code) {
-      // Never finished, so only a STOP_SENDING completes it with a code.
-      if (code != null && !_closing) {
-        _protocolError('STOP_SENDING on the control stream');
-      }
-    }, onError: (Object _) {}).ignore();
+    stream.resetReceived
+        .then(
+          (_) {
+            if (!_closing) _protocolError('the control stream was reset');
+          },
+          onError: (Object e) {
+            if (!isSessionEnd(e) && !_closing) {
+              _lost('control reset notification failed');
+            }
+          },
+        )
+        .ignore();
+    stream.stopped
+        .then(
+          (code) {
+            // Never finished, so only a STOP_SENDING completes it with a code.
+            if (code != null && !_closing) {
+              _protocolError('STOP_SENDING on the control stream');
+            }
+          },
+          onError: (Object e) {
+            if (e is QuicStreamStopped && !_closing) {
+              _protocolError('STOP_SENDING on the control stream');
+            } else if (!isSessionEnd(e) && !_closing) {
+              _lost('control stream acknowledgement failed');
+            }
+          },
+        )
+        .ignore();
     _pumpControl();
     if (!_controlReady.isCompleted) {
       _controlReady.complete();
@@ -469,6 +539,16 @@ class QuicBindingConnection extends BindingConnection {
       return;
     }
     final record = encodeDataRecord(message.encode());
+    // Reading-driven replies may overshoot the soft mark by one record.
+    // Local callers (PING/IDENT) must not bypass the bound indefinitely.
+    if (_controlQueued + record.length >
+        quicOptions.controlOutputMark +
+            1 +
+            maxControlPayloadLength +
+            quicRecordHeaderSize) {
+      _fail(Status.of(StatusCode.resourceExhausted, 'control output full'));
+      return;
+    }
     _controlQueue.add(record);
     _controlQueued += record.length;
     _pumpControl();
@@ -488,8 +568,7 @@ class QuicBindingConnection extends BindingConnection {
       batch.add(_controlQueue.removeFirst());
     }
     final bytes = batch.takeBytes();
-    stream
-        .write(bytes)
+    Future<void>.sync(() => stream.write(bytes))
         .then(
           (_) {
             _controlWriting = false;
@@ -635,6 +714,8 @@ class QuicBindingConnection extends BindingConnection {
   }
 
   void _onHello(QuicHello hello) {
+    _controlTimer?.cancel();
+    _controlTimer = null;
     _peerHello = hello;
     _log.fine('$this: peer $hello');
     final rules = quicOptions.identity;
@@ -661,12 +742,26 @@ class QuicBindingConnection extends BindingConnection {
         ? status
         : Status.of(StatusCode.goingAway, status.toString());
     _peerGoAwayStatus.complete(status);
-    scheduleMicrotask(_checkIdle);
+    Timer.run(_checkIdle);
   }
 
   // Incoming streams ----------------------------------------------------------
 
   Future<void> _onIncomingStream(QuicStream stream) async {
+    if (_pendingStreams.length >= quicOptions.maxPendingStreams) {
+      _release(stream, StatusCode.resourceExhausted.code);
+      return;
+    }
+    _pendingStreams.add(stream);
+    try {
+      await _readOpen(stream);
+    } finally {
+      _pendingStreams.remove(stream);
+      Timer.run(_checkIdle);
+    }
+  }
+
+  Future<void> _readOpen(QuicStream stream) async {
     if (_closing) {
       _release(stream, StatusCode.goingAway.code);
       return;
@@ -674,7 +769,14 @@ class QuicBindingConnection extends BindingConnection {
     final reader = RecordReader(stream);
     final QuicRecord? first;
     try {
-      first = await reader.next(limit: quicOptions.recordLimit);
+      final reading = reader.next(limit: quicOptions.recordLimit);
+      final timeout = quicOptions.openStreamTimeout;
+      first = await (timeout > Duration.zero
+          ? reading.timeout(timeout)
+          : reading);
+    } on TimeoutException {
+      _release(stream, StatusCode.deadlineExceeded.code);
+      return;
     } on QuicStreamReset {
       // Its opener gave it up before the OPEN record was complete.
       _release(stream, StatusCode.cancelled.code);
@@ -737,6 +839,9 @@ class QuicBindingConnection extends BindingConnection {
       if (_control != null) {
         throw ProtocolException('a second control stream');
       }
+      if (payload.isNotEmpty) {
+        throw ProtocolException('control OPEN has a payload');
+      }
       _onControlStream(stream, reader);
       return;
     }
@@ -761,9 +866,6 @@ class QuicBindingConnection extends BindingConnection {
       isLocallyOpened: false,
       openPayload: Uint8List.fromList(payload),
     );
-    if (id > _highestPeerId) {
-      _highestPeerId = id;
-    }
     _channels[id] = channel;
     _payloads.add(channel);
     _openPayloadBytes += payload.length;
@@ -807,11 +909,8 @@ class QuicBindingConnection extends BindingConnection {
     return half != null && half < budget ? half : budget;
   }
 
-  /// Whether [openPayload] opens a Talk bulk channel for a channel admitted
-  /// before this side's GOAWAY: one that is open, or one that ended since
-  /// (its bulk streams may arrive after its close, streams being
-  /// independent; Talk then applies its rules for ended parents). Ids are
-  /// never reused, so the marks taken when the GOAWAY went tell them.
+  /// A continuation of an open parent or one whose reader still waits
+  /// for referenced bulk streams. A lower id alone proves no admission.
   bool _continuesOpenChannel(Uint8List openPayload) {
     try {
       final address = ChannelAddress.decode(openPayload);
@@ -822,10 +921,7 @@ class QuicBindingConnection extends BindingConnection {
       if (_channels.containsKey(parentId)) {
         return true;
       }
-      final ours = parentId.isOdd != isInitiator;
-      return ours
-          ? parentId < _goAwayOwnMark
-          : parentId > 0 && parentId <= _goAwayPeerMark;
+      return retainedForDrain(parentId);
     } on SwitchboardException {
       return false;
     } on FormatException {
@@ -838,14 +934,19 @@ class QuicBindingConnection extends BindingConnection {
   void _reject(QuicStream stream, int id, Status status) {
     _log.fine('$this: rejecting channel $id: $status');
     final code = quicErrorCode(status);
-    stream
-      ..priority = quicOrdinaryPriority
-      ..stop(code);
-    stream
-        .write(encodeCloseRecord(status))
-        .then((_) => stream.finish())
-        .catchError((Object _) {})
-        .ignore();
+    final sending = Future<void>.sync(() async {
+      stream.priority = quicOrdinaryPriority;
+      stream.stop(code);
+      await stream.write(encodeCloseRecord(status));
+      await stream.finish();
+      await stream.stopped;
+    });
+    final timeout = options.closeConfirmTimeout;
+    final bounded = timeout > Duration.zero
+        ? sending.timeout(timeout)
+        : sending;
+    final finished = bounded.catchError((Object _) => _release(stream, code));
+    _trackFinishing(finished);
   }
 
   // Delivery of incoming channels ---------------------------------------------
@@ -903,11 +1004,17 @@ class QuicBindingConnection extends BindingConnection {
     if (!_undelivered.contains(channel)) {
       _releasePayload(channel);
     }
-    scheduleMicrotask(_checkIdle);
+    Timer.run(_checkIdle);
   }
 
+  @override
+  void drainStateChanged() => Timer.run(_checkIdle);
+
   void _checkIdle() {
-    if (_closing || _channels.isNotEmpty) {
+    if (_closing ||
+        _channels.isNotEmpty ||
+        hasDrainHolds ||
+        _pendingStreams.isNotEmpty) {
       return;
     }
     final idle = _idle;
@@ -1070,8 +1177,6 @@ class QuicBindingConnection extends BindingConnection {
     }
     if (!_goAwaySent) {
       _goAwaySent = true;
-      _goAwayPeerMark = _highestPeerId;
-      _goAwayOwnMark = _nextId;
       _ownGoAway = status;
       _log.fine('$this: sending GOAWAY $status');
       _sendControl(MuxControlMessage.goAway(statusForWire(status)));
@@ -1080,7 +1185,10 @@ class QuicBindingConnection extends BindingConnection {
   }
 
   Future<void> _goAwayWait() async {
-    if (_channels.isNotEmpty && !_closing) {
+    // Let channel stream listeners register their pending bulk work.
+    await Future<void>.delayed(Duration.zero);
+    if ((_channels.isNotEmpty || hasDrainHolds || _pendingStreams.isNotEmpty) &&
+        !_closing) {
       final idle = _idle ??= Completer<void>();
       await idle.future.timeout(
         options.goAwayGrace,
@@ -1204,7 +1312,12 @@ class QuicBindingConnection extends BindingConnection {
     } on Object catch (e) {
       _log.fine('$this: session close: $e');
     }
-    await _streams?.cancel();
+    try {
+      await _streams?.cancel();
+      await _unidirectional?.cancel();
+    } on Object catch (e) {
+      _log.fine('$this: cancelling incoming streams: $e');
+    }
   }
 
   void _finish(Status status, Status channelStatus) {
@@ -1213,6 +1326,10 @@ class QuicBindingConnection extends BindingConnection {
     _controlTimer?.cancel();
     _controlTimer = null;
     _controlQueue.clear();
+    for (final stream in _pendingStreams) {
+      _release(stream, StatusCode.goingAway.code);
+    }
+    _pendingStreams.clear();
     final drained = _controlDrained;
     _controlDrained = null;
     drained?.complete();
@@ -1268,7 +1385,7 @@ class QuicBindingConnection extends BindingConnection {
     if (!end.lost && end.byPeer) {
       // An application close counts as a GOAWAY with its status (code 0:
       // GOING_AWAY), then the end of the transport.
-      final code = end.code ?? 0;
+      final code = end.code;
       _onPeerGoAway(
         code == 0
             ? Status.of(StatusCode.goingAway, end.reason)
@@ -1309,7 +1426,7 @@ class QuicBindingConnection extends BindingConnection {
     _keepAliveTimer = Timer(interval, _onKeepAliveTimer);
   }
 
-  /// A record arrived from the peter: it is alive.
+  /// A record arrived from the peer: it is alive.
   void _noteReceive() {
     _sinceReceive.reset();
     if (_probing) {
@@ -1322,6 +1439,12 @@ class QuicBindingConnection extends BindingConnection {
   void _onKeepAliveTimer() {
     final interval = options.keepAliveInterval;
     if (_closing || interval == null) {
+      return;
+    }
+    if (_controlQueued > quicOptions.controlOutputMark) {
+      // Reading is paused locally; that silence is not a dead peer.
+      _probing = false;
+      _keepAliveTimer = Timer(interval, _onKeepAliveTimer);
       return;
     }
     if (_probing) {
@@ -1596,14 +1719,14 @@ class QuicBindingConnection extends BindingConnection {
     }
     final ident = MuxIdent.decode(payload);
     final verifier = options.identityVerifier;
-    if (verifier == null) {
-      _log.fine('$this: ignoring IDENT, no identity verifier');
-      return;
-    }
     final bound = exporterBound;
     if (!bound && quicOptions.identity.requireExporterBinding) {
       _log.info('$this: IDENT refused: not bound to the TLS session');
       _fail(_unauthenticated);
+      return;
+    }
+    if (verifier == null) {
+      _log.fine('$this: ignoring IDENT, no identity verifier');
       return;
     }
     // Control messages after the IDENT wait for its verification; the
@@ -1622,17 +1745,23 @@ class QuicBindingConnection extends BindingConnection {
     PeerIdentity? identity;
     var failure = '';
     try {
-      identity = await verifyIdent(
-        ident,
-        verifier: verifier,
-        senderNonce: senderNonce,
-        receiverNonce: receiverNonce,
-        localIdentity: localIdentity,
-        requireNamedIdent:
-            options.requireNamedIdent ||
-            (isInitiator && quicOptions.identity.awaitPeerIdentity),
-        exporter: bound ? _exporter : null,
-      );
+      final verification = Future.any<PeerIdentity>([
+        verifyIdent(
+          ident,
+          verifier: verifier,
+          senderNonce: senderNonce,
+          receiverNonce: receiverNonce,
+          localIdentity: localIdentity,
+          requireNamedIdent:
+              options.requireNamedIdent ||
+              (isInitiator && quicOptions.identity.awaitPeerIdentity),
+          exporter: bound ? _exporter : null,
+        ),
+        done.then((status) => throw SwitchboardException(status)),
+      ]);
+      identity = await (options.identityTimeout > Duration.zero
+          ? verification.timeout(options.identityTimeout)
+          : verification);
     } on SwitchboardException catch (e) {
       failure = e.status.reason;
     } on Object catch (e, st) {
@@ -1687,7 +1816,9 @@ class QuicBindingConnection extends BindingConnection {
 }
 
 class _PendingPing {
-  _PendingPing(this.payload);
+  _PendingPing(this.payload) {
+    completer.future.ignore();
+  }
 
   final Uint8List payload;
   final Completer<Duration> completer = Completer<Duration>();
