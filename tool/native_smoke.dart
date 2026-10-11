@@ -11,7 +11,7 @@ Authors:
 // and AOT (tool/aot_smoke.sh builds it with `dart build cli`): a listener with
 // a self-signed certificate, a pinned client, an echo in both directions with
 // FIN, the exporter on both ends, an application close seen by the peer, and
-// 32 MiB through one stream. Exits non-zero on any failure.
+// 64 MiB through one stream. Exits non-zero on any failure.
 
 import 'dart:async';
 import 'dart:io';
@@ -67,7 +67,7 @@ Future<void> main() async {
   check(await cs.stopped == null && await ss.stopped == null, 'acknowledged');
 
   // Throughput.
-  const total = 32 << 20;
+  const total = 64 << 20;
   final chunk = Uint8List(64 << 10);
   final sw = Stopwatch()..start();
   final tx = await client.openStream();
@@ -90,7 +90,7 @@ Future<void> main() async {
   check(received == total, 'throughput bytes');
   final mbs = total / sw.elapsedMicroseconds;
   print(
-    'native smoke: 32 MiB in ${sw.elapsedMilliseconds} ms (${mbs.toStringAsFixed(0)} MB/s)',
+    'native smoke: 64 MiB in ${sw.elapsedMilliseconds} ms (${mbs.toStringAsFixed(0)} MB/s)',
   );
 
   await client.close(7, 'done');
