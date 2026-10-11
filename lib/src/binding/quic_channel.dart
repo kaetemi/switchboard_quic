@@ -36,8 +36,10 @@ part of 'quic_binding_connection.dart';
 ///   the previous one (the [stream]'s listener, or [consumed] under
 ///   [manualCredit]), so that unread data stays in the stack and a reader
 ///   that stops stalls its own channel; [grant] lets it read that much
-///   further ahead. A subframe costs its record: its length plus the
-///   4-byte header ([sendCost]).
+///   further ahead, and so does an `OK` close of this side, by a window,
+///   so that the peer's CLOSE record is found behind data nobody takes. A
+///   subframe costs its record: its length plus the 4-byte header
+///   ([sendCost]).
 /// * [maxSubframeLength] is the peer's record limit; a bulk channel's
 ///   payload goes in records of at most the smaller of it and
 ///   [MuxOptions.bulkChunkSize].
