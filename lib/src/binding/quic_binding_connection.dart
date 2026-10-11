@@ -15,7 +15,6 @@ library;
 import 'dart:async';
 import 'dart:collection';
 import 'dart:convert';
-import 'dart:math';
 import 'dart:typed_data';
 
 import 'package:logging/logging.dart';
@@ -1518,7 +1517,7 @@ class QuicBindingConnection extends BindingConnection {
   }
 
   Uint8List _sendNonce() {
-    final nonce = secureNonce();
+    final nonce = secureRandomBytes(MuxIdent.nonceLength);
     _localNonce = nonce;
     _sendControl(MuxControlMessage.nonce(nonce));
     return nonce;
@@ -1643,13 +1642,6 @@ class QuicBindingConnection extends BindingConnection {
       '${session.remote}, ${_channels.length} channels'
       '${_closing ? ', closed' : ''})';
 }
-
-/// 32 bytes from a cryptographically secure source, for a `NONCE`.
-Uint8List secureNonce() => Uint8List.fromList(
-  List<int>.generate(MuxIdent.nonceLength, (_) => _random.nextInt(256)),
-);
-
-final Random _random = Random.secure();
 
 class _PendingPing {
   _PendingPing(this.payload);

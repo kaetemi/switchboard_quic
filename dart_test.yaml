@@ -1,17 +1,14 @@
-# `dart test` runs everything on the VM.
+# `dart test` runs everything on the VM, against the in-memory provider of
+# test/fake_provider.dart.
 #
-# `dart test -P node` (or `dart test -p node test/vectors/`) runs the
-# platform independent codec tests compiled to JavaScript on Node.js, which
-# checks the 32 and 48-bit arithmetic of the wire codecs on the web, and the
-# reconnecting client, which is meant for web frontends, and the identity
-# tests (credentials, Ed25519 in pure Dart, the NONCE/IDENT handshake).
+# `dart test -P node` runs the tests of `package:switchboard_quic/core.dart`
+# (which compiles for the web) compiled to JavaScript on Node.js: the wire
+# codecs and their 32 and 48-bit arithmetic, and the connection and channel
+# of the binding, as a browser frontend runs them over the web provider.
+# The node-level tests (switchboard_test.dart) need dart:io.
 presets:
   node:
     platforms: [node]
     paths:
-      - test/vectors
-      - test/bytes_test.dart
-      - test/identity_test.dart
-      - test/name_test.dart
-      - test/status_test.dart
-      - test/reconnecting_client_test.dart
+      - test/vectors_test.dart
+      - test/binding_test.dart

@@ -14,8 +14,8 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:typed_data';
 
-import 'package:switchboard/switchboard.dart';
-import 'package:switchboard_quic/switchboard_quic.dart';
+import 'package:switchboard/core.dart';
+import 'package:switchboard_quic/core.dart';
 import 'package:test/test.dart';
 
 import 'fake_provider.dart';

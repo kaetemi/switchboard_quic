@@ -23,7 +23,7 @@ import 'dart:convert';
 import 'dart:math';
 import 'dart:typed_data';
 
-import 'package:switchboard_quic/switchboard_quic.dart';
+import 'package:switchboard_quic/core.dart';
 
 /// What the delay of a stream direction is chosen by.
 class FakeStreamInfo {
@@ -165,7 +165,7 @@ class FakeQuicConnector implements QuicConnector {
       network: network,
       initiator: this.config.copyWith(
         streamWindow: config.streamReceiveWindow,
-        connectionWindow: config.receiveWindow,
+        connectionWindow: config.connectionReceiveWindow,
         maxStreams: config.maxStreamsBidi,
       ),
       acceptor: listener.config,
@@ -388,6 +388,7 @@ class FakeQuicSession implements QuicSession {
     if (ended) {
       return;
     }
+    reason = _truncate(reason, 1024);
     closes.add((code, reason));
     _end(QuicSessionEnd.closed(code, reason, byPeer: false));
     final other = peer;
@@ -447,7 +448,9 @@ class _Direction {
     this.sender,
     this.receiver,
     this.shared,
-  ) : window = to.config.streamWindow;
+  ) : window = to.config.streamWindow {
+    stopped.future.ignore();
+  }
 
   final _Shared shared;
   final FakeQuicSession from;
@@ -457,13 +460,20 @@ class _Direction {
   final FakeQuicStream receiver;
   final int window;
 
-  // Sender side.
+  static const QuicException _ended = QuicException(
+    QuicExceptionKind.sessionEnded,
+    'session ended',
+  );
+
+  // Sender side: writes queued in order, the head sent as the windows
+  // allow.
   int sent = 0;
   int consumed = 0;
-  Uint8List? _writing;
+  final Queue<(Uint8List, Completer<void>)> _writes =
+      Queue<(Uint8List, Completer<void>)>();
   int _writeOffset = 0;
-  Completer<void>? _write;
   bool finished = false;
+  Completer<void>? _finish;
   bool resetSent = false;
   int? stopCode;
   bool stopReceived = false;
@@ -475,7 +485,9 @@ class _Direction {
   bool finRead = false;
   bool reset = false;
   int? resetCode;
+  // This side stopped its read direction (STOP_SENDING) with [stopSentCode].
   bool stopSent = false;
+  int? stopSentCode;
   Completer<Uint8List?>? _read;
   int _readMax = 0;
   bool closedAtReceiver = false;
@@ -522,9 +534,7 @@ class _Direction {
 
   Future<void> write(Uint8List bytes) {
     if (from.ended) {
-      return Future.error(
-        const QuicException(QuicExceptionKind.sessionEnded, 'session ended'),
-      );
+      return Future.error(_ended);
     }
     if (stopReceived) {
       return Future.error(QuicStreamStopped(stopCode));
@@ -532,59 +542,92 @@ class _Direction {
     if (finished || resetSent) {
       return Future.error(StateError('the direction has ended'));
     }
-    if (_write != null) {
-      return Future.error(StateError('a write is pending'));
-    }
-    if (bytes.isEmpty) {
-      return Future.value();
-    }
-    _writing = Uint8List.fromList(bytes);
-    _writeOffset = 0;
-    final completer = _write = Completer<void>();
+    final completer = Completer<void>();
+    _writes.add((Uint8List.fromList(bytes), completer));
     _pump();
     return completer.future;
   }
 
-  /// Sends what the windows allow of the pending write.
+  /// Sends what the windows allow of the queued writes.
   void _pump() {
-    final data = _writing;
-    if (data == null || from.ended || resetSent || stopReceived) {
-      return;
-    }
-    while (_writeOffset < data.length) {
-      final streamCredit = window - (sent - consumed);
-      final connectionCredit = from._connectionCredit;
-      var n = data.length - _writeOffset;
-      if (streamCredit < n) {
-        n = streamCredit;
-      }
-      if (connectionCredit < n) {
-        n = connectionCredit;
-      }
-      if (n <= 0) {
-        if (connectionCredit <= 0) {
-          from._blocked.add(this);
-        }
+    while (_writes.isNotEmpty) {
+      if (from.ended || resetSent || stopReceived) {
         return;
       }
-      final chunk = Uint8List.sublistView(data, _writeOffset, _writeOffset + n);
-      _writeOffset += n;
-      sent += n;
-      from._connectionSent += n;
-      _post(() => _receive(chunk));
+      final (data, completer) = _writes.first;
+      while (_writeOffset < data.length) {
+        final streamCredit = window - (sent - consumed);
+        final connectionCredit = from._connectionCredit;
+        var n = data.length - _writeOffset;
+        if (streamCredit < n) {
+          n = streamCredit;
+        }
+        if (connectionCredit < n) {
+          n = connectionCredit;
+        }
+        if (n <= 0) {
+          if (connectionCredit <= 0) {
+            from._blocked.add(this);
+          }
+          return;
+        }
+        final chunk = Uint8List.sublistView(
+          data,
+          _writeOffset,
+          _writeOffset + n,
+        );
+        _writeOffset += n;
+        sent += n;
+        from._connectionSent += n;
+        _post(() => _receive(chunk));
+      }
+      _writes.removeFirst();
+      _writeOffset = 0;
+      completer.complete();
     }
-    _writing = null;
-    final completer = _write!;
-    _write = null;
-    completer.complete();
+    _postFin();
   }
 
-  void finish() {
-    if (finished || resetSent || from.ended) {
+  /// Fails the writes still queued with [error].
+  void _failWrites(Object error) {
+    final writes = List.of(_writes);
+    _writes.clear();
+    _writeOffset = 0;
+    for (final (_, completer) in writes) {
+      completer.completeError(error);
+    }
+  }
+
+  Future<void> finish() {
+    if (from.ended) {
+      return Future.error(_ended);
+    }
+    if (stopReceived) {
+      return Future.error(QuicStreamStopped(stopCode));
+    }
+    if (resetSent) {
+      return Future.error(StateError('the direction was reset'));
+    }
+    if (!finished) {
+      finished = true;
+      _finish = Completer<void>()..future.ignore();
+      _finished = _finish!.future;
+      _postFin();
+    }
+    return _finished!;
+  }
+
+  Future<void>? _finished;
+
+  /// FIN goes once every queued write went.
+  void _postFin() {
+    final finish = _finish;
+    if (!finished || _writes.isNotEmpty || finish == null) {
       return;
     }
-    finished = true;
+    _finish = null;
     _post(_receiveFin);
+    finish.complete();
   }
 
   void resetDirection(int code) {
@@ -592,14 +635,14 @@ class _Direction {
       return;
     }
     if (finished && fin) {
-      // Everything arrived already.
+      // Everything arrived already: the direction has ended.
       return;
     }
     resetSent = true;
-    final write = _write;
-    _write = null;
-    _writing = null;
-    write?.completeError(StateError('reset'));
+    _failWrites(StateError('reset'));
+    final finish = _finish;
+    _finish = null;
+    finish?.completeError(StateError('reset'));
     if (!stopped.isCompleted) {
       stopped.complete(null);
     }
@@ -645,23 +688,26 @@ class _Direction {
     if (dropped > 0) {
       _credit(dropped);
     }
-    final read = _read;
-    _read = null;
-    read?.completeError(QuicStreamReset(code));
+    if (!stopSent) {
+      final read = _read;
+      _read = null;
+      read?.completeError(QuicStreamReset(code));
+    }
     _checkClosed();
   }
 
   Future<Uint8List?> read(int max) {
     if (to.ended) {
-      return Future.error(
-        const QuicException(QuicExceptionKind.sessionEnded, 'session ended'),
-      );
+      return Future.error(_ended);
     }
     if (_read != null) {
       return Future.error(StateError('a read is pending'));
     }
     if (max <= 0) {
       return Future.error(ArgumentError.value(max, 'max'));
+    }
+    if (stopSent) {
+      return Future.error(QuicStreamReset(stopSentCode));
     }
     final completer = _read = Completer<Uint8List?>();
     _readMax = max;
@@ -713,11 +759,15 @@ class _Direction {
     });
   }
 
+  /// This side's read direction ends at once: a pending read and every
+  /// later one fail with a reset of [code]; STOP_SENDING goes to the
+  /// sender, whose confirming reset is not observable here.
   void stop(int code) {
-    if (stopSent || to.ended) {
+    if (stopSent || reset || finRead || to.ended) {
       return;
     }
     stopSent = true;
+    stopSentCode = code;
     var dropped = 0;
     for (final chunk in buffer) {
       dropped += chunk.length;
@@ -726,6 +776,9 @@ class _Direction {
     if (dropped > 0) {
       _credit(dropped);
     }
+    final read = _read;
+    _read = null;
+    read?.completeError(QuicStreamReset(code));
     // STOP_SENDING travels back to the sender.
     final back = receiver._out!;
     back._post(() => _receiveStop(code));
@@ -739,15 +792,16 @@ class _Direction {
     }
     stopReceived = true;
     stopCode = code;
-    final write = _write;
-    _write = null;
-    _writing = null;
-    write?.completeError(QuicStreamStopped(code));
+    _failWrites(QuicStreamStopped(code));
+    final finish = _finish;
+    _finish = null;
+    finish?.completeError(QuicStreamStopped(code));
     if (!stopped.isCompleted) {
       stopped.complete(code);
     }
-    // The stack answers with a reset of the same code.
-    if (!finished && !resetSent) {
+    // The stack answers with a reset of the same code, unless everything
+    // arrived already.
+    if (!resetSent && !(finished && fin)) {
       resetSent = true;
       _post(() => _receiveReset(code));
     }
@@ -763,21 +817,25 @@ class _Direction {
     }
   }
 
-  void sessionEnded() {
+  /// The sender's session ended: what it has pending fails.
+  void senderEnded() {
     _timer?.cancel();
     _timer = null;
     _events.clear();
-    final write = _write;
-    _write = null;
-    _writing = null;
-    write?.completeError(
-      const QuicException(QuicExceptionKind.sessionEnded, 'session ended'),
-    );
+    _failWrites(_ended);
+    final finish = _finish;
+    _finish = null;
+    finish?.completeError(_ended);
+    if (!stopped.isCompleted) {
+      stopped.completeError(_ended);
+    }
+  }
+
+  /// The receiver's session ended: its pending read fails.
+  void receiverEnded() {
     final read = _read;
     _read = null;
-    read?.completeError(
-      const QuicException(QuicExceptionKind.sessionEnded, 'session ended'),
-    );
+    read?.completeError(_ended);
   }
 }
 
@@ -810,7 +868,7 @@ class FakeQuicStream implements QuicStream {
   Future<void> write(Uint8List bytes) => _out!.write(bytes);
 
   @override
-  Future<void> finish() async => _out!.finish();
+  Future<void> finish() => _out!.finish();
 
   @override
   void reset(int code) {
@@ -831,8 +889,8 @@ class FakeQuicStream implements QuicStream {
   Future<int?> get stopped => _out!.stopped.future;
 
   void _sessionEnded() {
-    _out?.sessionEnded();
-    _in?.sessionEnded();
+    _out?.senderEnded();
+    _in?.receiverEnded();
   }
 
   @override
@@ -851,4 +909,17 @@ bool _equal(List<int> a, List<int> b) {
     }
   }
   return true;
+}
+
+/// [text] cut to at most [max] bytes of UTF-8, at a character boundary.
+String _truncate(String text, int max) {
+  final bytes = utf8.encode(text);
+  if (bytes.length <= max) {
+    return text;
+  }
+  var cut = max;
+  while (cut > 0 && bytes[cut] & 0xC0 == 0x80) {
+    cut--;
+  }
+  return utf8.decode(bytes.sublist(0, cut));
 }

@@ -132,7 +132,7 @@ class QuicSwitchboardBinding extends SwitchboardBinding {
           : verifyCertificate,
       maxStreamsBidi: options.maxChannels > 0 ? options.maxChannels : 65536,
       streamReceiveWindow: options.initialWindow,
-      receiveWindow: options.receiveHighWaterMarkBytes > 0
+      connectionReceiveWindow: options.receiveHighWaterMarkBytes > 0
           ? options.receiveHighWaterMarkBytes
           : 16 << 20,
       idleTimeout: idleTimeout,

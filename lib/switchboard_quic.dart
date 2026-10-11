@@ -13,26 +13,15 @@ Authors:
 /// QUIC and WebTransport Binding").
 ///
 /// * [QuicSwitchboardBinding] and [QuicSwitchboardListener] give a
-///   `Switchboard` node its `quic://` and `https://` endpoints.
-/// * [QuicBindingConnection] and [QuicChannel] are the connection and
+///   `Switchboard` node its `quic://` and `https://` endpoints (they need
+///   `dart:io`, as the node does).
+/// * Everything of `package:switchboard_quic/core.dart`, which compiles for
+///   the web: [QuicBindingConnection] and [QuicChannel], the connection and
 ///   channel contracts of `MuxConnection` and `MuxChannel` over a
-///   [QuicSession] of any stream provider.
-/// * The stream provider contract ([QuicConnector], [QuicListener],
-///   [QuicSession], [QuicStream]) is what a provider implements.
-/// * The wire format (records, `HELLO`, error codes, the exporter) is
-///   public for providers and tests.
+///   [QuicSession] of any stream provider; the stream provider contract
+///   ([QuicConnector], [QuicListener], [QuicSession], [QuicStream]); and the
+///   wire format (records, `HELLO`, error codes, the exporter).
 library;
 
-export 'src/binding/exporter.dart';
-export 'src/binding/quic_binding_connection.dart'
-    show
-        QuicBindingConnection,
-        QuicChannel,
-        quicBulkPriority,
-        quicControlPriority,
-        quicOrdinaryPriority;
-export 'src/binding/quic_options.dart';
+export 'core.dart';
 export 'src/binding/quic_switchboard_binding.dart';
-export 'src/binding/record_reader.dart';
-export 'src/binding/records.dart';
-export 'src/provider/quic_provider.dart';
