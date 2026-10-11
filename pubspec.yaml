@@ -1,0 +1,22 @@
+name: switchboard_quic
+description: The QUIC and WebTransport binding of Polyverse Switchboard. Every channel on a native stream, over quinn through FFI on the VM and over the browser's WebTransport API on the web.
+version: 0.1.0-dev.1
+repository: https://github.com/kaetemi/switchboard_quic
+publish_to: none
+
+environment:
+  sdk: ^3.13.0
+
+dependencies:
+  switchboard:
+    path: ../switchboard
+  async: ^2.13.0
+  ffi: ^2.1.3
+  logging: ^1.3.0
+  meta: ^1.19.0
+  web: ^1.1.1
+
+dev_dependencies:
+  ffigen: ^19.0.0
+  lints: ^6.1.0
+  test: ^1.26.0
