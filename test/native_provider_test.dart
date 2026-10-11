@@ -16,6 +16,7 @@ library;
 
 import 'dart:async';
 import 'dart:isolate';
+import 'dart:math' as math;
 import 'dart:typed_data';
 
 import 'package:async/async.dart';
@@ -311,6 +312,11 @@ void main() {
           32,
         );
         expect(ctx, isNot(c1));
+        // More than the exporter can produce (255 hash lengths).
+        await expectLater(
+          p1.client.exportKeyingMaterial(_exporterLabel, Uint8List(0), 1 << 16),
+          throwsArgumentError,
+        );
       },
     );
   });
@@ -434,6 +440,31 @@ void main() {
     });
 
     test(
+      'the opener stops at once: the acceptor\'s stopped has the code',
+      () async {
+        // The stream and the STOP_SENDING arrive together; the stream is
+        // announced before its events, so neither is dropped.
+        for (var i = 0; i < 20; i++) {
+          final cs = await p.client.openStream();
+          await cs.write(bytes('x'));
+          cs.stop(5);
+          final ss = await p.serverStreams.next;
+          expect(await ss.stopped.timeout(const Duration(seconds: 5)), 5);
+          await expectLater(
+            ss.write(bytes('y')),
+            throwsA(isA<QuicStreamStopped>().having((e) => e.code, 'code', 5)),
+          );
+          expect(await ss.read(10), bytes('x'));
+          cs.reset(0);
+          await expectLater(
+            ss.read(10),
+            throwsA(isA<QuicStreamReset>().having((e) => e.code, 'code', 0)),
+          );
+        }
+      },
+    );
+
+    test(
       'a second stop is a no-op; reads keep failing with the code',
       () async {
         final cs = await p.client.openStream();
@@ -450,6 +481,23 @@ void main() {
         }
       },
     );
+
+    test('codes beyond QUIC\'s range are argument errors', () async {
+      const max = (1 << 62) - 1;
+      final cs = await p.client.openStream();
+      await cs.write(bytes('x'));
+      final ss = await p.serverStreams.next;
+      expect(() => cs.reset(max + 1), throwsArgumentError);
+      expect(() => cs.reset(-1), throwsArgumentError);
+      expect(() => ss.stop(max + 1), throwsArgumentError);
+      expect(() => p.client.close(max + 1, ''), throwsArgumentError);
+      // Nothing was sent: the largest code still goes through afterwards.
+      cs.reset(max);
+      await expectLater(
+        readAll(ss),
+        throwsA(isA<QuicStreamReset>().having((e) => e.code, 'code', max)),
+      );
+    });
 
     test('a write waiting for credit fails when the peer stops', () async {
       final cs = await p.client.openStream();
@@ -502,46 +550,88 @@ void main() {
     });
   });
 
-  test('priorities: the higher-priority stream finishes first', () async {
-    // Windows hold everything, so the server's stack takes (and acknowledges)
-    // all data without its application reading: the order in which the two
-    // finishes are acknowledged is the order the sender transmitted them in.
-    final server = await Server.start(
-      serverConfig(window: 8 << 20, connectionWindow: 32 << 20),
-    );
-    final p = await Pair.connect(server);
-    final low = await p.client.openStream();
-    final high = await p.client.openStream();
-    low.priority = 0;
-    high.priority = 1;
-    final data = pattern(4 << 20);
-    final sw = Stopwatch()..start();
-    final acked = <String, int>{};
-    final done = Future.wait([
-      low.stopped.then((_) => acked['low'] = sw.elapsedMicroseconds),
-      high.stopped.then((_) => acked['high'] = sw.elapsedMicroseconds),
-    ]);
-    // Low first, high second, in the same turn. Round robin would interleave
-    // them and finish both within a packet or two of each other (measured:
-    // under 1% of the transfer apart); strict priority sends the high one
-    // first, and the low one's last bytes go out well later (measured: about
-    // 20% of the transfer, the low one having had a head start while the high
-    // one was being handed over).
-    await Future.wait([
-      low.write(data).then((_) => low.finish()),
-      high.write(data).then((_) => high.finish()),
-    ]);
-    await done.timeout(const Duration(seconds: 20));
-    final gap = acked['low']! - acked['high']!;
-    expect(gap, greaterThan(0), reason: 'acknowledged: $acked');
-    expect(
-      gap / acked['low']!,
-      greaterThan(0.1),
-      reason: 'acknowledged: $acked',
-    );
-    for (var i = 0; i < 2; i++) {
-      expect(await readAll(await p.serverStreams.next, 1 << 20), data);
+  group('priorities', () {
+    // The contract's classes on quinn's strict levels: 2 (control) strictly
+    // first, 1 (ordinary) and 0 (bulk) on one level, interleaved.
+    test('the classes on quinn\'s levels', () {
+      int level(int c) => NativeQuicStream.quinnPriority(c);
+      expect(level(1), level(0));
+      expect(level(2), greaterThan(level(1)));
+      expect(level(3), greaterThan(level(2)));
+      expect(level(-1), lessThan(level(0)));
+      expect(level(1 << 40), 0x7FFFFFFF);
+    });
+
+    // How far ahead of a stream of class [first] one of class [second]
+    // finishes, as a fraction of the transfer, with [first] handed to the
+    // stack first and [second] right after, in the same turn. Windows hold
+    // everything, so the server's stack takes (and acknowledges) all data
+    // without its application reading: the order in which the two finishes
+    // are acknowledged is the order the sender transmitted them in. Round
+    // robin finishes both within a packet or two of each other (measured:
+    // under 1% of the transfer apart); strict priority sends the second one
+    // first, and the first one's last bytes go out well later (measured:
+    // about 20% of the transfer, the first one having had a head start while
+    // the second was being handed over).
+    Future<double> lead(Server server, int first, int second) async {
+      final p = await Pair.connect(server);
+      final a = await p.client.openStream();
+      final b = await p.client.openStream();
+      a.priority = first;
+      b.priority = second;
+      final data = pattern(4 << 20);
+      final sw = Stopwatch()..start();
+      late int ackedA, ackedB;
+      final done = Future.wait([
+        a.stopped.then((_) => ackedA = sw.elapsedMicroseconds),
+        b.stopped.then((_) => ackedB = sw.elapsedMicroseconds),
+      ]);
+      await Future.wait([
+        a.write(data).then((_) => a.finish()),
+        b.write(data).then((_) => b.finish()),
+      ]);
+      await done.timeout(const Duration(seconds: 20));
+      for (var i = 0; i < 2; i++) {
+        expect(await readAll(await p.serverStreams.next, 1 << 20), data);
+      }
+      await p.client.close(0, '');
+      return (ackedA - ackedB) / math.max(ackedA, ackedB);
     }
+
+    // A measurement that loses a packet at the very end waits for a probe
+    // timeout and says nothing about the scheduler: up to three tries.
+    Future<double> measure(
+      int first,
+      int second,
+      bool Function(double) ok,
+    ) async {
+      final server = await Server.start(
+        serverConfig(window: 8 << 20, connectionWindow: 32 << 20),
+      );
+      var v = 0.0;
+      for (var i = 0; i < 3; i++) {
+        v = await lead(server, first, second);
+        // ignore: avoid_print
+        print(
+          'priority class $second ahead of class $first by '
+          '${(v * 100).toStringAsFixed(1)}% of the transfer',
+        );
+        if (ok(v)) break;
+      }
+      return v;
+    }
+
+    test('control goes strictly before bulk', () async {
+      bool ok(double v) => v > 0.1;
+      final v = await measure(0, 2, ok);
+      expect(ok(v), isTrue, reason: 'control ahead by $v of the transfer');
+    });
+
+    test('ordinary and bulk interleave', () async {
+      bool ok(double v) => v.abs() < 0.1;
+      final v = await measure(0, 1, ok);
+      expect(ok(v), isTrue, reason: 'ordinary ahead by $v of the transfer');
+    });
   });
 
   test('stream limit: openStream waits until a stream closes', () async {

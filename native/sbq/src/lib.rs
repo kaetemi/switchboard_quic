@@ -218,10 +218,6 @@ pub extern "C" fn sbq_shutdown(ctx_id: u64) -> i32 {
     SBQ_OK as i32
 }
 
-/// The largest `cap` `sbq_poll` acts on; anything above is clamped down, which the drain-until-
-/// fewer-than-`cap` protocol cannot observe.
-const POLL_CAP_MAX: usize = 1 << 12;
-
 /// Moves up to `cap` queued events of the context into `out`; returns how many. Call until it
 /// returns less than `cap` after each doorbell.
 #[no_mangle]
@@ -232,7 +228,11 @@ pub unsafe extern "C" fn sbq_poll(ctx_id: u64, out: *mut SbqEvent, cap: usize) -
     let Some(ctx) = get(&CTXS, ctx_id) else {
         return 0;
     };
-    ctx.poll(std::slice::from_raw_parts_mut(out, cap.min(POLL_CAP_MAX)))
+    // Only the events handed out are written, each into its own slot of the caller's `cap`;
+    // no slice of `cap` elements is formed, so any `cap` is honoured as given (a clamp would
+    // return fewer than asked with events still queued, and the caller would stop polling
+    // while no further doorbell comes).
+    ctx.poll(cap, |i, ev| out.add(i).write(ev))
 }
 
 /// Copies the message of the last failure on the calling thread into `out` (up to `cap` bytes,
@@ -344,6 +344,9 @@ pub unsafe extern "C" fn sbq_client_config(
             }
             if pin_count > 1024 {
                 return fail(SBQ_ERR_ARG, "too many pinned hashes");
+            }
+            if pins.is_null() {
+                return fail(SBQ_ERR_ARG, "no pinned hash");
             }
             let raw = bytes(pins, pin_count * 32);
             Verify::Pinned(
@@ -552,6 +555,8 @@ pub unsafe extern "C" fn sbq_conn_close_reason(conn: u64, out: *mut u8, cap: usi
 
 /// RFC 8446 section 7.5 keying material exporter of the connection's TLS session: `out_len`
 /// bytes for `label` and `context` (an empty context equals no context in TLS 1.3).
+/// `SBQ_ERR_STATE` before the handshake completed; `SBQ_ERR_ARG` for a length the exporter
+/// cannot produce (more than 255 times the hash length of the cipher suite).
 #[no_mangle]
 pub unsafe extern "C" fn sbq_conn_exporter(
     conn: u64,
@@ -574,7 +579,12 @@ pub unsafe extern "C" fn sbq_conn_exporter(
     let out = std::slice::from_raw_parts_mut(out, out_len);
     match qc.export_keying_material(out, bytes(label, label_len), bytes(context, context_len)) {
         Ok(()) => SBQ_OK as i32,
-        Err(_) => fail(SBQ_ERR_STATE, "exporter unavailable") as i32,
+        // The handshake is complete (`connection()` is set only then): the length is the
+        // only thing left to refuse.
+        Err(_) => fail(
+            SBQ_ERR_ARG,
+            format!("the exporter cannot produce {out_len} bytes"),
+        ) as i32,
     }
 }
 

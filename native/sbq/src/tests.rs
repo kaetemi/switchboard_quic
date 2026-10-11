@@ -253,11 +253,51 @@ fn pin_comparison() {
     assert!(config::pin_matches(&[[7u8; 32], hash], &hash));
     assert!(!config::pin_matches(&[], &hash));
     // One differing bit is a mismatch, at every position.
-    for bit in 0..32 {
-        let mut wrong = hash;
-        wrong[bit] ^= 1;
-        assert!(!config::pin_matches(&[hash], &wrong));
+    for byte in 0..32 {
+        for bit in 0..8 {
+            let mut wrong = hash;
+            wrong[byte] ^= 1 << bit;
+            assert!(!config::pin_matches(&[hash], &wrong));
+            assert!(config::pin_matches(&[wrong, hash], &hash));
+        }
     }
+    // Every byte value of a difference counts, 0xFF included.
+    let mut far = hash;
+    far[31] ^= 0xFF;
+    assert!(!config::pin_matches(&[far], &hash));
+}
+
+#[test]
+fn poll_drains_whatever_the_cap() {
+    let h = Harness::new();
+    let ctx = get(&CTXS, h.ctx).unwrap();
+    let post = |n: u64| {
+        for i in 1..=n {
+            ctx.post(SBQ_EV_READABLE, i, 0, 0);
+        }
+    };
+    let poll = |buf: &mut [SbqEvent]| unsafe { sbq_poll(h.ctx, buf.as_mut_ptr(), buf.len()) };
+    // A buffer larger than the queue (and larger than any batch the Dart layer uses) takes
+    // everything at once, in order: fewer than asked means the queue is empty.
+    post(5000);
+    let mut big = vec![SbqEvent::default(); 8192];
+    assert_eq!(poll(&mut big), 5000);
+    assert!(big[..5000]
+        .iter()
+        .zip(1u64..)
+        .all(|(e, i)| e.handle == i && e.kind == SBQ_EV_READABLE));
+    assert_eq!(poll(&mut big), 0);
+    // Small buffers: full while events remain, then the rest.
+    post(40);
+    let mut small = [SbqEvent::default(); 16];
+    assert_eq!(poll(&mut small), 16);
+    assert_eq!(small[0].handle, 1);
+    assert_eq!(poll(&mut small), 16);
+    assert_eq!(poll(&mut small), 8);
+    assert_eq!(small[7].handle, 40);
+    assert_eq!(poll(&mut small), 0);
+    assert_eq!(unsafe { sbq_poll(h.ctx, std::ptr::null_mut(), 16) }, 0);
+    assert_eq!(unsafe { sbq_poll(12345, small.as_mut_ptr(), 16) }, 0);
 }
 
 #[test]
@@ -303,6 +343,22 @@ fn config_errors() {
             SBQ_VERIFY_PINNED,
             none,
             usize::MAX,
+            1,
+            1,
+            1,
+            0,
+            0,
+        )
+    };
+    assert_eq!(r, SBQ_ERR_ARG);
+    // A count without the hashes.
+    let r = unsafe {
+        sbq_client_config(
+            ALPN.as_ptr(),
+            ALPN.len(),
+            SBQ_VERIFY_PINNED,
+            none,
+            2,
             1,
             1,
             1,
@@ -411,6 +467,22 @@ fn handshake_exporter_and_identity() {
     );
 
     assert_eq!(exporter(c), exporter(s));
+    let label = b"EXPORTER-Channel-Binding";
+    let mut huge = vec![0u8; 1 << 16];
+    assert_eq!(
+        unsafe {
+            sbq_conn_exporter(
+                c,
+                label.as_ptr(),
+                label.len(),
+                std::ptr::null(),
+                0,
+                huge.as_mut_ptr(),
+                huge.len(),
+            )
+        },
+        SBQ_ERR_ARG as i32
+    );
     let (c2, s2) = h.pair(l, port);
     assert_eq!(exporter(c2), exporter(s2));
     assert_ne!(exporter(c), exporter(c2));
@@ -519,6 +591,49 @@ fn streams_fin_reset_stop() {
     h.write_all(ss, b"z");
     assert_eq!(sbq_stream_finish(ss), 0);
     assert_eq!(h.read_all(cs), Ok(b"z".to_vec()));
+}
+
+#[test]
+fn a_stream_is_announced_before_its_events() {
+    // The opener writes and stops the other direction at once, so that STREAM and STOP_SENDING
+    // reach the acceptor together: STOPPED must not overtake the STREAM that announces the
+    // handle (an embedder would drop an event for a handle it does not know yet).
+    let mut h = Harness::new();
+    let (l, port, _) = h.server(64, 1 << 20, 30_000);
+    let (c, s) = h.pair(l, port);
+    for _ in 0..50 {
+        let cs = sbq_stream_open(c) as u64;
+        assert!(cs > 0);
+        assert_eq!(write_one(cs), 1);
+        assert_eq!(sbq_stream_stop(cs, 5), 0);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let (announced, stopped) = loop {
+            h.pump();
+            let announced = h
+                .backlog
+                .iter()
+                .position(|e| e.kind == SBQ_EV_STREAM && e.a == s as i64);
+            if let Some(i) = announced {
+                let ss = h.backlog[i].handle;
+                let stopped = h
+                    .backlog
+                    .iter()
+                    .position(|e| e.kind == SBQ_EV_STOPPED && e.handle == ss);
+                if let Some(j) = stopped {
+                    break (i, j);
+                }
+            }
+            assert!(Instant::now() < deadline, "backlog {:?}", h.backlog);
+            h.sleep();
+        };
+        assert!(announced < stopped, "backlog {:?}", h.backlog);
+        let ss = h.backlog[announced].handle;
+        assert_eq!(h.backlog[stopped].a, 5);
+        h.backlog.retain(|e| e.handle != ss);
+        assert_eq!(sbq_stream_reset(cs, 0), 0);
+        assert_eq!(sbq_stream_release(cs), 0);
+        assert_eq!(sbq_stream_release(ss), 0);
+    }
 }
 
 #[test]

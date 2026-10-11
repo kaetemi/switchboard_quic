@@ -236,6 +236,8 @@ external int sbq_conn_close_reason(
 
 /// RFC 8446 section 7.5 keying material exporter of the connection's TLS session: `out_len`
 /// bytes for `label` and `context` (an empty context equals no context in TLS 1.3).
+/// `SBQ_ERR_STATE` before the handshake completed; `SBQ_ERR_ARG` for a length the exporter
+/// cannot produce (more than 255 times the hash length of the cipher suite).
 @ffi.Native<
   ffi.Int32 Function(
     ffi.Uint64,
@@ -334,9 +336,9 @@ external int sbq_stream_set_priority(int stream, int priority);
 external int sbq_stream_release(int stream);
 
 /// The doorbell: called from the notifier thread, with the context id, when the context's event
-/// queue went from empty to non-empty (or still holds events after a poll that filled the
-/// caller's buffer). The embedder answers with `sbq_poll` until it returns fewer events than it
-/// asked for. Never called again for a context once `sbq_shutdown` returned.
+/// queue went from empty to non-empty. The embedder answers with `sbq_poll` until it returns fewer
+/// events than it asked for (the queue is then empty, and the next event rings again). Never
+/// called again for a context once `sbq_shutdown` returned.
 typedef SbqDoorbell =
     ffi.Pointer<ffi.NativeFunction<ffi.Void Function(ffi.Uint64 ctx)>>;
 

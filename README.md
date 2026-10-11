@@ -8,7 +8,7 @@ Work in progress.
 
 ## The native provider
 
-`package:switchboard_quic/switchboard_quic_native.dart` (Dart VM only) exports `NativeQuicProvider`: raw QUIC (`quic://host:port`, ALPN `switchboard`) over quinn, through the Rust shim in `native/sbq` (see `native/README.md`).
+`package:switchboard_quic/switchboard_quic_native.dart` (Dart VM only) exports `NativeQuicProvider`: raw QUIC (`quic://host:port`, ALPN `switchboard`) over quinn, through the Rust shim in `native/sbq` (see `native/README.md`). quinn's stream priorities are strict between levels and round robin within one, so the provider puts the priority classes 1 (ordinary) and 0 (bulk) on one level and class 2 (control) above it (`NativeQuicStream.quinnPriority`).
 
 ```dart
 final provider = NativeQuicProvider();

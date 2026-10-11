@@ -6,7 +6,6 @@ Authors:
   Jan Boon <jan.boon@kaetemi.be>
   Claude Fable 5.1 <noreply@anthropic.com>
   Claude Opus 5.5 <noreply@anthropic.com>
-  GLM 5.3 Flash <noreply@z.ai>
 */
 
 /// The stream provider contract of the QUIC and WebTransport binding.
@@ -70,9 +69,8 @@ abstract interface class QuicSession {
   /// Opens a bidirectional stream. Waits for stream credit; fails with
   /// [QuicException] once the session has ended. Nothing is visible to the
   /// peer until the first write. Waiting calls are served in order. A caller
-  /// that stops waiting (a timeout) should reset the stream the call still
-  /// yields once it arrives, since an opened stream holds a unit of the
-  /// peer's stream limit.
+  /// that stops waiting (a timeout) resets the stream the call still yields,
+  /// since an opened stream holds a unit of the peer's stream limit.
   Future<QuicStream> openStream();
 
   /// Streams the peer opened, in the order the stack delivers them (no
@@ -149,8 +147,13 @@ abstract interface class QuicStream {
   /// observable through the stacks). A no-op once the direction has ended.
   void stop(int code);
 
-  /// Sender-local priority: higher first, strict between levels. The
-  /// binding uses 2 for the control stream, 1 ordinary, 0 bulk.
+  /// Sender-local priority class. The binding uses 2 for the control
+  /// stream, 1 for ordinary channels and 0 for bulk ones. 2 goes first,
+  /// strictly. 1 and 0 share what is left so that neither starves the
+  /// other (binding page, "Flow control and scheduling"): a stack whose
+  /// priorities are strict only (quinn) puts 1 and 0 on one level, below
+  /// 2, where it interleaves them; one with weights or send groups (the
+  /// W3C API's `sendGroup`) favours 1 without starving 0.
   set priority(int value);
 
   /// Completes when the peer's `STOP_SENDING` arrived (with its code) or
@@ -269,7 +272,11 @@ enum QuicExceptionKind {
 /// The peer reset its direction of a stream.
 class QuicStreamReset implements Exception {
   const QuicStreamReset(this.code);
-  final int code;
+
+  /// The application error code; null when the stack delivered none (a
+  /// WebTransport reset outside the application range, such as those of a
+  /// terminating session), which the binding reads as `UNKNOWN`.
+  final int? code;
   @override
   String toString() => 'QuicStreamReset($code)';
 }
@@ -277,7 +284,10 @@ class QuicStreamReset implements Exception {
 /// The peer asked this side to stop sending.
 class QuicStreamStopped implements Exception {
   const QuicStreamStopped(this.code);
-  final int code;
+
+  /// The application error code; null when the stack delivered none, as
+  /// for [QuicStreamReset.code].
+  final int? code;
   @override
   String toString() => 'QuicStreamStopped($code)';
 }

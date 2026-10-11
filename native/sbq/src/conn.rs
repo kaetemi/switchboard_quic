@@ -43,7 +43,9 @@ pub struct ConnObj {
     pub tasks: Mutex<Vec<AbortHandle>>,
     /// The client's certificate verifier rejected the server's certificate.
     pub rejected: Arc<AtomicBool>,
-    pub streams: Mutex<HashSet<u64>>,
+    /// The connection's streams in the stream table; None once released, so that a stream an
+    /// accept or open task completes afterwards is dropped instead of registered.
+    pub streams: Mutex<Option<HashSet<u64>>>,
 }
 
 impl ConnObj {
@@ -56,7 +58,7 @@ impl ConnObj {
             end: Mutex::new(None),
             tasks: Mutex::new(Vec::new()),
             rejected,
-            streams: Mutex::new(HashSet::new()),
+            streams: Mutex::new(Some(HashSet::new())),
         })
     }
 
@@ -142,6 +144,15 @@ impl ConnObj {
     /// Forgets the connection: closes it with code 0 if it is still open, stops its tasks and
     /// drops its streams.
     pub fn release(&self) {
+        // Recorded first, as `close` does: a dial task whose handshake completes concurrently
+        // (an abort only takes effect at its next await) then closes the connection itself
+        // instead of keeping it alive with no handle (see `connect`).
+        {
+            let mut lc = lock(&self.local_close);
+            if lc.is_none() {
+                *lc = Some((0, Vec::new()));
+            }
+        }
         if let Some(c) = lock(&self.conn).take() {
             if c.close_reason().is_none() {
                 c.close(0u32.into(), b"");
@@ -150,7 +161,7 @@ impl ConnObj {
         for t in lock(&self.tasks).drain(..) {
             t.abort();
         }
-        let streams: Vec<u64> = lock(&self.streams).drain().collect();
+        let streams = lock(&self.streams).take().unwrap_or_default();
         // Dropped after the table lock is released: dropping a stream takes quinn's lock.
         let _removed: Vec<_> = {
             let mut table = lock(&STREAMS);
@@ -166,8 +177,9 @@ fn watch(obj: &Arc<ConnObj>, conn: Connection) {
     let c = conn.clone();
     let accept = rt().spawn(async move {
         while let Ok((s, r)) = c.accept_bi().await {
-            let sh = stream::insert(&o, s, r);
-            o.ctx.post(SBQ_EV_STREAM, sh, o.handle as i64, 0);
+            if stream::insert(&o, s, r, Some(SBQ_EV_STREAM)).is_none() {
+                break;
+            }
         }
     });
     let o = obj.clone();
@@ -200,6 +212,14 @@ async fn handshake(inc: quinn::Incoming, ctx: Arc<Ctx>, listener: u64) {
     if let Ok(conn) = connecting.await {
         let obj = ConnObj::new(ctx, Some(conn.clone()), Arc::new(AtomicBool::new(false)));
         lock(&CONNS).insert(obj.handle, obj.clone());
+        // `sbq_shutdown` closes the context before it sweeps the table: a handshake that completes
+        // during the sweep either is in the table for it, or sees the context closed here.
+        if obj.ctx.is_closed() {
+            if let Some(o) = lock(&CONNS).remove(&obj.handle) {
+                o.release();
+            }
+            return;
+        }
         obj.ctx
             .post(SBQ_EV_INCOMING, obj.handle, listener as i64, 0);
         watch(&obj, conn);
@@ -374,7 +394,8 @@ pub fn connect(
             Ok(conn) => {
                 {
                     let mut slot = lock(&o.conn);
-                    // A close asked for during the handshake (which reported CLOSED already).
+                    // A close asked for during the handshake (which reported CLOSED already), or
+                    // a release: either recorded `local_close` before looking at the slot.
                     if let Some((code, reason)) = lock(&o.local_close).clone() {
                         conn.close(quinn::VarInt::from_u64(code).unwrap_or_default(), &reason);
                         return;

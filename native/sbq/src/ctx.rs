@@ -30,9 +30,9 @@ use crate::conn::{ConnObj, ListenerObj};
 use crate::stream::StreamObj;
 
 /// The doorbell: called from the notifier thread, with the context id, when the context's event
-/// queue went from empty to non-empty (or still holds events after a poll that filled the
-/// caller's buffer). The embedder answers with `sbq_poll` until it returns fewer events than it
-/// asked for. Never called again for a context once `sbq_shutdown` returned.
+/// queue went from empty to non-empty. The embedder answers with `sbq_poll` until it returns fewer
+/// events than it asked for (the queue is then empty, and the next event rings again). Never
+/// called again for a context once `sbq_shutdown` returned.
 pub type SbqDoorbell = extern "C" fn(ctx: u64);
 
 /// One event, as `sbq_poll` delivers it. The meaning of `handle`, `a` and `b` depends on `kind`
@@ -89,17 +89,23 @@ impl Ctx {
         }
     }
 
-    /// Moves up to `out.len()` events into `out`; returns how many.
-    pub fn poll(&self, out: &mut [SbqEvent]) -> usize {
+    /// Hands up to `cap` events to `put` (with their index), oldest first; returns how many. Fewer
+    /// than `cap` means the queue is empty now, and the next post rings the doorbell again.
+    pub fn poll(&self, cap: usize, mut put: impl FnMut(usize, SbqEvent)) -> usize {
         let mut q = lock(&self.queue);
-        let n = out.len().min(q.events.len());
-        for (slot, ev) in out.iter_mut().zip(q.events.drain(..n)) {
-            *slot = ev;
+        let n = cap.min(q.events.len());
+        for (i, ev) in q.events.drain(..n).enumerate() {
+            put(i, ev);
         }
         if q.events.is_empty() {
             q.rung = false;
         }
         n
+    }
+
+    /// Whether `sbq_shutdown` closed the context.
+    pub fn is_closed(&self) -> bool {
+        lock(&self.queue).closed
     }
 
     /// Stops event delivery: drops queued events, and returns once no doorbell call for this

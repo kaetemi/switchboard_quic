@@ -38,6 +38,16 @@ import 'sbq_bindings.g.dart';
 /// The ALPN protocol of raw QUIC Switchboard connections.
 const String quicAlpn = 'switchboard';
 
+/// The largest application error code QUIC carries (a variable-length
+/// integer).
+const int _maxCode = (1 << 62) - 1;
+
+void _checkCode(int code) {
+  if (code < 0 || code > _maxCode) {
+    throw ArgumentError.value(code, 'code', 'must be 0 to 2^62 - 1');
+  }
+}
+
 /// A certificate and its private key, both DER, with the certificate's
 /// SHA-256 (what a client pins).
 final class NativeCertificate {
@@ -465,12 +475,15 @@ final class NativeQuicSession implements QuicSession {
     );
     if (r == SBQ_OK) return out;
     if (r == SBQ_ERR_STATE) return null;
+    if (r == SBQ_ERR_ARG) {
+      throw ArgumentError.value(length, 'length', _Sbq.lastError());
+    }
     throw _Sbq.failure(r, 'exportKeyingMaterial');
   }
 
   @override
   Future<void> close(int code, String reason) {
-    if (code < 0) throw ArgumentError.value(code, 'code');
+    _checkCode(code);
     if (_end == null && !_closeSent) {
       _closeSent = true;
       final r = _truncateUtf8(utf8.encode(reason), 1024);
@@ -636,8 +649,22 @@ final class NativeQuicStream implements QuicStream {
 
   @override
   set priority(int value) {
-    if (!_released && !_sendEnded) sbq_stream_set_priority(_handle, value);
+    if (!_released && !_sendEnded) {
+      sbq_stream_set_priority(_handle, quinnPriority(value));
+    }
   }
+
+  /// quinn's send priority for a priority class of the contract. quinn's
+  /// levels are strict, and the contract wants class 2 (the control stream)
+  /// strictly first but classes 1 (ordinary) and 0 (bulk) never starving
+  /// each other: 1 and 0 share quinn's level 0 (a new stream's), where quinn
+  /// sends their streams round robin; a class `c` above 1 is level `c - 1`,
+  /// so 2 is level 1; a negative class is the level of the same value.
+  static int quinnPriority(int priorityClass) =>
+      (priorityClass > 0 ? priorityClass - 1 : priorityClass).clamp(
+        -0x80000000,
+        0x7FFFFFFF,
+      );
 
   @override
   Future<Uint8List?> read(int max) {
@@ -778,7 +805,7 @@ final class NativeQuicStream implements QuicStream {
 
   @override
   void reset(int code) {
-    if (code < 0) throw ArgumentError.value(code, 'code');
+    _checkCode(code);
     if (_released || _resetSent || _sendFailure != null) return;
     _resetSent = true;
     sbq_stream_reset(_handle, code);
@@ -789,7 +816,7 @@ final class NativeQuicStream implements QuicStream {
 
   @override
   void stop(int code) {
-    if (code < 0) throw ArgumentError.value(code, 'code');
+    _checkCode(code);
     if (_released || _recvEnded) return;
     sbq_stream_stop(_handle, code);
     final failure = _recvFailure = QuicStreamReset(code);

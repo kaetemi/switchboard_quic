@@ -61,10 +61,11 @@ pub fn code_result(code: u64) -> i64 {
 
 impl StreamObj {
     /// STOP_SENDING arrived: reset the direction with the same code (RFC 9000 section 3.5; quinn
-    /// leaves it to the application).
+    /// leaves it to the application), also when it is finished but not acknowledged yet, which
+    /// ends the retransmission of data the peer discards.
     fn peer_stopped(&self, code: VarInt) {
         let mut g = lock(&self.inner);
-        if g.send_state == SendState::Open {
+        if matches!(g.send_state, SendState::Open | SendState::Finished) {
             let _ = g.send.reset(code);
             g.send_state = SendState::Stopped(code.into_inner());
         }
@@ -170,8 +171,23 @@ impl StreamObj {
     }
 }
 
-/// Registers a new stream of `conn` and starts its STOP_SENDING / acknowledgement task.
-pub fn insert(conn: &Arc<ConnObj>, send: SendStream, recv: RecvStream) -> u64 {
+/// Registers a new stream of `conn`, posts `announce` (STREAM or OPENED, with the connection) if
+/// given, and only then starts its STOP_SENDING / acknowledgement task, so that the embedder
+/// learns the handle before any event of the stream. None when the connection was released
+/// meanwhile (the stream is dropped, which quinn turns into a finish and a STOP_SENDING 0 on a
+/// connection that the release closed anyway).
+pub fn insert(
+    conn: &Arc<ConnObj>,
+    send: SendStream,
+    recv: RecvStream,
+    announce: Option<i32>,
+) -> Option<u64> {
+    let mut ids = lock(&conn.streams);
+    let Some(set) = ids.as_mut() else {
+        drop(ids);
+        drop((send, recv));
+        return None;
+    };
     let h = next_handle();
     let ctx: Arc<Ctx> = conn.ctx.clone();
     let stopped = send.stopped();
@@ -194,8 +210,14 @@ pub fn insert(conn: &Arc<ConnObj>, send: SendStream, recv: RecvStream) -> u64 {
         write_waker: waker(SBQ_EV_WRITABLE),
     });
     let weak = Arc::downgrade(&obj);
+    // Lock order: the connection's stream set, then the stream table (`ConnObj::release` and
+    // `release` below take them one at a time).
     lock(&STREAMS).insert(h, obj);
-    lock(&conn.streams).insert(h);
+    set.insert(h);
+    drop(ids);
+    if let Some(kind) = announce {
+        ctx.post(kind, h, conn.handle as i64, 0);
+    }
     rt().spawn(async move {
         match stopped.await {
             Ok(Some(code)) => {
@@ -208,7 +230,7 @@ pub fn insert(conn: &Arc<ConnObj>, send: SendStream, recv: RecvStream) -> u64 {
             Err(_) => {}
         }
     });
-    h
+    Some(h)
 }
 
 /// Opens a bidirectional stream now if the peer's stream limit allows it; otherwise waits for
@@ -223,7 +245,9 @@ pub fn open(conn_h: u64) -> i64 {
     {
         let mut fut = pin!(conn.open_bi());
         match fut.as_mut().poll(&mut Context::from_waker(Waker::noop())) {
-            Poll::Ready(Ok((s, r))) => return insert(&obj, s, r) as i64,
+            Poll::Ready(Ok((s, r))) => {
+                return insert(&obj, s, r, None).map_or(SBQ_ERR_CONNECTION, |h| h as i64)
+            }
             Poll::Ready(Err(_)) => return SBQ_ERR_CONNECTION,
             Poll::Pending => {}
         }
@@ -231,8 +255,7 @@ pub fn open(conn_h: u64) -> i64 {
     let o = obj.clone();
     let task = rt().spawn(async move {
         if let Ok((s, r)) = conn.open_bi().await {
-            let sh = insert(&o, s, r);
-            o.ctx.post(SBQ_EV_OPENED, sh, o.handle as i64, 0);
+            insert(&o, s, r, Some(SBQ_EV_OPENED));
         }
     });
     obj.add_task(task.abort_handle());
@@ -246,7 +269,9 @@ pub fn release(h: u64) -> i32 {
         return SBQ_ERR_HANDLE as i32;
     };
     if let Some(conn) = crate::ctx::get(&CONNS, obj.conn) {
-        lock(&conn.streams).remove(&h);
+        if let Some(set) = lock(&conn.streams).as_mut() {
+            set.remove(&h);
+        }
     }
     drop(obj);
     SBQ_OK as i32

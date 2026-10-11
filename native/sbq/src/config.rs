@@ -140,18 +140,23 @@ fn verify_signatures_13(
     )
 }
 
-/// Compares `hash` against every pin without an early exit: the loop runs over all pins and all
-/// bytes whatever the contents, so the time taken says nothing about how much of a pin matched.
+/// Whether `hash` equals one of `pins`, in time that depends only on the number of pins: every
+/// byte of every pin is compared, the per-pin result is turned into 0 or 1 arithmetically (no
+/// comparison the compiler could make a branch of), and `black_box` keeps the optimiser from
+/// reasoning about the accumulated values (for example stopping once a pin has matched).
 pub(crate) fn pin_matches(pins: &[[u8; 32]], hash: &[u8; 32]) -> bool {
     let mut any = 0u8;
     for pin in pins {
         let mut diff = 0u8;
-        for (a, b) in pin.iter().zip(hash.iter()) {
-            diff |= a ^ b;
+        for i in 0..32 {
+            diff |= pin[i] ^ hash[i];
         }
-        any |= (diff == 0) as u8;
+        let diff = std::hint::black_box(diff);
+        // 1 when diff is 0: 0 - 1 borrows into the high byte, 1..=255 - 1 does not.
+        let equal = ((u16::from(diff).wrapping_sub(1) >> 8) & 1) as u8;
+        any = std::hint::black_box(any | equal);
     }
-    any != 0
+    any == 1
 }
 
 /// Pinned hashes, or nothing at all when the list is empty (Verify::None). The handshake
@@ -329,8 +334,9 @@ fn der_len(b: &[u8]) -> Option<usize> {
     }
     let len = b[2..2 + count]
         .iter()
-        .fold(0usize, |acc, &x| (acc << 8) | x as usize);
-    Some(2 + count + len)
+        .fold(0u64, |acc, &x| (acc << 8) | u64::from(x));
+    // Checked: on a 32-bit target four length bytes near 2^32 would wrap the sum.
+    usize::try_from(len).ok()?.checked_add(2 + count)
 }
 
 /// Builds the quinn server configuration: TLS 1.3 only, no client authentication, no 0-RTT.
