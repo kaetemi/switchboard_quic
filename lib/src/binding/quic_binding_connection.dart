@@ -91,7 +91,7 @@ class QuicBindingConnection extends BindingConnection {
   /// Starts the binding over [session], an established QUIC connection or
   /// WebTransport session ([isWebTransport]), and returns the connection
   /// once it can open channels: on the initiator, once the control stream
-  /// is open with its OPEN record and `HELLO` handed to the stack.
+  /// is open, its OPEN record and `HELLO` written first.
   ///
   /// Asks the session for its exporter first (RFC 9266's
   /// `EXPORTER-Channel-Binding` on raw QUIC, the application label

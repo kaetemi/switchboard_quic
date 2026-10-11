@@ -303,14 +303,17 @@ class QuicSwitchboardListener {
     }
   }
 
-  /// Identifies to [connection]'s peer, naming it, once its exporter-bound
-  /// `IDENT` verified (or the TLS handshake authenticated it): that
-  /// verification is what asks this side to.
+  /// Identifies to [connection]'s peer, naming it, once its `IDENT`
+  /// verified: that verification is what asks this side to. Under
+  /// [QuicIdentityRules.identifyOnlyToIdentifiedPeer] (the listener's
+  /// default) only once its exporter-bound `IDENT` verified.
   Future<void> _identifyInReturn(
     QuicBindingConnection connection,
     PeerIdentity identity,
   ) async {
-    if (!connection.peerAuthenticated || !connection.isOpen) {
+    final rules = connection.quicOptions.identity;
+    if (!connection.isOpen ||
+        (rules.identifyOnlyToIdentifiedPeer && !connection.peerAuthenticated)) {
       return;
     }
     try {

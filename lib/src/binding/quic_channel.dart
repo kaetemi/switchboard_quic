@@ -95,6 +95,9 @@ class QuicChannel extends MuxChannel {
   bool _sendEnded = false;
   bool _stopSent = false;
   Timer? _confirmTimer;
+  // Completes once this side's direction is acknowledged, or will never
+  // be: what a graceful close of the connection waits for.
+  Completer<void>? _acknowledged;
   final List<Completer<void>> _writableWaiters = [];
 
   // Receiving.
@@ -317,6 +320,7 @@ class QuicChannel extends MuxChannel {
       _closeQueued = true;
       _noteStatus(status);
       _pendingClose = status;
+      _trackAcknowledgement();
       _startConfirmTimer();
       if (!status.isOk) {
         // A rejection or a failure: this side will not read what is still
@@ -343,6 +347,7 @@ class QuicChannel extends MuxChannel {
       return;
     }
     if (_ended) {
+      _neverWritten();
       return;
     }
     final opening = connection.session.openStream();
@@ -393,9 +398,19 @@ class QuicChannel extends MuxChannel {
     }
     if (_ended) {
       connection._release(stream, StatusCode.cancelled.code);
+      _neverWritten();
       return;
     }
     _attach(stream, RecordReader(stream), openWritten: false);
+  }
+
+  /// The channel ended before its stream opened (closed with a failure,
+  /// or the confirmation timed out): nothing of it will be written.
+  void _neverWritten() {
+    _sendEnded = true;
+    _pendingClose = null;
+    _dropOut();
+    _acknowledge();
   }
 
   /// The stream of this channel: [openWritten] for the peer's channels,
@@ -435,6 +450,7 @@ class QuicChannel extends MuxChannel {
     _closeQueued = true;
     _pendingClose = null;
     _dropOut();
+    _acknowledge();
     _endIncoming();
     _end();
   }
@@ -538,6 +554,11 @@ class QuicChannel extends MuxChannel {
             for (final completer in completers) {
               completer.completeError(error);
             }
+            if (_sendEnded) {
+              // This side reset its direction meanwhile.
+              _wakeWritable();
+              return;
+            }
             if (e is QuicStreamStopped) {
               _onStopSending(e.code);
             } else {
@@ -546,6 +567,7 @@ class QuicChannel extends MuxChannel {
               _closeQueued = true;
               _pendingClose = null;
               _dropOut();
+              _acknowledge();
               if (e is! QuicException) {
                 _log.warning('$this: write failed: $e');
                 _abort(Status.of(StatusCode.internal, 'write failed'));
@@ -565,12 +587,29 @@ class QuicChannel extends MuxChannel {
   /// The CLOSE record was taken: FIN ends this side's direction.
   void _finishDirection(QuicStream stream) {
     _sendEnded = true;
-    stream.finish().then((_) {
-      connection._trackFinishing(
-        stream.stopped.then<void>((_) {}, onError: (Object _) {}),
-      );
-    }, onError: (Object _) {}).ignore();
+    stream
+        .finish()
+        .then((_) => stream.stopped)
+        .then((_) => _acknowledge(), onError: (Object _) => _acknowledge())
+        .ignore();
     _checkEnd();
+  }
+
+  /// This side closed: a graceful close of the connection waits until its
+  /// direction is acknowledged (or never will be).
+  void _trackAcknowledgement() {
+    if (_acknowledged != null) {
+      return;
+    }
+    final acknowledged = _acknowledged = Completer<void>();
+    connection._trackFinishing(acknowledged.future);
+  }
+
+  void _acknowledge() {
+    final acknowledged = _acknowledged;
+    if (acknowledged != null && !acknowledged.isCompleted) {
+      acknowledged.complete();
+    }
   }
 
   /// Ends this side's direction with a reset carrying [code]: what was
@@ -584,6 +623,7 @@ class QuicChannel extends MuxChannel {
     _pendingClose = null;
     _dropOut();
     _stream?.reset(code);
+    _acknowledge();
   }
 
   /// Sends `STOP_SENDING` with [code] once: this side reads no more of
@@ -638,6 +678,7 @@ class QuicChannel extends MuxChannel {
       _closeQueued = true;
       if (!_sendEnded) {
         _pendingClose = Status.ok;
+        _trackAcknowledgement();
       }
     } else if (!_sendEnded && _pendingClose != null) {
       // Ours waited behind data: it goes at once.
@@ -797,6 +838,7 @@ class QuicChannel extends MuxChannel {
     _closeQueued = true;
     _peerEnded = true;
     _dropOut();
+    _acknowledge();
     _endIncoming();
     _end();
   }
