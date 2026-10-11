@@ -1,4 +1,6 @@
 build/
 .dart_tool/
 pubspec.lock
-native/target/
+native/sbq/target/
+# Prebuilt shims are release artifacts (see native/README.md), never committed.
+native/sbq/prebuilt/*/
