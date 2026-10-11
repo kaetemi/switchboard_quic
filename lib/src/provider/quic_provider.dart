@@ -5,6 +5,7 @@ Copyright (C) 2018-2026  Jan BOON (Kaetemi)
 Authors:
   Jan Boon <jan.boon@kaetemi.be>
   Claude Fable 5.1 <noreply@anthropic.com>
+  Claude Opus 5.5 <noreply@anthropic.com>
 */
 
 /// The stream provider contract of the QUIC and WebTransport binding.
@@ -74,10 +75,13 @@ abstract interface class QuicSession {
   int? get maxIncomingStreams;
 
   /// RFC 8446 section 7.5 keying material; null when the stack has no
-  /// exporter (a browser without `exportKeyingMaterial`). Over WebTransport
-  /// the provider applies the per-session exporter of the draft itself, so
-  /// [label] and [context] are the application's (`switchboard-ident`,
-  /// empty) on every provider.
+  /// exporter (a browser without `exportKeyingMaterial`). On a raw QUIC
+  /// connection [label] and [context] go to the TLS exporter unchanged (the
+  /// binding asks for RFC 9266's `EXPORTER-Channel-Binding`, empty context).
+  /// Over WebTransport the provider applies the per-session exporter of the
+  /// draft itself (label `EXPORTER-WebTransport`, the session ID and the
+  /// application's label and context in the TLS context), so [label] and
+  /// [context] are the application's (`switchboard-ident`, empty).
   Future<Uint8List?> exportKeyingMaterial(
     String label,
     Uint8List context,
@@ -100,13 +104,17 @@ abstract interface class QuicSession {
 abstract interface class QuicStream {
   /// Reads the next chunk, at most [max] bytes; null at the peer's FIN.
   /// Fails with [QuicStreamReset] when the peer reset its direction (the
-  /// code is the status). Only one read may be pending at a time.
+  /// code is the status), and with [QuicException] once the session has
+  /// ended. Only one read may be pending at a time. The binding does not
+  /// read again after [stop].
   Future<Uint8List?> read(int max);
 
   /// Writes [bytes]; completes once the stack has accepted them (they are
   /// copied, the buffer may be reused). Waits for stream and connection
   /// credit, so a peer that does not read stalls the writer. Fails with
-  /// [QuicStreamStopped] once the peer sent `STOP_SENDING` (its code).
+  /// [QuicStreamStopped] once the peer sent `STOP_SENDING` (its code), and
+  /// with [QuicException] once the session has ended. The binding has at
+  /// most one write pending per stream.
   Future<void> write(Uint8List bytes);
 
   /// Ends this side's direction (FIN) after everything written.
@@ -116,12 +124,18 @@ abstract interface class QuicStream {
   /// delivered is discarded.
   void reset(int code);
 
-  /// Asks the peer to stop sending with [code] (`STOP_SENDING`); the
-  /// peer's direction then ends with a reset the next [read] reports.
+  /// Asks the peer to stop sending with [code] (`STOP_SENDING`); what was
+  /// not read yet may be discarded, and the peer's direction ends with a
+  /// reset. A read pending meanwhile may complete, or fail with the reset
+  /// or a [QuicException]; the binding reads no more.
   void stop(int code);
 
-  /// Sender-local priority: higher first, strict between levels. The
-  /// binding uses 2 for the control stream, 1 ordinary, 0 bulk.
+  /// Sender-local priority class. The binding uses 2 for the control
+  /// stream, 1 for ordinary channels and 0 for bulk ones. 2 goes first,
+  /// strictly. 1 and 0 share what is left so that neither starves the
+  /// other: a stack whose priorities are strict only (quinn) puts 1 and 0
+  /// on one level, below 2, where it interleaves them; one with weights or
+  /// send groups (the W3C API's `sendGroup`) favours 1 without starving 0.
   set priority(int value);
 
   /// Completes when the peer's `STOP_SENDING` arrived (with its code) or
@@ -138,6 +152,7 @@ class QuicClientConfig {
     this.verifyCertificate = true,
     this.maxStreamsBidi = 128,
     this.streamReceiveWindow = 1 << 20,
+    this.receiveWindow = 16 << 20,
     this.idleTimeout = const Duration(seconds: 30),
     this.keepAlive = const Duration(seconds: 10),
   });
@@ -153,6 +168,10 @@ class QuicClientConfig {
   final bool verifyCertificate;
   final int maxStreamsBidi;
   final int streamReceiveWindow;
+
+  /// The connection receive window (`MAX_DATA`) shared by every stream:
+  /// the backstop for the stream windows together.
+  final int receiveWindow;
   final Duration idleTimeout;
   final Duration keepAlive;
 }
@@ -165,6 +184,7 @@ class QuicServerConfig {
     required this.privateKeyDer,
     this.maxStreamsBidi = 128,
     this.streamReceiveWindow = 1 << 20,
+    this.receiveWindow = 16 << 20,
     this.idleTimeout = const Duration(seconds: 30),
     this.keepAlive = const Duration(seconds: 10),
   });
@@ -174,6 +194,9 @@ class QuicServerConfig {
   final Uint8List privateKeyDer;
   final int maxStreamsBidi;
   final int streamReceiveWindow;
+
+  /// As [QuicClientConfig.receiveWindow].
+  final int receiveWindow;
   final Duration idleTimeout;
   final Duration keepAlive;
 }
@@ -216,7 +239,11 @@ enum QuicExceptionKind {
 /// The peer reset its direction of a stream.
 class QuicStreamReset implements Exception {
   const QuicStreamReset(this.code);
-  final int code;
+
+  /// The application error code; null when the stack delivered none (a
+  /// WebTransport reset outside the application range, such as those of a
+  /// terminating session).
+  final int? code;
   @override
   String toString() => 'QuicStreamReset($code)';
 }
@@ -224,7 +251,10 @@ class QuicStreamReset implements Exception {
 /// The peer asked this side to stop sending.
 class QuicStreamStopped implements Exception {
   const QuicStreamStopped(this.code);
-  final int code;
+
+  /// The application error code; null when the stack delivered none, as
+  /// for [QuicStreamReset.code].
+  final int? code;
   @override
   String toString() => 'QuicStreamStopped($code)';
 }
