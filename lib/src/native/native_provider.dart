@@ -5,6 +5,7 @@ Copyright (C) 2018-2026  Jan BOON (Kaetemi)
 Authors:
   Jan Boon <jan.boon@kaetemi.be>
   Claude Opus 5.5 <noreply@anthropic.com>
+  GLM 5.3 Flash <noreply@z.ai>
 */
 
 /// The native stream provider: raw QUIC over quinn, through the sbq shim
@@ -383,6 +384,9 @@ final class NativeQuicSession implements QuicSession {
   /// Changes how many streams the peer may have open at once (`MAX_STREAMS`).
   /// Lowering it takes effect as the peer's streams end.
   void setMaxIncomingStreams(int count) {
+    if (count < 0) {
+      throw ArgumentError.value(count, 'count', 'must not be negative');
+    }
     if (_end != null) return;
     final r = sbq_conn_set_max_bidi(_handle, count);
     if (r != SBQ_OK) throw _Sbq.failure(r, 'setMaxIncomingStreams');

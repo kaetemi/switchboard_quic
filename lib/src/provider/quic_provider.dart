@@ -6,6 +6,7 @@ Authors:
   Jan Boon <jan.boon@kaetemi.be>
   Claude Fable 5.1 <noreply@anthropic.com>
   Claude Opus 5.5 <noreply@anthropic.com>
+  GLM 5.3 Flash <noreply@z.ai>
 */
 
 /// The stream provider contract of the QUIC and WebTransport binding.
@@ -69,8 +70,9 @@ abstract interface class QuicSession {
   /// Opens a bidirectional stream. Waits for stream credit; fails with
   /// [QuicException] once the session has ended. Nothing is visible to the
   /// peer until the first write. Waiting calls are served in order. A caller
-  /// that stops waiting (a timeout) resets the stream the call still yields,
-  /// since an opened stream holds a unit of the peer's stream limit.
+  /// that stops waiting (a timeout) should reset the stream the call still
+  /// yields once it arrives, since an opened stream holds a unit of the
+  /// peer's stream limit.
   Future<QuicStream> openStream();
 
   /// Streams the peer opened, in the order the stack delivers them (no

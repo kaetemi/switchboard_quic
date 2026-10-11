@@ -5,6 +5,7 @@ Copyright (C) 2018-2026  Jan BOON (Kaetemi)
 Authors:
   Jan Boon <jan.boon@kaetemi.be>
   Claude Opus 5.5 <noreply@anthropic.com>
+  GLM 5.3 Flash <noreply@z.ai>
 */
 
 //! sbq: a flat extern "C" shim over quinn (QUIC with rustls and ring) for the native stream
@@ -217,6 +218,10 @@ pub extern "C" fn sbq_shutdown(ctx_id: u64) -> i32 {
     SBQ_OK as i32
 }
 
+/// The largest `cap` `sbq_poll` acts on; anything above is clamped down, which the drain-until-
+/// fewer-than-`cap` protocol cannot observe.
+const POLL_CAP_MAX: usize = 1 << 12;
+
 /// Moves up to `cap` queued events of the context into `out`; returns how many. Call until it
 /// returns less than `cap` after each doorbell.
 #[no_mangle]
@@ -227,7 +232,7 @@ pub unsafe extern "C" fn sbq_poll(ctx_id: u64, out: *mut SbqEvent, cap: usize) -
     let Some(ctx) = get(&CTXS, ctx_id) else {
         return 0;
     };
-    ctx.poll(std::slice::from_raw_parts_mut(out, cap))
+    ctx.poll(std::slice::from_raw_parts_mut(out, cap.min(POLL_CAP_MAX)))
 }
 
 /// Copies the message of the last failure on the calling thread into `out` (up to `cap` bytes,
@@ -331,10 +336,16 @@ pub unsafe extern "C" fn sbq_client_config(
         SBQ_VERIFY_PLATFORM => Verify::Platform,
         SBQ_VERIFY_NONE => Verify::None,
         SBQ_VERIFY_PINNED => {
-            let raw = bytes(pins, pin_count * 32);
-            if raw.is_empty() {
+            // The count is bounded before it is multiplied: a huge count would overflow the
+            // length (panicking in a debug build) or claim a buffer far larger than any caller
+            // has.
+            if pin_count == 0 {
                 return fail(SBQ_ERR_ARG, "no pinned hash");
             }
+            if pin_count > 1024 {
+                return fail(SBQ_ERR_ARG, "too many pinned hashes");
+            }
+            let raw = bytes(pins, pin_count * 32);
             Verify::Pinned(
                 raw.chunks_exact(32)
                     .map(|c| c.try_into().expect("32 bytes"))

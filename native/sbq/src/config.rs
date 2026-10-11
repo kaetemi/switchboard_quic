@@ -5,6 +5,7 @@ Copyright (C) 2018-2026  Jan BOON (Kaetemi)
 Authors:
   Jan Boon <jan.boon@kaetemi.be>
   Claude Opus 5.5 <noreply@anthropic.com>
+  GLM 5.3 Flash <noreply@z.ai>
 */
 
 //! Client and server configuration: TLS 1.3 through rustls with ring, certificate verification
@@ -139,6 +140,20 @@ fn verify_signatures_13(
     )
 }
 
+/// Compares `hash` against every pin without an early exit: the loop runs over all pins and all
+/// bytes whatever the contents, so the time taken says nothing about how much of a pin matched.
+pub(crate) fn pin_matches(pins: &[[u8; 32]], hash: &[u8; 32]) -> bool {
+    let mut any = 0u8;
+    for pin in pins {
+        let mut diff = 0u8;
+        for (a, b) in pin.iter().zip(hash.iter()) {
+            diff |= a ^ b;
+        }
+        any |= (diff == 0) as u8;
+    }
+    any != 0
+}
+
 /// Pinned hashes, or nothing at all when the list is empty (Verify::None). The handshake
 /// signature is always checked against the presented certificate's key.
 #[derive(Debug)]
@@ -156,7 +171,7 @@ impl ServerCertVerifier for PinVerifier {
         _ocsp: &[u8],
         _now: UnixTime,
     ) -> Result<ServerCertVerified, rustls::Error> {
-        if self.any || self.pins.contains(&sha256(end_entity.as_ref())) {
+        if self.any || pin_matches(&self.pins, &sha256(end_entity.as_ref())) {
             Ok(ServerCertVerified::assertion())
         } else {
             Err(rustls::Error::InvalidCertificate(
@@ -345,7 +360,8 @@ pub fn server_config(
 
 /// A self-signed ECDSA P-256 certificate for `subject` (its common name and its one subject
 /// alternative name, an IP address if it parses as one), valid from five minutes ago for
-/// `validity_days` days. Returns the certificate DER and the PKCS#8 private key DER.
+/// `validity_days` days. Returns the certificate DER and the PKCS#8 private key DER. A validity
+/// that reaches past what a timestamp can hold is an error, not an overflow.
 pub fn self_signed(subject: &str, validity_days: u32) -> Result<(Vec<u8>, Vec<u8>), String> {
     let key =
         rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).map_err(|e| e.to_string())?;
@@ -356,7 +372,10 @@ pub fn self_signed(subject: &str, validity_days: u32) -> Result<(Vec<u8>, Vec<u8
     params.distinguished_name = dn;
     let start = time::OffsetDateTime::now_utc() - time::Duration::minutes(5);
     params.not_before = start;
-    params.not_after = start + time::Duration::days(validity_days.max(1) as i64);
+    let days = validity_days.max(1) as i64;
+    params.not_after = start
+        .checked_add(time::Duration::days(days))
+        .ok_or_else(|| format!("a validity of {days} days is out of range"))?;
     let cert = params.self_signed(&key).map_err(|e| e.to_string())?;
     Ok((cert.der().to_vec(), key.serialize_der()))
 }

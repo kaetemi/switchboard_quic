@@ -5,6 +5,7 @@ Copyright (C) 2018-2026  Jan BOON (Kaetemi)
 Authors:
   Jan Boon <jan.boon@kaetemi.be>
   Claude Opus 5.5 <noreply@anthropic.com>
+  GLM 5.3 Flash <noreply@z.ai>
 */
 
 //! Bidirectional streams: non-blocking reads and writes polled with wakers that post READABLE and
@@ -124,6 +125,8 @@ impl StreamObj {
     pub fn finish(&self) -> i64 {
         let mut g = lock(&self.inner);
         match g.send_state {
+            // quinn's finish reports a STOP_SENDING that raced in as Ok and leaves the code to
+            // the stopped() task above, so only "already ended" can be seen here.
             SendState::Open => match g.send.finish() {
                 Ok(()) => {
                     g.send_state = SendState::Finished;

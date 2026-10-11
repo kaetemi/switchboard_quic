@@ -5,6 +5,7 @@ Copyright (C) 2018-2026  Jan BOON (Kaetemi)
 Authors:
   Jan Boon <jan.boon@kaetemi.be>
   Claude Opus 5.5 <noreply@anthropic.com>
+  GLM 5.3 Flash <noreply@z.ai>
 */
 
 // The native provider end to end over loopback: both sides in this isolate,
@@ -322,6 +323,18 @@ void main() {
       p = await Pair.connect(server);
     });
 
+    test('a second read while one is pending throws StateError', () async {
+      final cs = await p.client.openStream();
+      // A write first: nothing of the stream is visible to the peer before it.
+      await cs.write(bytes('hi'));
+      // Nothing from the peer yet: the read stays pending, a second is rejected.
+      final pending = cs.read(10);
+      expect(() => cs.read(10), throwsStateError);
+      final ss = await p.serverStreams.next;
+      await ss.write(bytes('x'));
+      expect(await pending, bytes('x'));
+    });
+
     test('both directions with FIN; read returns null at FIN', () async {
       final cs = await p.client.openStream();
       await cs.write(bytes('hello '));
@@ -339,6 +352,22 @@ void main() {
       expect(await ss.stopped, isNull);
       expect(() => cs.write(bytes('late')), throwsStateError);
     });
+
+    test(
+      'finish is idempotent; write after finish throws StateError',
+      () async {
+        final cs = await p.client.openStream();
+        await cs.write(bytes('fin'));
+        final f = cs.finish();
+        // Same future on a second call; writes are rejected at once, before the
+        // FIN has reached the peer.
+        expect(cs.finish(), same(f));
+        await f;
+        expect(() => cs.write(bytes('late')), throwsStateError);
+        final ss = await p.serverStreams.next;
+        expect(await readAll(ss), bytes('fin'));
+      },
+    );
 
     test('writes take views and unmodifiable lists', () async {
       final cs = await p.client.openStream();
@@ -403,6 +432,24 @@ void main() {
       await ss.finish();
       expect(await readAll(cs), bytes('z'));
     });
+
+    test(
+      'a second stop is a no-op; reads keep failing with the code',
+      () async {
+        final cs = await p.client.openStream();
+        await cs.write(bytes('x'));
+        final ss = await p.serverStreams.next;
+        await ss.read(10);
+        ss.stop(7);
+        ss.stop(7);
+        for (var i = 0; i < 2; i++) {
+          await expectLater(
+            ss.read(10),
+            throwsA(isA<QuicStreamReset>().having((e) => e.code, 'code', 7)),
+          );
+        }
+      },
+    );
 
     test('a write waiting for credit fails when the peer stops', () async {
       final cs = await p.client.openStream();
@@ -570,6 +617,23 @@ void main() {
       expect(client.lost, isTrue);
       expect(client.code, isNull);
       expect(peer.lost, isTrue);
+    });
+
+    test('the exporter fails once the session has ended', () async {
+      final server = await Server.start();
+      final p = await Pair.connect(server);
+      await p.client.close(0, '');
+      await p.client.done;
+      await expectLater(
+        p.client.exportKeyingMaterial(_exporterLabel, Uint8List(0), 32),
+        throwsA(
+          isA<QuicException>().having(
+            (e) => e.kind,
+            'kind',
+            QuicExceptionKind.sessionEnded,
+          ),
+        ),
+      );
     });
 
     test('keep-alive holds an idle connection open', () async {

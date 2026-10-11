@@ -5,6 +5,7 @@ Copyright (C) 2018-2026  Jan BOON (Kaetemi)
 Authors:
   Jan Boon <jan.boon@kaetemi.be>
   Claude Opus 5.5 <noreply@anthropic.com>
+  GLM 5.3 Flash <noreply@z.ai>
 */
 
 //! Self test of the ABI, through the extern "C" functions as an embedder calls them: a
@@ -246,6 +247,20 @@ fn write_one(h: u64) -> i64 {
 }
 
 #[test]
+fn pin_comparison() {
+    let hash = [3u8; 32];
+    assert!(config::pin_matches(&[hash], &hash));
+    assert!(config::pin_matches(&[[7u8; 32], hash], &hash));
+    assert!(!config::pin_matches(&[], &hash));
+    // One differing bit is a mismatch, at every position.
+    for bit in 0..32 {
+        let mut wrong = hash;
+        wrong[bit] ^= 1;
+        assert!(!config::pin_matches(&[hash], &wrong));
+    }
+}
+
+#[test]
 fn config_errors() {
     let _h = Harness::new();
     let bad = b"\x05abc";
@@ -272,6 +287,22 @@ fn config_errors() {
             SBQ_VERIFY_PINNED,
             none,
             0,
+            1,
+            1,
+            1,
+            0,
+            0,
+        )
+    };
+    assert_eq!(r, SBQ_ERR_ARG);
+    // A pin count that would overflow the byte length is rejected, not wrapped.
+    let r = unsafe {
+        sbq_client_config(
+            ALPN.as_ptr(),
+            ALPN.len(),
+            SBQ_VERIFY_PINNED,
+            none,
+            usize::MAX,
             1,
             1,
             1,
@@ -329,6 +360,21 @@ fn self_signed_certificate() {
     };
     assert_eq!(r, SBQ_ERR_STATE as i32);
     assert!(cl > 8 && kl > 8);
+    // An absurd validity is an error, not an overflow of the timestamp.
+    let r = unsafe {
+        sbq_generate_self_signed(
+            subject.as_ptr(),
+            1,
+            u32::MAX,
+            small.as_mut_ptr(),
+            8,
+            &mut cl,
+            key_buf.as_mut_ptr(),
+            8,
+            &mut kl,
+        )
+    };
+    assert_eq!(r, SBQ_ERR_ARG as i32);
     // Chains split on DER boundaries.
     let mut two = cert.clone();
     two.extend_from_slice(&cert);
