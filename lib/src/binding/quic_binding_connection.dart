@@ -175,7 +175,6 @@ class QuicBindingConnection extends BindingConnection {
   final Queue<QuicChannel> _undelivered = Queue<QuicChannel>();
   final Set<QuicChannel> _payloads = {};
   int _openPayloadBytes = 0;
-  int _localOpenCount = 0;
   int _nextId;
   bool _incomingScheduled = false;
   bool _incomingCancelled = false;
@@ -245,7 +244,10 @@ class QuicBindingConnection extends BindingConnection {
   Future<Status> get peerGoAwayStatus => _peerGoAwayStatus.future;
 
   /// The channels the peer accepts at once, as its `HELLO` states them; 0
-  /// before it arrives and when it states no limit.
+  /// before it arrives and when it states no limit. Advisory: the pool of
+  /// a `Switchboard` opens a further connection once it is reached, and
+  /// [open] beyond it waits for stream credit in the stack, which enforces
+  /// the limit, instead of being refused.
   @override
   int get peerMaxChannels => _peerHello?.channels ?? 0;
 
@@ -433,8 +435,9 @@ class QuicBindingConnection extends BindingConnection {
     _control = stream;
     _controlReader = reader;
     stream.stopped.then((code) {
-      if (!_closing) {
-        _protocolError('the control stream ended (${code ?? 'FIN'})');
+      // Never finished, so only a STOP_SENDING completes it with a code.
+      if (code != null && !_closing) {
+        _protocolError('STOP_SENDING on the control stream');
       }
     }, onError: (Object _) {}).ignore();
     _pumpControl();
@@ -691,9 +694,13 @@ class QuicBindingConnection extends BindingConnection {
 
   /// Stops and resets [stream], which carries no channel.
   void _release(QuicStream stream, int code) {
-    stream
-      ..stop(code)
-      ..reset(code);
+    try {
+      stream
+        ..stop(code)
+        ..reset(code);
+    } on Object catch (e) {
+      _log.fine('$this: releasing a stream: $e');
+    }
   }
 
   void _onOpen(QuicStream stream, RecordReader reader, Uint8List body) {
@@ -856,9 +863,6 @@ class QuicBindingConnection extends BindingConnection {
       return;
     }
     _channels.remove(channel.id);
-    if (channel.isLocallyOpened) {
-      _localOpenCount--;
-    }
     if (!_undelivered.contains(channel)) {
       _releasePayload(channel);
     }
@@ -902,13 +906,9 @@ class QuicBindingConnection extends BindingConnection {
         'peer is going away',
       );
     }
-    final max = peerMaxChannels;
-    if (max > 0 && _localOpenCount >= max) {
-      throw SwitchboardException.of(
-        StatusCode.resourceExhausted,
-        'peer accepts at most $max channels',
-      );
-    }
+    // The channels of the peer's HELLO are advisory (the pool reads them,
+    // [peerMaxChannels]): beyond them an open waits for stream credit in
+    // the stack, bounded by [QuicBindingOptions.openStreamTimeout].
     final size = quicChannelIdSize + openPayload.length;
     if (size > peerRecordLimit) {
       throw SwitchboardException.of(
@@ -925,7 +925,6 @@ class QuicBindingConnection extends BindingConnection {
       openPayload: Uint8List.fromList(openPayload),
     );
     _channels[id] = channel;
-    _localOpenCount++;
     return channel;
   }
 
@@ -1180,7 +1179,6 @@ class QuicBindingConnection extends BindingConnection {
     drained?.complete();
     final channels = List.of(_channels.values);
     _channels.clear();
-    _localOpenCount = 0;
     for (final channel in channels) {
       try {
         channel._connectionLost(channelStatus);

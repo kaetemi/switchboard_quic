@@ -808,21 +808,21 @@ void main() {
       expect(connection.openPayloadBytes, 80);
     });
 
-    test('the peer\'s HELLO states its channels; an open beyond them is '
-        'refused', () async {
-      final (connection, _) = await bindingAndRaw(
+    test('the peer\'s HELLO states its channels, which are advisory: an '
+        'open beyond them waits for the stack\'s stream credit', () async {
+      final (connection, raw) = await bindingAndRaw(
         bindingIsInitiator: true,
         rawHello: QuicHello(channels: 2),
       );
       await until(() => connection.peerHello != null);
       expect(connection.peerMaxChannels, 2);
-      connection
-        ..open(Uint8List(0))
-        ..open(Uint8List(0));
-      expect(
-        () => connection.open(Uint8List(0)),
-        throwsCode(StatusCode.resourceExhausted),
-      );
+      for (var i = 0; i < 3; i++) {
+        connection.open(Uint8List(0));
+      }
+      // The stack granted more streams than the HELLO stated.
+      for (var i = 0; i < 3; i++) {
+        await raw.nextStream();
+      }
     });
 
     test('a side states the channels it accepts: its stream limit less the '
@@ -906,6 +906,41 @@ void main() {
       await identifying.timeout(limit);
       return (ident, nonce.payload, ours);
     }
+
+    test('the exporter: RFC 9266\'s label on raw QUIC, the application '
+        'label over WebTransport', () async {
+      for (final webTransport in [false, true]) {
+        final (a, b) = FakeQuicSession.pair();
+        final starting = QuicBindingConnection.start(
+          b,
+          options: fast,
+          isWebTransport: webTransport,
+        );
+        final connection = await QuicBindingConnection.start(
+          a,
+          options: fast,
+          isWebTransport: webTransport,
+        );
+        final accepted = await starting;
+        addTearDown(connection.close);
+        addTearDown(accepted.close);
+        expect(a.exporterLabels, [
+          webTransport ? 'switchboard-ident' : 'EXPORTER-Channel-Binding',
+        ]);
+        expect(connection.hasExporter, isTrue);
+        await until(() => connection.exporterBound && accepted.exporterBound);
+      }
+      // A stack without one announces none.
+      final (connection, raw) = await bindingAndRaw(
+        bindingIsInitiator: true,
+        bindingEnd: const FakeEndConfig(exporter: false),
+        rawHello: QuicHello(exporter: true),
+      );
+      expect(connection.hasExporter, isFalse);
+      await until(() => connection.peerHello != null);
+      expect(connection.exporterBound, isFalse);
+      expect(raw.session.peer.exporterLabels, hasLength(1));
+    });
 
     test('both HELLOs with EXPORTER: the proof signs the exporter', () async {
       final (connection, raw) = await bindingAndRaw(

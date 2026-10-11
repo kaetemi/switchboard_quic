@@ -284,12 +284,16 @@ class FakeQuicSession implements QuicSession {
   @override
   Future<QuicSessionEnd> get done => _done.future;
 
+  /// The labels the exporter was asked for.
+  final List<String> exporterLabels = [];
+
   @override
   Future<Uint8List?> exportKeyingMaterial(
     String label,
     Uint8List context,
     int length,
   ) async {
+    exporterLabels.add(label);
     if (!config.exporter) {
       return null;
     }

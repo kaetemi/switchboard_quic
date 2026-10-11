@@ -54,6 +54,7 @@ Switchboard node({
   Resolver? resolver,
   ExpectedIdentity? expectedIdentityFor,
   Duration identityTimeout = const Duration(seconds: 2),
+  bool identifyOutgoing = true,
   MuxOptions options = fast,
 }) {
   final s = Switchboard(
@@ -65,6 +66,7 @@ Switchboard node({
     resolver: resolver,
     expectedIdentityFor: expectedIdentityFor,
     identityTimeout: identityTimeout,
+    identifyOutgoing: identifyOutgoing,
     connectTimeout: const Duration(seconds: 5),
   );
   addTearDown(s.close);
@@ -214,6 +216,70 @@ void main() {
       expect(twins[1].payload, pattern(200000, 2));
     });
 
+    test('many channels at once over jittered streams: beyond the channels a '
+        'listener states the pool opens another connection, and a burst '
+        'of opens waits for stream credit', () async {
+      final network = FakeQuicNetwork(
+        delay: (info, {required fromInitiator}) => Duration(
+          microseconds:
+              ((info.ordinal * 7919 + (fromInitiator ? 13 : 0)) % 97) * 50,
+        ),
+      );
+      final server = node();
+      server.registerService(echo, echoService);
+      final listener = await listen(
+        network,
+        server,
+        'many-1',
+        config: const FakeEndConfig(maxStreams: 101),
+      );
+      final binding = QuicSwitchboardBinding(network.connector());
+      final client = node(bindings: [binding]);
+      // 120 channels kept open: beyond the 100 the listener states, the
+      // pool dials another connection.
+      final talks = <TalkChannel>[];
+      for (var i = 0; i < 120; i++) {
+        talks.add(
+          await client.openTalkAt(
+            listener.endpoint,
+            ChannelAddress(type: echo),
+          ),
+        );
+        if (i == 0) {
+          await until(() => binding.dialled.single.peerHello != null);
+        }
+      }
+      expect(binding.dialled.first.peerMaxChannels, 100);
+      expect(binding.dialled, hasLength(2));
+      // Requests on all of them at once; bulk payloads on the channels of
+      // the second connection, the first having no stream left for them.
+      final results = await Future.wait([
+        for (var i = 0; i < talks.length; i++)
+          () async {
+            final payload = pattern(i >= 100 ? 70000 + i : 100 + i, i);
+            final reply = await talks[i].request('ECHO', payload);
+            return _same(reply.payload, payload);
+          }(),
+      ]).timeout(const Duration(seconds: 60));
+      expect(results.every((ok) => ok), isTrue);
+      await Future.wait([for (final talk in talks) talk.close()]);
+      // And as many opened at once on a pooled connection wait for stream
+      // credit instead of failing.
+      final burst = await Future.wait([
+        for (var i = 0; i < 150; i++)
+          () async {
+            final talk = await client.openTalkAt(
+              listener.endpoint,
+              ChannelAddress(type: echo),
+            );
+            final reply = await talk.request('ECHO', pattern(10, i));
+            await talk.close();
+            return _same(reply.payload, pattern(10, i));
+          }(),
+      ]).timeout(const Duration(seconds: 60));
+      expect(burst.every((ok) => ok), isTrue);
+    });
+
     test('whenWritable paces a publisher at the stream window', () async {
       final network = FakeQuicNetwork();
       final server = node();
@@ -356,6 +422,53 @@ void main() {
       expect(initiated.peerIdentityBound, isTrue);
       expect(initiated.peerAuthenticated, isTrue);
       expect(initiated.quicOptions.identity.awaitPeerIdentity, isTrue);
+    });
+
+    test('a channel that overtakes the IDENT on its own stream is held by '
+        'the node until the peer identified', () async {
+      // The control stream (0) is slow: the channel's stream arrives first.
+      final network = FakeQuicNetwork(
+        delay: (info, {required fromInitiator}) =>
+            Duration(milliseconds: info.ordinal == 0 ? 60 : 0),
+      );
+      var asked = 0;
+      final scoped = ChannelPolicies.scoped();
+      final server = node(verifier: await verifier());
+      server.registerService(npc, answer);
+      final listener = await listen(
+        network,
+        server,
+        'hold-1',
+        policy: (address, connection) {
+          asked++;
+          return scoped(address, connection);
+        },
+      );
+      final client = node(
+        bindings: [
+          QuicSwitchboardBinding(
+            network.connector(),
+            identityRules: const QuicIdentityRules(
+              requireExporterBinding: true,
+            ),
+          ),
+        ],
+        credential: await credential('npc-7', clientKey),
+        holderKey: clientKey,
+        identifyOutgoing: false,
+      );
+      final connection = await client.connect(listener.endpoint);
+      final identified = client.identifyOn(connection);
+      // Opened while the identification is under way: its stream arrives
+      // before the IDENT.
+      await until(() => (connection as QuicBindingConnection).exporterBound);
+      final channel = client.openChannelOn(
+        connection,
+        ChannelAddress(type: npc),
+      );
+      expect(await answerOf(channel), 'npc for npc-7');
+      await identified.timeout(limit);
+      expect(asked, 2);
     });
 
     test('an initiator with a credential reaches only an acceptor that '
@@ -895,4 +1008,16 @@ void main() {
       );
     });
   });
+}
+
+bool _same(List<int> a, List<int> b) {
+  if (a.length != b.length) {
+    return false;
+  }
+  for (var i = 0; i < a.length; i++) {
+    if (a[i] != b[i]) {
+      return false;
+    }
+  }
+  return true;
 }
