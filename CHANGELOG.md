@@ -15,12 +15,11 @@
   endpoints) and `QuicSwitchboardListener` for `Switchboard` nodes; the
   wire codecs, the exporter labels and the WebTransport error code
   mapping.
-* Provider contract: reset and stop codes may be absent (`int?`, a
-  WebTransport reset without an application code), a connection receive
-  window in both configurations, and the documented semantics of priority
-  classes (1 and 0 never starving each other), of the exporter on raw QUIC
-  and WebTransport, of reads after `stop`, and of pending reads and writes
-  when the session ends.
+* Provider contract (on top of the native provider's amendments): reset
+  and stop codes may be absent (`int?`, a WebTransport reset without an
+  application code), and the priority classes 1 and 0 never starve each
+  other (a stack with strict priorities only puts them on one level).
+* `package:switchboard_quic/core.dart`: what compiles for the web.
 * Tests: an in-memory provider with independent stream delivery, the test
   vectors of the page, the connection and channel contracts, and two nodes
   end to end.
