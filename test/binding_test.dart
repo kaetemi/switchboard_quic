@@ -437,6 +437,48 @@ void main() {
       expect(end, StatusCode.deadlineExceeded.code);
     });
 
+    test(
+      'a close whose CLOSE record waits behind data the peer does not '
+      'read is reset with its own status at the confirmation timeout',
+      () async {
+        final (connection, raw) = await bindingAndRaw(
+          bindingIsInitiator: true,
+          options: fast.copyWith(
+            closeConfirmTimeout: const Duration(milliseconds: 150),
+          ),
+          rawEnd: const FakeEndConfig(streamWindow: 1000),
+        );
+        final channel = connection.open(Uint8List(0));
+        unawaited(channel.send(pattern(5000)).catchError((Object _) {}));
+        final stream = await raw.nextStream();
+        await channel.close(Status.of(StatusCode.notFound, 'gone'));
+        expect(await channel.done, Status.of(StatusCode.notFound, 'gone'));
+        // The peer reads nothing until the confirmation timed out.
+        await settle(300);
+        final (_, end) = await RawPeer.drain(stream);
+        expect(end, StatusCode.notFound.code);
+      },
+    );
+
+    test('a side that closes without reading still finds the peer\'s CLOSE '
+        'behind what it did not take', () async {
+      final (a, b) = await connectionPair(
+        initiator: fast.copyWith(closeConfirmTimeout: limit),
+        acceptor: fast.copyWith(closeConfirmTimeout: limit),
+      );
+      final arriving = nextChannel(b);
+      final channel = a.open(Uint8List(0));
+      unawaited(channel.send(pattern(3000)));
+      final remote = await arriving;
+      await settle();
+      // Nobody listens on the remote side, which closes.
+      final watch = Stopwatch()..start();
+      await remote.close().timeout(limit);
+      expect(watch.elapsed, lessThan(const Duration(seconds: 2)));
+      expect(await remote.done, Status.ok);
+      expect(await channel.done.timeout(limit), Status.ok);
+    });
+
     test('a failure close does not wait: what the peer still sends is not '
         'read', () async {
       final (a, b) = await connectionPair();
@@ -623,6 +665,34 @@ void main() {
       expect(atBinding[1].id, 6);
     });
 
+    test('after GOAWAY, a bulk channel whose parent was admitted before it '
+        'is admitted even once the parent ended; one for a parent never '
+        'admitted is not', () async {
+      final (connection, raw) = await bindingAndRaw();
+      final atBinding = <MuxChannel>[];
+      connection.incoming.listen((c) {
+        atBinding.add(c);
+        c.stream.listen((_) {});
+      });
+      final parent = await raw.openRaw(encodeOpenRecord(2, const []));
+      // Another channel keeps the connection busy meanwhile.
+      await raw.openRaw(encodeOpenRecord(4, const []));
+      await until(() => atBinding.length == 2);
+      unawaited(connection.goAway());
+      await raw.nextControlOf(MuxControlType.goAway.code);
+      // The parent's close overtakes its bulk stream.
+      await parent.write(encodeCloseRecord(Status.ok));
+      await parent.finish();
+      await until(() => connection.channelWithId(2) == null);
+      await raw.openRaw(encodeOpenRecord(6, TalkBulkOpen(2, 1).encode()));
+      await until(() => atBinding.length == 3);
+      expect(atBinding[2].id, 6);
+      final stray = await raw.openRaw(
+        encodeOpenRecord(8, TalkBulkOpen(10, 1).encode()),
+      );
+      expect(await stray.stopped.timeout(limit), StatusCode.goingAway.code);
+    });
+
     test(
       'a received application close counts as a GOAWAY with its status',
       () async {
@@ -669,6 +739,24 @@ void main() {
         await channel.done.timeout(limit),
         hasCode(StatusCode.connectionLost),
       );
+    });
+
+    test('close waits for the FIN of a channel still waiting for the peer\'s '
+        'close', () async {
+      final network = FakeQuicNetwork(
+        delay: (info, {required fromInitiator}) =>
+            Duration(milliseconds: info.ordinal == 1 ? 60 : 0),
+      );
+      final (a, b) = await connectionPair(network: network);
+      final arriving = nextChannel(b);
+      final channel = a.open(Uint8List(0));
+      final remote = await arriving;
+      remote.stream.listen((_) {});
+      unawaited(channel.close());
+      await until(() => network.pairs.single.$1.streams[1].finished);
+      await a.close();
+      // The CLOSE arrived before the session ended.
+      expect(await remote.done.timeout(limit), Status.ok);
     });
 
     test('close waits for the CLOSE records this side wrote to be '
@@ -1137,6 +1225,52 @@ void main() {
         throwsCode(StatusCode.failedPrecondition),
       );
       expect(initiator.peerAuthenticated, isFalse);
+    });
+
+    test(
+      'a bearer IDENT is not exporter-bound: it authenticates nobody',
+      () async {
+        final key = Uint8List(32);
+        final (connection, raw) = await bindingAndRaw(
+          options: fast.copyWith(
+            identityVerifier: CredentialVerifier(hmacKeys: {Name('k1'): key}),
+          ),
+          rawHello: QuicHello(exporter: true),
+        );
+        await raw.nextControl();
+        await raw.sendControl(MuxControlMessage.nonce(Uint8List(32)..[0] = 1));
+        await raw.nextControlOf(MuxControlType.nonce.code);
+        final bearer = await CredentialIssuer.hmac(
+          Name('k1'),
+          key,
+        ).issue(kind: CredentialKind.node, identity: 'bearer');
+        await raw.sendControl(
+          MuxControlMessage.ident(MuxIdent(credential: bearer.encode())),
+        );
+        await raw.sendControl(MuxControlMessage.ping(bytes('p')));
+        await raw.nextControlOf(MuxControlType.pong.code);
+        expect(connection.exporterBound, isTrue);
+        expect(connection.peerIdentity?.identity, 'bearer');
+        expect(connection.peerIdentityBound, isFalse);
+        expect(connection.peerAuthenticated, isFalse);
+      },
+    );
+
+    test('an initiator awaiting the acceptor\'s identity without a verifier '
+        'could never use the connection: it closes at once', () async {
+      final (a, _) = FakeQuicSession.pair();
+      final connection = await QuicBindingConnection.start(
+        a,
+        options: fast,
+        quicOptions: const QuicBindingOptions(
+          identity: QuicIdentityRules(awaitPeerIdentity: true),
+        ),
+      );
+      expect(connection.isOpen, isFalse);
+      expect(
+        await connection.done.timeout(limit),
+        hasCode(StatusCode.unauthenticated),
+      );
     });
 
     test(

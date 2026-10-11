@@ -174,6 +174,12 @@ class QuicBindingConnection extends BindingConnection {
   final Queue<QuicChannel> _undelivered = Queue<QuicChannel>();
   final Set<QuicChannel> _payloads = {};
   int _openPayloadBytes = 0;
+  // The highest id of the peer's parity this side admitted, and, once it
+  // sent GOAWAY, the marks under which a `_bulk` stream continues work
+  // admitted before it.
+  int _highestPeerId = -1;
+  int _goAwayPeerMark = -1;
+  int _goAwayOwnMark = -1;
   int _nextId;
   bool _incomingScheduled = false;
   bool _incomingCancelled = false;
@@ -347,6 +353,15 @@ class QuicBindingConnection extends BindingConnection {
         _fail(_unauthenticated);
         return;
       }
+      if (rules.awaitPeerIdentity && options.identityVerifier == null) {
+        // The acceptor's IDENT could never verify: nothing would open.
+        _log.warning(
+          '$this: awaiting the peer\'s identity needs '
+          'MuxOptions.identityVerifier',
+        );
+        _fail(_unauthenticated);
+        return;
+      }
       unawaited(_openControl());
     } else {
       _ready.complete();
@@ -490,12 +505,15 @@ class QuicBindingConnection extends BindingConnection {
             _controlWriting = false;
             if (e is QuicStreamStopped) {
               _protocolError('STOP_SENDING on the control stream');
-            } else if (e is! QuicException) {
+            } else if (!isSessionEnd(e)) {
               _log.warning('$this: control stream write failed: $e');
               _lost('control stream write failed');
             }
           },
-        );
+        )
+        .catchError((Object e, StackTrace st) {
+          _log.severe('$this: after a control stream write', e, st);
+        });
   }
 
   Future<void> _readControl() async {
@@ -519,7 +537,11 @@ class QuicBindingConnection extends BindingConnection {
       } on QuicStreamReset {
         _protocolError('the control stream was reset');
         return;
-      } on QuicException {
+      } on QuicException catch (e) {
+        if (!isSessionEnd(e)) {
+          _log.warning('$this: reading the control stream: $e');
+          _lost('the control stream failed');
+        }
         return;
       } on Object catch (e, st) {
         _log.severe('$this: reading the control stream', e, st);
@@ -668,7 +690,11 @@ class QuicBindingConnection extends BindingConnection {
     } on ProtocolException catch (e) {
       _fail(e.status);
       return;
-    } on QuicException {
+    } on QuicException catch (e) {
+      if (!isSessionEnd(e)) {
+        _log.fine('$this: a stream failed before its OPEN record: $e');
+        _release(stream, StatusCode.internal.code);
+      }
       return;
     } on Object catch (e, st) {
       _log.severe('$this: reading an OPEN record', e, st);
@@ -735,6 +761,9 @@ class QuicBindingConnection extends BindingConnection {
       isLocallyOpened: false,
       openPayload: Uint8List.fromList(payload),
     );
+    if (id > _highestPeerId) {
+      _highestPeerId = id;
+    }
     _channels[id] = channel;
     _payloads.add(channel);
     _openPayloadBytes += payload.length;
@@ -778,16 +807,25 @@ class QuicBindingConnection extends BindingConnection {
     return half != null && half < budget ? half : budget;
   }
 
-  /// Whether [openPayload] opens a Talk bulk channel for a channel that is
-  /// open: admitted after this side's GOAWAY.
+  /// Whether [openPayload] opens a Talk bulk channel for a channel admitted
+  /// before this side's GOAWAY: one that is open, or one that ended since
+  /// (its bulk streams may arrive after its close, streams being
+  /// independent; Talk then applies its rules for ended parents). Ids are
+  /// never reused, so the marks taken when the GOAWAY went tell them.
   bool _continuesOpenChannel(Uint8List openPayload) {
     try {
       final address = ChannelAddress.decode(openPayload);
       if (!TalkBulkOpen.isBulk(address)) {
         return false;
       }
-      final parent = _channels[TalkBulkOpen.decode(address).parentId];
-      return parent != null && !parent._peerClosed;
+      final parentId = TalkBulkOpen.decode(address).parentId;
+      if (_channels.containsKey(parentId)) {
+        return true;
+      }
+      final ours = parentId.isOdd != isInitiator;
+      return ours
+          ? parentId < _goAwayOwnMark
+          : parentId > 0 && parentId <= _goAwayPeerMark;
     } on SwitchboardException {
       return false;
     } on FormatException {
@@ -1032,6 +1070,8 @@ class QuicBindingConnection extends BindingConnection {
     }
     if (!_goAwaySent) {
       _goAwaySent = true;
+      _goAwayPeerMark = _highestPeerId;
+      _goAwayOwnMark = _nextId;
       _ownGoAway = status;
       _log.fine('$this: sending GOAWAY $status');
       _sendControl(MuxControlMessage.goAway(statusForWire(status)));
@@ -1611,11 +1651,14 @@ class QuicBindingConnection extends BindingConnection {
       return;
     }
     _log.fine(
-      '$this: peer identified as $identity${bound ? ', exporter-bound' : ''}',
+      '$this: peer identified as $identity'
+      '${bound && ident.proof.isNotEmpty ? ', exporter-bound' : ''}',
     );
+    // A bearer credential carries no proof: nothing bound it to the session.
+    final proven = bound && ident.proof.isNotEmpty;
     _peerIdentity = identity;
-    _peerIdentityBound = bound;
-    if (bound) {
+    _peerIdentityBound = proven;
+    if (proven) {
       final waiter = _boundIdentityWaiter;
       _boundIdentityWaiter = null;
       waiter?.complete(identity);
@@ -1662,3 +1705,8 @@ bool _bytesEqual(List<int> a, List<int> b) {
   }
   return true;
 }
+
+/// Whether [error] is the end of the session, which every pending
+/// operation reports, rather than a failure of one stream.
+bool isSessionEnd(Object error) =>
+    error is QuicException && error.kind == QuicExceptionKind.sessionEnded;

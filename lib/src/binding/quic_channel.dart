@@ -89,6 +89,10 @@ class QuicChannel extends MuxChannel {
   bool _writing = false;
   bool _openWritten = false;
   Status? _pendingClose;
+  // This side's close, once its CLOSE record went into a write.
+  Status? _closeInFlight;
+  // FIN went: the stack acknowledges the direction ([QuicStream.stopped]).
+  bool _finWritten = false;
   // This side has closed: its CLOSE is queued or written, or it reset.
   bool _closeQueued = false;
   // This side's direction ended on the wire (CLOSE and FIN, or a reset).
@@ -103,8 +107,6 @@ class QuicChannel extends MuxChannel {
   // Receiving.
   // The peer's direction ended: its CLOSE record or its reset.
   bool _peerEnded = false;
-  // The peer's close is known (its direction ended, or its STOP_SENDING).
-  bool _peerClosed = false;
   final Queue<Uint8List> _queue = Queue<Uint8List>();
   int _queuedCost = 0;
   int _held = 0;
@@ -327,6 +329,12 @@ class QuicChannel extends MuxChannel {
         // coming, and the channel has ended for it, the peer's direction
         // being reset. Its CLOSE record still follows what it sent.
         _stopReceiving(quicErrorCode(status));
+      } else if (!_peerEnded) {
+        // What the peer sends before it sees the close is still delivered;
+        // reading up to a window ahead finds its CLOSE record behind data
+        // nobody takes, as the frame mux would.
+        _readAhead += connection.options.initialWindow;
+        _signalConsumed();
       }
       _pump();
       _wakeWritable();
@@ -520,6 +528,7 @@ class QuicChannel extends MuxChannel {
     var finishing = false;
     if (_out.isEmpty && close != null) {
       _pendingClose = null;
+      _closeInFlight = close;
       batch.add(encodeCloseRecord(close));
       finishing = true;
     }
@@ -561,21 +570,23 @@ class QuicChannel extends MuxChannel {
             }
             if (e is QuicStreamStopped) {
               _onStopSending(e.code);
-            } else {
-              // The direction cannot be written any more.
+            } else if (isSessionEnd(e)) {
+              // The channel ends with the connection.
               _sendEnded = true;
               _closeQueued = true;
               _pendingClose = null;
               _dropOut();
               _acknowledge();
-              if (e is! QuicException) {
-                _log.warning('$this: write failed: $e');
-                _abort(Status.of(StatusCode.internal, 'write failed'));
-              }
+            } else {
+              _log.warning('$this: write failed: $e');
+              _abort(Status.of(StatusCode.internal, 'write failed'));
             }
             _wakeWritable();
           },
-        );
+        )
+        .catchError((Object e, StackTrace st) {
+          _log.severe('$this: after a write', e, st);
+        });
   }
 
   static Uint8List _header(QuicRecordCommand command, int length) {
@@ -587,6 +598,7 @@ class QuicChannel extends MuxChannel {
   /// The CLOSE record was taken: FIN ends this side's direction.
   void _finishDirection(QuicStream stream) {
     _sendEnded = true;
+    _finWritten = true;
     stream
         .finish()
         .then((_) => stream.stopped)
@@ -703,7 +715,6 @@ class QuicChannel extends MuxChannel {
       _resetDirection(code ?? quicErrorCode(status));
       return;
     }
-    _peerClosed = true;
     _noteStatus(status, fromCode: true);
     _resetDirection(code ?? quicErrorCode(status));
     if (_state == MuxChannelState.open) {
@@ -716,7 +727,6 @@ class QuicChannel extends MuxChannel {
 
   void _onPeerCloseRecord(Status status) {
     _peerEnded = true;
-    _peerClosed = true;
     if (_endFromCode && _endStatus.code == status.code) {
       // The same close, known first by its code: the record carries the
       // reason and the fields.
@@ -733,12 +743,20 @@ class QuicChannel extends MuxChannel {
   void _onPeerReset(int? code) {
     if (code == null || code > 0xFF) {
       // A reset without an application code may come from a session that
-      // is terminating: give its end a turn to arrive first.
-      Timer(Duration.zero, () => _peerReset(code));
+      // is terminating: give its end a moment to arrive first.
+      connection.session.done
+          .timeout(unknownResetGrace)
+          .then<void>((_) {}, onError: (Object _) {})
+          .whenComplete(() => _peerReset(code))
+          .ignore();
       return;
     }
     _peerReset(code);
   }
+
+  /// How long a reset without an application code waits for the end of
+  /// the session, which would explain it, before it reads as `UNKNOWN`.
+  static const Duration unknownResetGrace = Duration(milliseconds: 100);
 
   void _peerReset(int? code) {
     if (_ended) {
@@ -749,7 +767,6 @@ class QuicChannel extends MuxChannel {
       return;
     }
     _peerEnded = true;
-    _peerClosed = true;
     if (!_stopSent) {
       _noteStatus(statusOfQuicErrorCode(code), fromCode: true);
     }
@@ -777,7 +794,7 @@ class QuicChannel extends MuxChannel {
       if (!_sendEnded) {
         // The CLOSE record is still queued behind data the peer does not
         // read: the direction is reset instead.
-        final close = _pendingClose;
+        final close = _pendingClose ?? _closeInFlight;
         _resetDirection(
           close == null || close.isOk ? deadline : quicErrorCode(close),
         );
@@ -795,7 +812,7 @@ class QuicChannel extends MuxChannel {
     if (!_sendEnded) {
       // The CLOSE record is still queued behind data the peer does not
       // read.
-      final close = _pendingClose;
+      final close = _pendingClose ?? _closeInFlight;
       if (close == null || close.isOk) {
         _noteStatus(Status.of(StatusCode.deadlineExceeded));
         _resetDirection(deadline);
@@ -817,12 +834,13 @@ class QuicChannel extends MuxChannel {
     }
   }
 
-  /// A local failure of the stream: the channel ends with [status].
+  /// A local failure of the stream: both directions are given up (reset
+  /// and `STOP_SENDING`), and the channel ends with [status] unless it
+  /// ended already.
   void _abort(Status status) {
-    if (_ended) {
-      return;
+    if (!_ended) {
+      _noteStatus(status);
     }
-    _noteStatus(status);
     final code = quicErrorCode(status);
     _stopReceiving(code);
     _resetDirection(code);
@@ -838,7 +856,11 @@ class QuicChannel extends MuxChannel {
     _closeQueued = true;
     _peerEnded = true;
     _dropOut();
-    _acknowledge();
+    if (!_finWritten) {
+      // Nothing more goes; a FIN written is acknowledged (or fails with the
+      // session) on its own, which a graceful close waits for.
+      _acknowledge();
+    }
     _endIncoming();
     _end();
   }
@@ -943,12 +965,13 @@ class QuicChannel extends MuxChannel {
         );
       case ProtocolException(:final status):
         connection._fail(status);
-      case QuicException():
-        // The session ends.
-        break;
       default:
-        _log.severe('$this: reading failed: $failure');
-        connection._fail(Status.of(StatusCode.internal, 'internal error'));
+        if (isSessionEnd(failure)) {
+          // The channel ends with the connection.
+          break;
+        }
+        _log.warning('$this: reading failed: $failure');
+        _abort(Status.of(StatusCode.internal, 'read failed'));
     }
   }
 
