@@ -14,6 +14,7 @@ use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use quinn::{Connection, ConnectionError, Endpoint};
 use tokio::task::{AbortHandle, JoinSet};
@@ -250,6 +251,111 @@ fn client_endpoint(v6: bool) -> std::io::Result<Endpoint> {
     Ok(e)
 }
 
+/// Why one connection attempt failed.
+pub(crate) enum Failure {
+    Conn(ConnectionError),
+    Info(CloseInfo),
+}
+
+impl Failure {
+    fn info(self, o: &ConnObj) -> CloseInfo {
+        match self {
+            Failure::Conn(e) => o.close_info(&e),
+            Failure::Info(i) => i,
+        }
+    }
+
+    /// Of two failures, the one that says more: anything beats a timeout.
+    fn pick(first: Failure, second: Failure) -> Failure {
+        match first {
+            Failure::Conn(ConnectionError::TimedOut) => second,
+            _ => first,
+        }
+    }
+}
+
+fn unreachable(msg: String) -> Failure {
+    Failure::Info(CloseInfo {
+        kind: SBQ_CLOSE_UNREACHABLE,
+        code: 0,
+        reason: msg.into_bytes(),
+    })
+}
+
+async fn attempt(
+    cc: quinn::ClientConfig,
+    addr: SocketAddr,
+    server_name: &str,
+) -> Result<Connection, Failure> {
+    let endpoint = client_endpoint(addr.is_ipv6())
+        .map_err(|e| unreachable(format!("cannot open a socket: {e}")))?;
+    let connecting = endpoint.connect_with(cc, addr, server_name).map_err(|e| {
+        Failure::Info(CloseInfo {
+            kind: SBQ_CLOSE_OTHER,
+            code: 0,
+            reason: e.to_string().into_bytes(),
+        })
+    })?;
+    connecting.await.map_err(Failure::Conn)
+}
+
+/// How long the first address has to itself before the first address of the other family is
+/// tried alongside it (a light form of RFC 8305's Happy Eyeballs: a dual-stack name whose
+/// preferred address has no listener does not cost a whole handshake timeout).
+const SECOND_FAMILY_DELAY: Duration = Duration::from_millis(250);
+
+/// Resolves `host` and completes a handshake with the first of its addresses that answers.
+async fn dial(
+    cc: quinn::ClientConfig,
+    host: &str,
+    port: u16,
+    server_name: &str,
+) -> Result<Connection, Failure> {
+    let addrs: Vec<SocketAddr> = match tokio::net::lookup_host((host, port)).await {
+        Ok(a) => a.collect(),
+        Err(e) => return Err(unreachable(format!("cannot resolve {host}: {e}"))),
+    };
+    if addrs.is_empty() {
+        return Err(unreachable(format!("no address for {host}")));
+    }
+    dial_addrs(cc, &addrs, server_name).await
+}
+
+/// Tries the first address, and after `SECOND_FAMILY_DELAY` also the first address of the other
+/// family; the first handshake to complete wins and the other attempt is dropped (closed).
+pub(crate) async fn dial_addrs(
+    cc: quinn::ClientConfig,
+    addrs: &[SocketAddr],
+    server_name: &str,
+) -> Result<Connection, Failure> {
+    let first = addrs[0];
+    let Some(&second) = addrs.iter().find(|a| a.is_ipv6() != first.is_ipv6()) else {
+        return attempt(cc, first, server_name).await;
+    };
+    let a = attempt(cc.clone(), first, server_name);
+    tokio::pin!(a);
+    tokio::select! {
+        r = &mut a => match r {
+            Ok(c) => Ok(c),
+            Err(e1) => attempt(cc, second, server_name).await.map_err(|e2| Failure::pick(e1, e2)),
+        },
+        _ = tokio::time::sleep(SECOND_FAMILY_DELAY) => {
+            let b = attempt(cc, second, server_name);
+            tokio::pin!(b);
+            tokio::select! {
+                r = &mut a => match r {
+                    Ok(c) => Ok(c),
+                    Err(e1) => b.await.map_err(|e2| Failure::pick(e1, e2)),
+                },
+                r = &mut b => match r {
+                    Ok(c) => Ok(c),
+                    Err(e2) => a.await.map_err(|e1| Failure::pick(e1, e2)),
+                },
+            }
+        }
+    }
+}
+
 pub fn connect(
     ctx: &Arc<Ctx>,
     params: &ClientParams,
@@ -264,33 +370,7 @@ pub fn connect(
     lock(&CONNS).insert(h, obj.clone());
     let o = obj.clone();
     let task = rt().spawn(async move {
-        let unreachable = |msg: String| CloseInfo {
-            kind: SBQ_CLOSE_UNREACHABLE,
-            code: 0,
-            reason: msg.into_bytes(),
-        };
-        let addr = match tokio::net::lookup_host((host.as_str(), port)).await {
-            Ok(mut a) => match a.next() {
-                Some(a) => a,
-                None => return o.finish(unreachable(format!("no address for {host}"))),
-            },
-            Err(e) => return o.finish(unreachable(format!("cannot resolve {host}: {e}"))),
-        };
-        let endpoint = match client_endpoint(addr.is_ipv6()) {
-            Ok(e) => e,
-            Err(e) => return o.finish(unreachable(format!("cannot open a socket: {e}"))),
-        };
-        let connecting = match endpoint.connect_with(cc, addr, &server_name) {
-            Ok(c) => c,
-            Err(e) => {
-                return o.finish(CloseInfo {
-                    kind: SBQ_CLOSE_OTHER,
-                    code: 0,
-                    reason: e.to_string().into_bytes(),
-                })
-            }
-        };
-        match connecting.await {
+        match dial(cc, &host, port, &server_name).await {
             Ok(conn) => {
                 {
                     let mut slot = lock(&o.conn);
@@ -304,7 +384,7 @@ pub fn connect(
                 o.ctx.post(SBQ_EV_CONNECTED, h, 0, 0);
                 watch(&o, conn);
             }
-            Err(e) => o.finish(o.close_info(&e)),
+            Err(f) => o.finish(f.info(&o)),
         }
     });
     obj.add_task(task.abort_handle());

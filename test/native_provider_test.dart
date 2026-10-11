@@ -14,6 +14,7 @@ Authors:
 library;
 
 import 'dart:async';
+import 'dart:isolate';
 import 'dart:typed_data';
 
 import 'package:async/async.dart';
@@ -138,6 +139,22 @@ Future<bool> completesWithin(Future<Object?> f, Duration d) => f
     .then((_) => true, onError: (_) => true)
     .timeout(d, onTimeout: () => false);
 
+/// Connects from a new isolate, echoes a message through one stream, closes
+/// with 9; the isolate has to exit by itself afterwards.
+Future<String> clientInIsolate(Uri endpoint) => Isolate.run(() async {
+  final provider = NativeQuicProvider();
+  final client = await provider.connect(
+    endpoint,
+    const QuicClientConfig(alpn: [quicAlpn], verifyCertificate: false),
+  );
+  final s = await client.openStream();
+  await s.write(Uint8List.fromList('from another isolate'.codeUnits));
+  await s.finish();
+  final back = await readAll(s);
+  await client.close(9, 'bye');
+  return String.fromCharCodes(back);
+});
+
 void main() {
   setUpAll(() {
     provider = NativeQuicProvider();
@@ -251,6 +268,25 @@ void main() {
       );
     });
 
+    test('IPv6 loopback', () async {
+      final NativeQuicListener listener;
+      try {
+        listener = await provider.listen('::1', 0, serverConfig());
+      } on QuicException catch (e) {
+        markTestSkipped('no IPv6 loopback: $e');
+        return;
+      }
+      addTearDown(listener.close);
+      expect(listener.endpoint.toString(), startsWith('quic://[::1]:'));
+      final accepted = listener.sessions.first;
+      final client = await provider.connect(listener.endpoint, clientConfig());
+      addTearDown(() => client.close(0, ''));
+      final server = await accepted;
+      addTearDown(() => server.close(0, ''));
+      expect(client.remote, '[::1]:${listener.port}');
+      expect(server.remote, startsWith('[::1]:'));
+    });
+
     test(
       'exporter: equal on both ends, different across connections',
       () async {
@@ -302,6 +338,18 @@ void main() {
       expect(await cs.stopped, isNull);
       expect(await ss.stopped, isNull);
       expect(() => cs.write(bytes('late')), throwsStateError);
+    });
+
+    test('writes take views and unmodifiable lists', () async {
+      final cs = await p.client.openStream();
+      final data = pattern(100000, 3);
+      await cs.write(Uint8List.sublistView(data, 0, 10));
+      await cs.write(data.sublist(10, 50000).asUnmodifiableView());
+      await cs.write(Uint8List.sublistView(data, 50000));
+      await cs.write(Uint8List(0));
+      await cs.finish();
+      final ss = await p.serverStreams.next;
+      expect(await readAll(ss), data);
     });
 
     test('a stream the server opens', () async {
@@ -629,6 +677,27 @@ void main() {
       await peer.done;
     }
   }, timeout: const Timeout(Duration(seconds: 120)));
+
+  test(
+    'another isolate has a context of its own, and exits when done',
+    () async {
+      final server = await Server.start();
+      final endpoint = server.listener.endpoint;
+      final echoed = () async {
+        final session = await server.accept();
+        final s = await session.incomingStreams.first;
+        final got = await readAll(s);
+        await s.write(got);
+        await s.finish();
+        return session.done;
+      }();
+      final reply = await clientInIsolate(endpoint)
+          .timeout(const Duration(seconds: 20));
+      expect(reply, 'from another isolate');
+      final end = await echoed.timeout(const Duration(seconds: 5));
+      expect((end.code, end.byPeer), (9, true));
+    },
+  );
 
   test('shutdown ends every session of the isolate', () async {
     final server = await Server.start();

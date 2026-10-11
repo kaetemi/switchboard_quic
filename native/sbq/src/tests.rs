@@ -600,3 +600,32 @@ fn shutdown_closes_connections() {
     assert_eq!(sbq_conn_release(c), SBQ_ERR_HANDLE as i32);
     assert_eq!(sbq_shutdown(client.ctx), SBQ_ERR_HANDLE as i32);
 }
+
+#[test]
+fn dial_falls_back_to_the_other_family() {
+    let mut h = Harness::new();
+    let (l, port, _) = h.server(16, 1 << 20, 30_000);
+    let params = config::ClientParams {
+        alpn: vec![b"switchboard".to_vec()],
+        verify: config::Verify::None,
+        limits: config::Limits {
+            max_bidi: 4,
+            stream_window: 1 << 20,
+            conn_window: 16 << 20,
+            idle_ms: 30_000,
+            keep_alive_ms: 0,
+        },
+    };
+    let cc = config::client_config(&params, Default::default()).unwrap();
+    // The preferred address (IPv6 loopback) has no listener; the IPv4 one does.
+    let addrs: Vec<std::net::SocketAddr> = vec![
+        format!("[::1]:{port}").parse().unwrap(),
+        format!("127.0.0.1:{port}").parse().unwrap(),
+    ];
+    let started = Instant::now();
+    let conn = ctx::rt().block_on(conn::dial_addrs(cc, &addrs, "localhost"));
+    assert!(conn.is_ok(), "dial failed");
+    assert!(started.elapsed() < Duration::from_secs(5));
+    assert_eq!(conn.ok().unwrap().remote_address(), addrs[1]);
+    h.wait("incoming", |e| e.kind == SBQ_EV_INCOMING && e.a == l as i64);
+}
