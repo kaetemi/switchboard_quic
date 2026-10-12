@@ -1,0 +1,4 @@
+# The cargo build output (hook/build.dart builds into it as well).
+/target/
+# Prebuilt shims are release artifacts (see native/README.md), never committed.
+/prebuilt/*/
