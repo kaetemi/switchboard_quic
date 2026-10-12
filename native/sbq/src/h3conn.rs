@@ -936,8 +936,9 @@ impl H3Conn {
         let mut r = Reader { recv };
         let ty = match within(self.request_timeout, r.varint()).await {
             Some(Ok(Some(t))) => t,
-            Some(_) => return,
-            None => {
+            // Nothing to keep, but stopped explicitly rather than dropped (quinn stops a dropped
+            // stream with 0).
+            _ => {
                 abort(None, Some(&mut r.recv), err::H3_STREAM_CREATION_ERROR);
                 return;
             }
@@ -993,8 +994,7 @@ impl H3Conn {
             }
             stream_type::WEBTRANSPORT => match within(self.request_timeout, r.varint()).await {
                 Some(Ok(Some(sid))) => self.route(sid, Held::Uni(r.recv)),
-                Some(_) => {}
-                None => abort(None, Some(&mut r.recv), err::H3_STREAM_CREATION_ERROR),
+                _ => abort(None, Some(&mut r.recv), err::H3_STREAM_CREATION_ERROR),
             },
             // Reserved and unknown types: abort reading (RFC 9114 section 6.2).
             t => {
@@ -1127,14 +1127,9 @@ impl H3Conn {
         let mut r = Reader { recv };
         let first = match within(self.request_timeout, r.varint()).await {
             Some(Ok(Some(t))) => t,
-            Some(Ok(None)) => {
-                if !self.client {
-                    abort(Some(&mut send), None, err::H3_REQUEST_INCOMPLETE);
-                }
-                return;
-            }
-            Some(Err(_)) => return,
-            None => {
+            // FIN, a reset, or nothing in time: nothing to keep, both directions ended explicitly
+            // rather than dropped.
+            _ => {
                 return abort(
                     Some(&mut send),
                     Some(&mut r.recv),
@@ -1145,8 +1140,7 @@ impl H3Conn {
         if first == frame::WT_STREAM {
             match within(self.request_timeout, r.varint()).await {
                 Some(Ok(Some(sid))) => self.route(sid, Held::Bi(send, r.recv)),
-                Some(_) => {}
-                None => abort(
+                _ => abort(
                     Some(&mut send),
                     Some(&mut r.recv),
                     err::H3_REQUEST_INCOMPLETE,
