@@ -19,12 +19,15 @@ Authors:
 //    %USERPROFILE%\.cargo\bin), into native/sbq/target. When rustc's own host is of another
 //    architecture than the Dart VM (an x64 Dart SDK under Rosetta 2 or Windows' emulation with
 //    an arm64 Rust toolchain), it builds with an explicit `--target` of the VM's architecture.
-// Dart 3.13 filters CARGO_HOME from normal hook invocations; custom installs
-// should put cargo on PATH (or build a prebuilt with their Rust environment).
+//    Cargo runs `--locked` (Cargo.lock decides the dependencies), and the library is the one
+//    this invocation reports. Dart 3.13's hooks runner passes the hook PATH and HOME (or
+//    USERPROFILE) but not CARGO_HOME, RUSTUP_HOME or RUSTFLAGS, so a Rust toolchain that
+//    needs them cannot build here: build the library by hand and place it as a prebuilt.
 // 3. Otherwise the build fails, naming the ways out. iOS and Android are never built here.
 //
 // A library whose header (ELF, Mach-O or PE) names another architecture or format than the
-// target's fails the build too.
+// target's, or that the header check cannot read, fails the build too (a universal Mach-O
+// library passes when it holds the target's slice).
 //
 // Which of the two happened is printed (`dart run -v`, or the hook's stdout file under
 // .dart_tool/hooks_runner) and written to sbq_source.txt in the hook's output directory.
@@ -86,24 +89,34 @@ void main(List<String> args) async {
       }
       final triple = await _cargoTarget(cargo, arch, crate);
       final target = crate.resolve('target/');
+      // JSON on stdout names the artifact; rustc's diagnostics stay text on
+      // stderr, where a failure shows them. Cargo writes UTF-8 on every host.
       final result = await Process.run(
         cargo,
         [
           'build',
           '--release',
           '--locked',
-          '--message-format=json',
+          '--message-format=json-render-diagnostics',
           '--manifest-path',
           crate.resolve('Cargo.toml').toFilePath(),
           if (triple != null) ...['--target', triple],
         ],
         workingDirectory: crate.toFilePath(),
         environment: {'CARGO_TARGET_DIR': target.toFilePath()},
+        stdoutEncoding: const Utf8Codec(allowMalformed: true),
+        stderrEncoding: const Utf8Codec(allowMalformed: true),
       );
       if (result.exitCode != 0) {
+        final errors = result.stderr as String;
+        final locked = errors.contains('--locked')
+            ? '\nThe hook builds with --locked: after changing '
+                  'native/sbq/Cargo.toml, update Cargo.lock with a cargo build '
+                  'in native/sbq.'
+            : '';
         throw StateError(
           'switchboard_quic: cargo build of native/sbq failed '
-          '(exit ${result.exitCode}):\n${result.stderr}',
+          '(exit ${result.exitCode}):\n$errors$locked',
         );
       }
       // Cargo config can set build.target too. Use the artifact from this

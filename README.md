@@ -126,7 +126,7 @@ tool/fetch_prebuilt.sh v0.1.0               # a release's libraries for linux_x6
                                             # against its SHA256SUMS, into native/sbq/prebuilt/
 ```
 
-The release workflow (`.github/workflows/release.yml`) builds all five before creating a draft, checks the exact asset set, and publishes once the libraries and `SHA256SUMS` are attached. A rerun verifies an existing published release without replacing it; the pub package, once published, will ship them under `native/sbq/prebuilt/` so that its users need neither (`native/README.md`, "Releases"). With Rust, by hand:
+A tag `v*` builds and attaches them (`.github/workflows/release.yml`, not yet run on GitHub); the pub package, once published, will ship them under `native/sbq/prebuilt/`, so that its users need neither Rust nor a download (`native/README.md`, "Releases"). With Rust, by hand:
 
 ```sh
 cd native/sbq

@@ -234,50 +234,55 @@ Authors:
   where the Windows Dart SDK also passes the VM suite and the AOT smoke.
   `native/README.md`, "Platforms", says what ran where and what did not.
 * Fix (the shim): a listener's UDP socket on an IPv6 address is
-  dual-stack where the platform allows it (`IPV6_V6ONLY` off, as quinn
-  makes its client sockets). On Windows, whose IPv6 sockets are IPv6-only
-  by default, a listener on `::` took no IPv4 client; Linux and macOS
-  normally defaulted to dual-stack (Linux can set `bindv6only`; no ABI change).
-* The build hook finds cargo in `%USERPROFILE%\.cargo\bin` too
-  (`$CARGO_HOME/bin` only when the hook runner passes that variable;
-  Dart 3.13 filters it); builds with an explicit `--target` when
-  rustc's host is of another architecture than the Dart VM (an x64 Dart
-  SDK under Rosetta 2 or Windows' emulation); refuses a library whose
-  header names another architecture or format than the target's (Dart
-  3.13 bundles it, and loading it fails with a misleading message); and
-  says that it builds nothing for iOS and Android. The `dart compile exe`
-  fallback loads the library with Apple's `RTLD_GLOBAL` on iOS too.
+  dual-stack where the platform allows it (`IPV6_V6ONLY` off before the
+  bind, as quinn makes its client sockets). On Windows, whose IPv6
+  sockets are IPv6-only by default, a listener on `::` took no IPv4
+  client; Linux and macOS default to dual-stack (on Linux unless
+  `bindv6only` is set, which the listener now overrides). No ABI change.
+* The build hook finds cargo in `%USERPROFILE%\.cargo\bin` too, and in a
+  quoted Windows `PATH` entry with semicolons or spaces in it
+  (`$CARGO_HOME/bin` only when the hooks runner passes that variable,
+  which Dart 3.13 does not); builds with `--locked` and takes the library
+  that build reports (a configured `build.target` cannot leave it an old
+  one), with an explicit `--target` when rustc's host is of another
+  architecture than the Dart VM (an x64 Dart SDK under Rosetta 2 or
+  Windows' emulation); refuses a library whose header names another
+  architecture or format than the target's, or that it cannot read
+  (Dart 3.13 bundles such a library, and loading it fails with a
+  misleading message): ELF by class and byte order, Mach-O in either
+  byte order, a universal one only with the target's slice, PE through
+  `e_lfanew`, also beyond the first page (six VM tests); declares
+  the library it uses as a dependency, so that a cached result does not
+  outlive a `cargo clean`; and says that it builds nothing for iOS and
+  Android. The `dart compile exe` fallback loads the library with
+  Apple's `RTLD_GLOBAL` on iOS too.
 * CI (`.github/workflows/ci.yml`): the shim and the Dart package on
   Linux x64 and arm64, macOS arm64 and x64, and Windows x64, and the
   Node.js suite on Linux x64, against the core commit recorded in
   `tool/core_commit.txt` (`01ccd03`). Releases
-  (`.github/workflows/release.yml`, on a tag `v*`): the shim built on
-  those five platforms, attached as `<os>_<arch>-<file>` with a
-  `SHA256SUMS` of the `<os>_<arch>/<file>` layout the hook reads;
-  `tool/fetch_prebuilt.sh` downloads them, checks them and puts them
-  under `native/sbq/prebuilt/`, and `native/sbq/.pubignore` lets them
+  (`.github/workflows/release.yml`, on a tag `v*`, or by hand for an
+  existing one): the shim tested and built on those five platforms from
+  the tag's commit with read-only access, then attached by one job with
+  write access, as `<os>_<arch>-<file>` with a `SHA256SUMS` of the
+  `<os>_<arch>/<file>` layout the hook reads, to a draft that is
+  published once exactly those six assets are there; runs for one tag
+  wait for each other, and a rerun leaves a published release as it is,
+  after checking it against its own `SHA256SUMS`. Neither workflow has
+  run on GitHub yet. `tool/fetch_prebuilt.sh` downloads a release's
+  libraries, checks its `SHA256SUMS` (known paths, hashes, no
+  duplicates) and the libraries against it, and replaces each under
+  `native/sbq/prebuilt/` atomically; `native/sbq/.pubignore` lets them
   into a published package.
-* Portability of the tools and tests: `tool/aot_smoke.sh` runs under Git
-  Bash on Windows (`.exe`); `.gitattributes` keeps LF in Windows
-  checkouts; `tool/web_server.dart` watches SIGTERM only where it can be
+* Portability of the tools and tests: `tool/aot_smoke.sh` runs the
+  `.exe` files under Git Bash on Windows (not run there yet);
+  `.gitattributes` keeps LF in Windows checkouts;
+  `tool/web_server.dart` watches SIGTERM only where it can be
   watched; a native provider test no longer binds 127.0.0.2 (Linux routes
   all of 127.0.0.0/8 to the loopback, macOS does not); the native smoke
-  waits for both `HELLO`s before it checks that they carry `EXPORTER` (a
-  channel's records may overtake the control stream, as a run under wine
-  showed).
-* Ports review: reject unknown or malformed library headers, accept a
-  universal Mach-O library only with the target slice, check ELF byte order
-  and class, and follow PE headers beyond the first page. Six VM tests cover
-  these checks. Cargo builds use `--locked` and the artifact reported by that
-  invocation (including a configured `build.target`); the library is a cache
-  dependency, so `cargo clean` cannot leave a cached hook pointing at it.
-* Release review: build artifacts before touching a release, limit repository
-  write access to the publishing job, serialize releases for a tag, and verify
-  an existing published release without replacing its assets. Fetching checks
-  manifest paths, hashes and duplicates before downloading; installs use unique
-  temporary files and atomic replacement of each library.
-* Port tests: a dual-stack test skips only when the OS cannot provide a
-  dual-stack socket, and the refusal test allows 2 s for the handshake and
-  request (300 ms failed under qemu), below the client's 5 s deadline.
-* Cargo lookup on Windows keeps quoted PATH entries containing semicolons
-  together, as well as accepting paths containing spaces.
+  waits up to 5 s for both `HELLO`s before it checks that they carry
+  `EXPORTER` (a channel's records may overtake the control stream, as a
+  run under wine showed). In the shim's tests, the dual-stack test skips
+  only where the system cannot bind a dual-stack socket, which it probes
+  itself, so that a failing listener is a failure; and
+  `refusals_carry_their_status` gives its listener 2 s instead of 300 ms
+  (it timed out under qemu), still below the client's 5 s.
