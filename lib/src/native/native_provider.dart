@@ -983,12 +983,14 @@ final class NativeQuicSession implements QuicSession {
   /// Closes the session with [code] and [reason] (at most 1024 bytes of
   /// UTF-8). Raw QUIC: `CONNECTION_CLOSE` with the code (0 to 2^62 - 1).
   /// WebTransport: `WT_CLOSE_SESSION` with the code (0 to 2^32 - 1) and the
-  /// reason, then FIN on the CONNECT stream; the shim closes the QUIC
-  /// connection once the peer has closed the CONNECT stream in turn, or
-  /// after a bounded wait. The future completes once the peer's stack
-  /// acknowledged the close, or after three round trips (within 0.2 to
-  /// 2 s) without that, so that disposing of the provider after
-  /// `await close()` does not cut the close short.
+  /// reason, then FIN on the CONNECT stream; once its last session has
+  /// closed, a client's shim closes the QUIC connection when the peer has
+  /// closed the CONNECT stream in turn, or after a bounded wait, and a
+  /// server's leaves that close to the client for the bounded wait. The
+  /// future completes once the peer's stack acknowledged the close, or
+  /// after three round trips (within 0.2 to 2 s) without that, so that
+  /// disposing of the provider after `await close()` does not cut the
+  /// close short.
   @override
   Future<void> close(int code, String reason) {
     _checkCode(code, webTransport: isWebTransport);

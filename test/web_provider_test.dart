@@ -140,6 +140,13 @@ void main() {
     final session = await s.open('sink', id);
     final stream = await session.openStream();
     await stream.write(bytes('abc'));
+    // Once the server has the stream: quinn drops what it buffered of a
+    // stream once its reset arrives, so a reset that reaches the server
+    // before it read the stream's header loses the header, and without
+    // RESET_STREAM_AT the server cannot tell which session the stream
+    // belonged to (Chrome sends the header, the data and the reset about a
+    // millisecond apart).
+    await s.reported(id, (e) => e['event'] == 'stream');
     stream.reset(42);
     stream.reset(43); // A no-op.
     expect(await stream.stopped.timeout(limit), isNull);

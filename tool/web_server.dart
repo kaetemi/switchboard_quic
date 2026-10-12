@@ -254,6 +254,7 @@ Future<void> _stream(
   String id,
   int i,
 ) async {
+  record(id, {'event': 'stream', 'stream': i});
   stream.resetReceived
       .then(
         (code) => record(id, {'event': 'reset', 'stream': i, 'code': code}),

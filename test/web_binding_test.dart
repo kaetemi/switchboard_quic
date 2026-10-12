@@ -213,8 +213,8 @@ void main() {
       await until(() => c.connection != null && c.connection != first);
       final again = await c.openTalk(ChannelAddress(type: echo));
       expect(text((await again.request('ECHO', bytes('c'))).payload), 'c');
-      expect((await first.done.timeout(limit)).known, StatusCode.goingAway);
       await again.close();
+      expect((await first.done.timeout(limit)).known, StatusCode.goingAway);
     });
   });
 }
