@@ -434,9 +434,11 @@ int32_t sbq_conn_stats(uint64_t conn, struct SbqStats *out);
 
 // Opens a bidirectional stream: returns its handle if the peer's stream limit allows it now,
 // otherwise `SBQ_WOULD_BLOCK` and an OPENED event carries the stream once it does (one event
-// per blocked call). Nothing reaches the peer before the first write. On a WebTransport session
-// (live) the stream carries the session's header; `SBQ_ERR_STATE` before the session is live,
-// `SBQ_ERR_CONNECTION` once the connection or session has ended.
+// per blocked call). Nothing reaches the peer before the first write. `SBQ_ERR_STATE` during
+// the handshake; `SBQ_ERR_CONNECTION` once the connection has ended, also when its handshake
+// never completed. On a WebTransport session the stream carries the session's header;
+// `SBQ_ERR_STATE` before the session is live, `SBQ_ERR_CONNECTION` once the session or its
+// connection has ended.
 int64_t sbq_stream_open(uint64_t conn);
 
 // Writes up to `len` (> 0) bytes; returns how many were accepted (the peer's flow control

@@ -412,9 +412,11 @@ external int sbq_conn_stats(int conn, ffi.Pointer<SbqStats> out);
 
 /// Opens a bidirectional stream: returns its handle if the peer's stream limit allows it now,
 /// otherwise `SBQ_WOULD_BLOCK` and an OPENED event carries the stream once it does (one event
-/// per blocked call). Nothing reaches the peer before the first write. On a WebTransport session
-/// (live) the stream carries the session's header; `SBQ_ERR_STATE` before the session is live,
-/// `SBQ_ERR_CONNECTION` once the connection or session has ended.
+/// per blocked call). Nothing reaches the peer before the first write. `SBQ_ERR_STATE` during
+/// the handshake; `SBQ_ERR_CONNECTION` once the connection has ended, also when its handshake
+/// never completed. On a WebTransport session the stream carries the session's header;
+/// `SBQ_ERR_STATE` before the session is live, `SBQ_ERR_CONNECTION` once the session or its
+/// connection has ended.
 @ffi.Native<ffi.Int64 Function(ffi.Uint64)>(isLeaf: true)
 external int sbq_stream_open(int conn);
 

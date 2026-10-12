@@ -545,6 +545,19 @@ void main() {
         expect(off.idleTimeout, const Duration(seconds: 30));
       }
     });
+
+    test('a negative idle timeout or keep-alive is an ArgumentError', () {
+      final connector = FakeQuicNetwork().connector();
+      const negative = Duration(microseconds: -1);
+      expect(
+        () => QuicSwitchboardBinding(connector, idleTimeout: negative),
+        throwsArgumentError,
+      );
+      expect(
+        () => QuicSwitchboardBinding(connector, keepAlive: negative),
+        throwsArgumentError,
+      );
+    });
   });
 
   group('identity', () {

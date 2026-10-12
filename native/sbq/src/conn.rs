@@ -96,9 +96,13 @@ impl ConnObj {
             let h3 = wt.h3().ok_or(SBQ_ERR_STATE)?;
             return Ok((h3.conn.clone(), Some(header)));
         }
+        // Ended first: a connection whose handshake never completed has no `Connection` either,
+        // and after CLOSED it fails as an ended one does, not as one still in its handshake.
+        if ended {
+            return Err(SBQ_ERR_CONNECTION);
+        }
         match self.connection() {
             Some(c) => Ok((c, None)),
-            None if ended => Err(SBQ_ERR_CONNECTION),
             None => Err(SBQ_ERR_STATE),
         }
     }

@@ -35,6 +35,7 @@ QuicServerConfig serverConfig({
   int connectionWindow = 16 << 20,
   Duration idle = const Duration(seconds: 30),
   Duration keepAlive = const Duration(seconds: 10),
+  Duration handshake = const Duration(seconds: 10),
 }) => QuicServerConfig(
   alpn: const [quicAlpn],
   certificateDer: cert.certificateDer,
@@ -44,6 +45,7 @@ QuicServerConfig serverConfig({
   connectionReceiveWindow: connectionWindow,
   idleTimeout: idle,
   keepAlive: keepAlive,
+  handshakeTimeout: handshake,
 );
 
 QuicClientConfig clientConfig({
@@ -313,6 +315,58 @@ void main() {
       );
       expect(watch.elapsed, lessThan(const Duration(seconds: 2)));
       expect(received, greaterThan(0));
+    });
+
+    test('a negative duration in a configuration is an ArgumentError, and a '
+        'deadline under a millisecond is still a deadline', () async {
+      const negative = Duration(microseconds: -1);
+      final nowhere = Uri.parse('quic://127.0.0.1:9');
+      for (final config in [
+        clientConfig(idle: negative),
+        clientConfig(keepAlive: negative),
+        clientConfig(handshake: negative),
+      ]) {
+        await expectLater(
+          provider.connect(nowhere, config),
+          throwsArgumentError,
+        );
+      }
+      for (final config in [
+        serverConfig(idle: negative),
+        serverConfig(keepAlive: negative),
+        serverConfig(handshake: negative),
+      ]) {
+        await expectLater(
+          provider.listen('127.0.0.1', 0, config),
+          throwsArgumentError,
+        );
+      }
+      // Rounded up to a millisecond, not down to none: without an idle
+      // timeout nothing else would end this connect.
+      final silent = await RawDatagramSocket.bind(
+        InternetAddress.loopbackIPv4,
+        0,
+      );
+      addTearDown(silent.close);
+      await expectLater(
+        provider
+            .connect(
+              Uri.parse('quic://127.0.0.1:${silent.port}'),
+              clientConfig(
+                idle: Duration.zero,
+                keepAlive: Duration.zero,
+                handshake: const Duration(microseconds: 1),
+              ),
+            )
+            .timeout(const Duration(seconds: 2)),
+        throwsA(
+          isA<QuicException>().having(
+            (e) => e.kind,
+            'kind',
+            QuicExceptionKind.unreachable,
+          ),
+        ),
+      );
     });
 
     test('IPv6 loopback', () async {

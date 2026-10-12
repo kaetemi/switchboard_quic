@@ -141,6 +141,15 @@ class FakeQuicConnector implements QuicConnector {
 
   @override
   Future<QuicSession> connect(Uri endpoint, QuicClientConfig config) async {
+    for (final (name, duration) in [
+      ('idleTimeout', config.idleTimeout),
+      ('keepAlive', config.keepAlive),
+      ('handshakeTimeout', config.handshakeTimeout),
+    ]) {
+      if (duration.isNegative) {
+        throw ArgumentError.value(duration, name, 'must not be negative');
+      }
+    }
     configs.add(config);
     await connectGate?.future;
     await Future<void>.delayed(Duration.zero);

@@ -6,6 +6,7 @@ Authors:
   Jan Boon <jan.boon@kaetemi.be>
   Claude Opus 5.5 <noreply@anthropic.com>
   GPT-6 Astra <noreply@openai.com>
+  GLM 5.3 Flash <noreply@z.ai>
 */
 
 import 'dart:async';
@@ -49,7 +50,8 @@ const String switchboardAlpn = 'switchboard';
 /// [keepAlive]); the control `PING` is the node's
 /// ([MuxOptions.keepAliveInterval]).
 class QuicSwitchboardBinding extends SwitchboardBinding {
-  /// A binding dialling through [connector].
+  /// A binding dialling through [connector]. Throws [ArgumentError] for a
+  /// negative [idleTimeout] or [keepAlive].
   QuicSwitchboardBinding(
     this.connector, {
     this.verifyCertificate = false,
@@ -59,7 +61,18 @@ class QuicSwitchboardBinding extends SwitchboardBinding {
     this.idleTimeout = const Duration(seconds: 30),
     this.keepAlive,
     this.webTransportCertificateVerified = true,
-  });
+  }) {
+    if (idleTimeout.isNegative) {
+      throw ArgumentError.value(
+        idleTimeout,
+        'idleTimeout',
+        'must not be negative',
+      );
+    }
+    if (keepAlive?.isNegative ?? false) {
+      throw ArgumentError.value(keepAlive, 'keepAlive', 'must not be negative');
+    }
+  }
 
   /// The URI scheme of raw QUIC endpoints.
   static const String quicScheme = 'quic';
@@ -111,13 +124,7 @@ class QuicSwitchboardBinding extends SwitchboardBinding {
   final Duration? keepAlive;
 
   /// [keepAlive] as the sessions are configured with it.
-  Duration get _stackKeepAlive {
-    final interval = keepAlive;
-    if (interval != null) {
-      return interval > Duration.zero ? interval : Duration.zero;
-    }
-    return idleTimeout > Duration.zero ? idleTimeout ~/ 3 : Duration.zero;
-  }
+  Duration get _stackKeepAlive => keepAlive ?? idleTimeout ~/ 3;
 
   /// Whether the server certificate of an `https` endpoint is verified
   /// (the platform roots, or [certificateHashes] as

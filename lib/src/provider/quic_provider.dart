@@ -196,7 +196,8 @@ abstract interface class QuicStream {
   Future<int?> get stopped;
 }
 
-/// Client configuration.
+/// Client configuration. Its durations are zero (none) or positive: a
+/// provider rejects a negative one with an [ArgumentError].
 class QuicClientConfig {
   const QuicClientConfig({
     required this.alpn,
@@ -246,7 +247,8 @@ class QuicClientConfig {
   final Duration handshakeTimeout;
 }
 
-/// Server configuration (native provider).
+/// Server configuration (native provider). Its durations are zero (none)
+/// or positive, as in [QuicClientConfig].
 class QuicServerConfig {
   const QuicServerConfig({
     required this.alpn,
