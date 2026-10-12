@@ -41,6 +41,13 @@ const String switchboardAlpn = 'switchboard';
 /// use ([QuicIdentityRules.initiator]); a pin or a verified certificate
 /// authenticates the acceptor, and lifts them. [identityRules] overrides
 /// them.
+///
+/// A dial is bounded by the node's connect timeout
+/// ([BindingDialSettings.timeout]), which is also the handshake deadline
+/// of the session it asks for ([QuicClientConfig.handshakeTimeout]). The
+/// QUIC idle timeout and keep-alive are the binding's own ([idleTimeout],
+/// [keepAlive]); the control `PING` is the node's
+/// ([MuxOptions.keepAliveInterval]).
 class QuicSwitchboardBinding extends SwitchboardBinding {
   /// A binding dialling through [connector].
   QuicSwitchboardBinding(
@@ -50,6 +57,7 @@ class QuicSwitchboardBinding extends SwitchboardBinding {
     this.quicOptions = const QuicBindingOptions(),
     this.identityRules,
     this.idleTimeout = const Duration(seconds: 30),
+    this.keepAlive,
     this.webTransportCertificateVerified = true,
   });
 
@@ -79,9 +87,37 @@ class QuicSwitchboardBinding extends SwitchboardBinding {
   /// [QuicIdentityRules.initiator] computed per dial.
   final QuicIdentityRules? identityRules;
 
-  /// The QUIC idle timeout; longer than the keep-alive interval, so that a
-  /// connection with nothing to say is not closed between two probes.
+  /// The QUIC idle timeout of the sessions this binding dials: one on which
+  /// nothing arrived for this long is lost (the stacks apply the shorter of
+  /// both ends' timeouts). Zero for none of this side's. Longer than the
+  /// stack's keep-alive interval ([keepAlive]), so that a connection with
+  /// nothing to say is not closed between two of its `PING`s; the default
+  /// keep-alive, a third of it, is by construction.
   final Duration idleTimeout;
+
+  /// The interval of the QUIC stack's own keep-alive on the sessions this
+  /// binding dials: `PING` frames the stack sends while the connection is
+  /// quiet, so that a live path does not reach [idleTimeout]. They show
+  /// that the peer's stack answers, not that its application reads.
+  ///
+  /// The control `PING` of the binding is another thing: the application's
+  /// probe of its peer, every [MuxOptions.keepAliveInterval] of the node
+  /// (null disables it), which this setting neither reads nor replaces
+  /// (binding page, "Keep-alive").
+  ///
+  /// Null, the default: a third of [idleTimeout], none when [idleTimeout]
+  /// is zero. [Duration.zero]: none, so that only traffic (the control
+  /// `PING` among it) keeps a quiet connection from its idle timeout.
+  final Duration? keepAlive;
+
+  /// [keepAlive] as the sessions are configured with it.
+  Duration get _stackKeepAlive {
+    final interval = keepAlive;
+    if (interval != null) {
+      return interval > Duration.zero ? interval : Duration.zero;
+    }
+    return idleTimeout > Duration.zero ? idleTimeout ~/ 3 : Duration.zero;
+  }
 
   /// Whether the server certificate of an `https` endpoint is verified
   /// (the platform roots, or [certificateHashes] as
@@ -111,6 +147,11 @@ class QuicSwitchboardBinding extends SwitchboardBinding {
     return super.normalise(endpoint);
   }
 
+  /// Dials [endpoint]. The connect is bounded by
+  /// [BindingDialSettings.timeout] when it is positive: on expiry the dial
+  /// fails with [StatusCode.unavailable], and a session the provider still
+  /// yields afterwards is closed with [StatusCode.cancelled] (a connect
+  /// cannot be cancelled), so that it never reaches [dialled].
   @override
   Future<MuxConnection> dial(Uri endpoint, BindingDialSettings settings) async {
     final scheme = endpoint.scheme.toLowerCase();
@@ -122,6 +163,9 @@ class QuicSwitchboardBinding extends SwitchboardBinding {
       );
     }
     final options = settings.options;
+    final timeout = settings.timeout > Duration.zero
+        ? settings.timeout
+        : Duration.zero;
     final verified = webTransport
         ? webTransportCertificateVerified || certificateHashes.isNotEmpty
         : verifyCertificate || certificateHashes.isNotEmpty;
@@ -137,11 +181,12 @@ class QuicSwitchboardBinding extends SwitchboardBinding {
           ? options.receiveHighWaterMarkBytes
           : 16 << 20,
       idleTimeout: idleTimeout,
-      keepAlive: options.keepAliveInterval ?? const Duration(seconds: 10),
+      keepAlive: _stackKeepAlive,
+      handshakeTimeout: timeout,
     );
     final QuicSession session;
     try {
-      session = await connector.connect(
+      final connecting = connector.connect(
         Uri(
           scheme: scheme,
           host: endpoint.host,
@@ -150,6 +195,18 @@ class QuicSwitchboardBinding extends SwitchboardBinding {
         ),
         config,
       );
+      session = await (timeout > Duration.zero
+          ? connecting.timeout(
+              timeout,
+              onTimeout: () {
+                _abandon(connecting);
+                throw SwitchboardException.of(
+                  StatusCode.unavailable,
+                  'cannot reach $endpoint: not connected within $timeout',
+                );
+              },
+            )
+          : connecting);
     } on QuicException catch (e) {
       throw SwitchboardException.of(
         e.kind == QuicExceptionKind.unsupportedScheme
@@ -184,6 +241,18 @@ class QuicSwitchboardBinding extends SwitchboardBinding {
     if (dialled.length == 64) dialled.removeAt(0);
     dialled.add(connection);
     return connection;
+  }
+
+  /// Closes the session a connect given up on still yields, and swallows
+  /// its failure.
+  static void _abandon(Future<QuicSession> connecting) {
+    connecting
+        .then(
+          (session) =>
+              session.close(StatusCode.cancelled.code, 'dial abandoned'),
+          onError: (Object _) {},
+        )
+        .ignore();
   }
 }
 

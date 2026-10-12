@@ -40,7 +40,8 @@ part of 'quic_binding_connection.dart';
 ///   further ahead, and so does an `OK` close of this side, by a window,
 ///   so that the peer's CLOSE record is found behind data nobody takes. A
 ///   subframe costs its record: its length plus the 4-byte header
-///   ([sendCost]).
+///   ([sendCost]). The stack's send window is not visible to the binding,
+///   so [sendWindow] is an estimate, which nothing here counts on.
 /// * [maxSubframeLength] is the peer's record limit; a bulk channel's
 ///   payload goes in records of at most the smaller of it and
 ///   [MuxOptions.bulkChunkSize].
@@ -226,8 +227,13 @@ class QuicChannel extends MuxChannel {
   @override
   Future<Status> get done => _done.future;
 
-  /// Room for a subframe of [maxSubframeLength] while the channel is
-  /// writable, else 0: the stack's window is not visible to the binding.
+  /// An estimate, as [MuxChannel.sendWindow] has it for a binding whose
+  /// streams the stack flow-controls: the stack's window is not visible to
+  /// the binding, so this is room for one largest subframe ([sendCost] of
+  /// [maxSubframeLength]) while the channel [isWritable], else 0. A
+  /// diagnostic, not a count: whether to produce a subframe is decided by
+  /// [isWritable] and [whenWritable], and a subframe is followed by the
+  /// future of [send].
   @override
   int get sendWindow => isWritable ? sendCost(maxSubframeLength) : 0;
 

@@ -135,9 +135,14 @@ class FakeQuicConnector implements QuicConnector {
   /// The configurations the binding asked for, in order.
   final List<QuicClientConfig> configs = [];
 
+  /// While set, a connect waits for it before it reaches the listener (a
+  /// handshake that takes its time).
+  Completer<void>? connectGate;
+
   @override
   Future<QuicSession> connect(Uri endpoint, QuicClientConfig config) async {
     configs.add(config);
+    await connectGate?.future;
     await Future<void>.delayed(Duration.zero);
     final scheme = endpoint.scheme.toLowerCase();
     if (scheme != 'quic' && !(webTransport && scheme == 'https')) {
