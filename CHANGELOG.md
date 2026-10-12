@@ -81,3 +81,12 @@
   returns `SBQ_ERR_CONNECTION` after its CLOSED event, as the event's
   documentation says, instead of `SBQ_ERR_STATE`, which stays the answer
   during the handshake.
+* Negative durations are argument errors: the native provider throws
+  `ArgumentError` for a negative `idleTimeout`, `keepAlive` or
+  `handshakeTimeout` in either configuration instead of passing it to
+  the shim as a huge unsigned value (a negative handshake deadline used
+  to mean none), and rounds a positive one up to whole milliseconds, so
+  that it never becomes none; `QuicSwitchboardBinding` throws for a
+  negative `idleTimeout` or `keepAlive` when constructed. The provider
+  contract says so of its configurations, and the fake provider checks
+  it too.
