@@ -92,7 +92,8 @@ abstract interface class QuicSession {
   /// order is guaranteed between streams). A provider may take them from
   /// the stack only while this stream is listened to and not paused,
   /// leaving the others in the stack, where they hold the peer's stream
-  /// credit.
+  /// credit; one that accepts eagerly holds what is not yet listened to
+  /// in its delivery instead.
   Stream<QuicStream> get incomingStreams;
 
   /// Peer-created unidirectional streams, for applications to accept or

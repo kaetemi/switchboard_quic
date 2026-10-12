@@ -5,6 +5,7 @@ Copyright (C) 2018-2026  Jan BOON (Kaetemi)
 Authors:
   Jan Boon <jan.boon@kaetemi.be>
   Claude Opus 5.5 <noreply@anthropic.com>
+  GLM 5.3 Flash <noreply@z.ai>
 */
 
 /// What the web provider needs of the W3C WebTransport API beyond
@@ -210,9 +211,15 @@ abstract final class StreamErrors {
     return _maxCode;
   }
 
-  /// A `WebTransportError` with [code] and [message].
+  /// A `WebTransportError` with [code] and [message]. Throws
+  /// [ArgumentError] where neither form of the constructor works (the
+  /// browser carries no code at all).
   static JSObject create(int code, String message) {
     _probe();
+    if (_specForm == false && _maxCode == 0) {
+      // Neither form of the constructor works: no code can be carried.
+      throw ArgumentError.value(code, 'code', 'no stream error code');
+    }
     final options = _ErrorInit(message: message, streamErrorCode: code);
     return _specForm == true
         ? _SpecError(message, options)

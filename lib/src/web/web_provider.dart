@@ -5,6 +5,7 @@ Copyright (C) 2018-2026  Jan BOON (Kaetemi)
 Authors:
   Jan Boon <jan.boon@kaetemi.be>
   Claude Opus 5.5 <noreply@anthropic.com>
+  GLM 5.3 Flash <noreply@z.ai>
 */
 
 /// The web stream provider: the browser's own WebTransport API (W3C) under
@@ -548,6 +549,10 @@ final class WebQuicSession implements QuicSession {
       }, onError: (Object _) {});
     }
     connecting.complete(this);
+    // A listener that subscribed while connecting: its pump saw
+    // `_connecting != null` and waits for this.
+    _pumpIncoming();
+    _pumpUnidirectional();
   }
 
   void _connectFailed(QuicException error, {bool abandon = false}) {
@@ -606,6 +611,9 @@ final class WebQuicSession implements QuicSession {
       );
       return;
     }
+    // Once this side closed, the close is the browser's stack's, and its
+    // `closed` tells neither delivery nor failure reliably: it ends as this
+    // close, not as a loss.
     _ended(
       _closeSent
           ? QuicSessionEnd.closed(_closeCode, _closeReason, byPeer: false)
