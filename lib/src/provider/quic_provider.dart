@@ -16,7 +16,7 @@ Authors:
 /// once against these interfaces. Two providers implement them: the native
 /// one over quinn through FFI (`quic://` raw QUIC and `https://`
 /// WebTransport over its own HTTP/3 layer) and the web one over the
-/// browser's WebTransport API.
+/// browser's WebTransport API (`https://` only; a browser cannot listen).
 /// Nothing here knows about Switchboard; it is the smallest QUIC surface the
 /// binding needs, in the vocabulary of RFC 9000 and the W3C WebTransport API.
 ///
@@ -75,18 +75,24 @@ abstract interface class QuicSession {
   /// when the server selected none.
   String? get protocol;
 
-  /// The peer's address for logs.
+  /// The peer's address for logs (the endpoint's host and port where the
+  /// stack does not tell the address it reached).
   String get remote;
 
-  /// Opens a bidirectional stream. Waits for stream credit; fails with
-  /// [QuicException] once the session has ended. Nothing is visible to the
+  /// Opens a bidirectional stream. Waits for stream credit (a provider whose
+  /// stack refuses a stream for want of credit instead of waiting waits
+  /// itself, asking again); fails with [QuicException] once the session has
+  /// ended. Nothing is visible to the
   /// peer until the first write. Waiting calls are served in order. A caller
   /// that stops waiting (a timeout) resets the stream the call still yields,
   /// since an opened stream holds a unit of the peer's stream limit.
   Future<QuicStream> openStream();
 
   /// Streams the peer opened, in the order the stack delivers them (no
-  /// order is guaranteed between streams).
+  /// order is guaranteed between streams). A provider may take them from
+  /// the stack only while this stream is listened to and not paused,
+  /// leaving the others in the stack, where they hold the peer's stream
+  /// credit.
   Stream<QuicStream> get incomingStreams;
 
   /// Peer-created unidirectional streams, for applications to accept or
@@ -103,7 +109,8 @@ abstract interface class QuicSession {
   int? get maxIncomingStreams;
 
   /// The session's keying material exporter; null when the stack has none
-  /// (a browser without `exportKeyingMaterial`).
+  /// (a browser without `exportKeyingMaterial`), or cannot export [length]
+  /// bytes.
   ///
   /// On a raw QUIC connection it is the TLS exporter of RFC 8446 section 7.5
   /// with [label] and [context] as given (Switchboard: the RFC 9266
@@ -133,7 +140,10 @@ abstract interface class QuicSession {
   /// session has ended once the peer's stack acknowledged the close, or a
   /// bounded wait for that passed (the native provider: three round trips,
   /// within 0.2 to 2 s, the wait a peer that is gone costs); the provider can
-  /// then be disposed of without cutting the close short.
+  /// then be disposed of without cutting the close short. Where the stack
+  /// delivers the close itself whatever the application does next (a
+  /// browser's network stack), the session has ended once the stack took the
+  /// close.
   Future<void> close(int code, String reason);
 
   /// Completes when the session has ended, with how.
@@ -182,7 +192,9 @@ abstract interface class QuicStream {
   /// fail with a [StateError]. A no-op once the direction has ended. A code
   /// is a QUIC application code on raw QUIC (0 to 2^62 - 1) and a
   /// WebTransport application code (0 to 2^32 - 1) over WebTransport; one
-  /// outside the range is an [ArgumentError].
+  /// outside the range is an [ArgumentError], and so is one the stack
+  /// cannot carry (an API may carry fewer codes than the protocol): a
+  /// provider never sends another code instead.
   void reset(int code);
 
   /// Asks the peer to stop sending with [code] (`STOP_SENDING`). This
@@ -190,6 +202,7 @@ abstract interface class QuicStream {
   /// arrives, and a pending [read] and every later one fail with a
   /// [QuicStreamReset] carrying [code] (the peer's confirming reset is not
   /// observable through the stacks). A no-op once the direction has ended.
+  /// Codes as for [reset].
   void stop(int code);
 
   /// Sender-local priority class. The binding uses 2 for the control
@@ -198,12 +211,14 @@ abstract interface class QuicStream {
   /// other (binding page, "Flow control and scheduling"): a stack whose
   /// priorities are strict only (quinn) puts 1 and 0 on one level, below
   /// 2, where it interleaves them; one with weights or send groups (the
-  /// W3C API's `sendGroup`) favours 1 without starving 0.
+  /// W3C API's `sendGroup`) favours 1 without starving 0. A stack without
+  /// priorities ignores it.
   set priority(int value);
 
   /// Completes when the peer's `STOP_SENDING` arrived (with its code) or
   /// when every byte of this side's direction was acknowledged after
-  /// [finish] (null). A STOP_SENDING without an application code fails
+  /// [finish] (null; where the stack does not tell acknowledgement, once it
+  /// reports the direction closed after the FIN). A STOP_SENDING without an application code fails
   /// with [QuicStreamStopped] whose code is null, distinguishing it from
   /// acknowledgement. With null at once when this side [reset] its
   /// direction. A provider answers a `STOP_SENDING` itself by resetting its
@@ -212,7 +227,9 @@ abstract interface class QuicStream {
 }
 
 /// Client configuration. Its durations are zero (none) or positive: a
-/// provider rejects a negative one with an [ArgumentError].
+/// provider rejects a negative one with an [ArgumentError]. A provider whose
+/// stack decides some of these itself (a browser: the windows, the stream
+/// limit, the idle timeout and the keep-alive) ignores them.
 class QuicClientConfig {
   const QuicClientConfig({
     required this.alpn,
@@ -233,7 +250,8 @@ class QuicClientConfig {
 
   /// SHA-256 hashes of acceptable server certificates (DER). Empty with
   /// [verifyCertificate] true: the platform roots; empty with it false:
-  /// any certificate (the identity then comes from `IDENT`).
+  /// any certificate (the identity then comes from `IDENT`), where the
+  /// stack allows it (a browser verifies whatever this says).
   final List<Uint8List> serverCertificateHashes;
   final bool verifyCertificate;
 

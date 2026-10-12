@@ -3,3 +3,4 @@ build/
 pubspec.lock
 native/target/
 pubspec_overrides.yaml
+test/web_server.json

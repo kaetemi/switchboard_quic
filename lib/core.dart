@@ -9,11 +9,13 @@ Authors:
 
 /// The parts of the QUIC and WebTransport binding that compile for the web
 /// (no `dart:io`): the stream provider contract, the connection and channel
-/// of the binding over it, and the wire format. A browser frontend runs a
-/// `QuicBindingConnection` over the web provider's session (with
-/// `ReconnectingClient.connections`, say); a `Switchboard` node uses
-/// `package:switchboard_quic/switchboard_quic.dart`, which adds its
-/// `SwitchboardBinding` and listener.
+/// of the binding over it, [connectQuicBinding] (the dial), and the wire
+/// format. A browser frontend runs a `QuicBindingConnection` over the web
+/// provider's session (`package:switchboard_quic/switchboard_quic_web.dart`,
+/// which exports this library: `ReconnectingClient.connections((options) =>
+/// connectQuicBinding(const WebQuicProvider(), endpoint, options: options))`);
+/// a `Switchboard` node uses `package:switchboard_quic/switchboard_quic.dart`,
+/// which adds its `SwitchboardBinding` and listener.
 library;
 
 export 'src/binding/exporter.dart';
@@ -24,6 +26,7 @@ export 'src/binding/quic_binding_connection.dart'
         quicBulkPriority,
         quicControlPriority,
         quicOrdinaryPriority;
+export 'src/binding/quic_dial.dart';
 export 'src/binding/quic_options.dart';
 export 'src/binding/record_reader.dart';
 export 'src/binding/records.dart';

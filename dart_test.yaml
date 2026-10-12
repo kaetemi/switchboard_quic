@@ -10,10 +10,31 @@
 # (which compiles for the web) compiled to JavaScript on Node.js: the wire
 # codecs and their 32 and 48-bit arithmetic, and the connection and channel
 # of the binding, as a browser frontend runs them over the web provider.
-# Everything else needs dart:io or dart:ffi and is marked @TestOn('vm').
+# Everything else needs dart:io or dart:ffi and is marked @TestOn('vm'), or
+# a browser and is marked @TestOn('browser').
+#
+# `dart test -P web` runs the browser tests of the web provider
+# (`package:switchboard_quic/switchboard_quic_web.dart`) in headless Chrome,
+# compiled with dart2js: the provider against the provider contract
+# (web_provider_test) and the binding over it with ReconnectingClient
+# (web_binding_test), against the server of tool/web_server.dart, which
+# tool/web_smoke.sh starts first and describes in test/web_server.json; the
+# tests skip without it. The browser is CHROME_EXECUTABLE (the script points
+# it at Chrome for Testing through a wrapper that gives Chromium a short
+# TMPDIR for its singleton socket); --no-sandbox lets it run where the
+# sandbox cannot (containers, some CI).
 presets:
   node:
     platforms: [node]
     paths:
       - test/vectors_test.dart
       - test/binding_test.dart
+  web:
+    platforms: [chrome]
+    paths:
+      - test/web_provider_test.dart
+      - test/web_binding_test.dart
+    override_platforms:
+      chrome:
+        settings:
+          arguments: --no-sandbox
