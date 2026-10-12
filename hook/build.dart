@@ -193,17 +193,21 @@ String? _findCargo() {
   final env = Platform.environment;
   final sep = Platform.pathSeparator;
   final exe = Platform.isWindows ? 'cargo.exe' : 'cargo';
+  final path = env['PATH'] ?? '';
+  // Windows permits semicolons inside a quoted PATH entry. Quotes are not
+  // path characters there; on Unix they may be, so leave Unix entries alone.
+  final pathDirs = Platform.isWindows
+      ? RegExp(r'(?:[^;"]|"[^"]*")+')
+            .allMatches(path)
+            .map((match) => match[0]!.replaceAll('"', ''))
+      : path.split(':');
   final dirs = [
-    ...?env['PATH']?.split(Platform.isWindows ? ';' : ':'),
+    ...pathDirs,
     if (env['CARGO_HOME'] case final home?) '$home${sep}bin',
     for (final home in [env['HOME'], env['USERPROFILE']])
       if (home != null) '$home$sep.cargo${sep}bin',
   ];
-  for (var dir in dirs) {
-    // A Windows PATH entry may be quoted.
-    if (dir.length >= 2 && dir.startsWith('"') && dir.endsWith('"')) {
-      dir = dir.substring(1, dir.length - 1);
-    }
+  for (final dir in dirs) {
     if (dir.isEmpty) continue;
     final f = File('$dir$sep$exe');
     if (f.existsSync()) return f.path;

@@ -279,3 +279,5 @@ Authors:
 * Port tests: a dual-stack test skips only when the OS cannot provide a
   dual-stack socket, and the refusal test allows 2 s for the handshake and
   request (300 ms failed under qemu), below the client's 5 s deadline.
+* Cargo lookup on Windows keeps quoted PATH entries containing semicolons
+  together, as well as accepting paths containing spaces.
