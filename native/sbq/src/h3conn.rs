@@ -1184,9 +1184,14 @@ impl H3Conn {
     // --- The peer's unidirectional streams.
 
     async fn uni(self: Arc<Self>, mut r: Reader) {
-        let started = Instant::now();
-        let ty = match within(self.request_timeout, r.varint()).await {
-            Some(Ok(Some(t))) => t,
+        // No deadline on the stream type: a peer sends it when it pleases. quiche (Chrome) sends
+        // the type of a QPACK stream with its first instruction, and the stream a peer opens opens
+        // the lower ones of its kind with it, typeless; stopping a peer's QPACK stream is fatal to
+        // the connection (Chrome closes it, "STOP_SENDING received for QPACK send stream"). The
+        // unidirectional stream limit (H3_UNI_STREAMS) bounds what such streams hold, and they
+        // end with the connection.
+        let ty = match r.varint().await {
+            Ok(Some(t)) => t,
             // Nothing to keep, but stopped explicitly rather than dropped (quinn stops a dropped
             // stream with 0).
             _ => {
@@ -1243,12 +1248,7 @@ impl H3Conn {
                     self.fail(err::H3_STREAM_CREATION_ERROR, "a push stream from a client")
                 }
             }
-            stream_type::WEBTRANSPORT => match within(
-                self.request_timeout.saturating_sub(started.elapsed()),
-                r.varint(),
-            )
-            .await
-            {
+            stream_type::WEBTRANSPORT => match within(self.request_timeout, r.varint()).await {
                 Some(Ok(Some(sid))) => self.route(sid, Held::Uni(r.recv.take())),
                 _ => abort(None, Some(&mut r.recv), err::H3_STREAM_CREATION_ERROR),
             },
