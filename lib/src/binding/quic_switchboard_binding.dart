@@ -6,6 +6,7 @@ Authors:
   Jan Boon <jan.boon@kaetemi.be>
   Claude Opus 5.5 <noreply@anthropic.com>
   GPT-6 Astra <noreply@openai.com>
+  GLM 5.3 Flash <noreply@z.ai>
 */
 
 import 'dart:async';
@@ -106,8 +107,9 @@ class QuicSwitchboardBinding extends SwitchboardBinding {
   /// (binding page, "Keep-alive").
   ///
   /// Null, the default: a third of [idleTimeout], none when [idleTimeout]
-  /// is zero. [Duration.zero]: none, so that only traffic (the control
-  /// `PING` among it) keeps a quiet connection from its idle timeout.
+  /// is zero. [Duration.zero] or less: none, so that only traffic (the
+  /// control `PING` among it) keeps a quiet connection from its idle
+  /// timeout.
   final Duration? keepAlive;
 
   /// [keepAlive] as the sessions are configured with it.
