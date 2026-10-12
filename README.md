@@ -14,7 +14,7 @@ The binding of [Polyverse Switchboard](https://github.com/kaetemi/switchboard) t
 
 The binding is written once against a stream provider interface (`lib/src/provider/quic_provider.dart`), for two providers: the native provider over [quinn](https://github.com/quinn-rs/quinn) through FFI (a Rust shim in `native/`), and the web provider over the browser's WebTransport API.
 
-Status: the binding layer is complete for both kinds of session; the native provider speaks raw QUIC (`quic://host:port`) and WebTransport over HTTP/3 (`https://host:port/path`, the HTTP/3 layer in its shim), as a client and as a listener, tested against web-transport-quinn and headless Chromium; the web provider runs the binding over the browser's own WebTransport API, tested in headless Chrome 149 against the native provider's listeners and a Switchboard node behind them. Platforms: everything runs on Linux x86-64; the shim's tests pass on Linux aarch64 under qemu, and the shim's tests, the VM suite and the AOT smoke on Windows x86-64 under wine (with quinn-udp patched for wine's sockets, outside the tree); macOS, iOS and Android are only checked by the compiler so far. The CI and release workflows are configured for Linux x64 and arm64, macOS arm64 and x64, and Windows x64; neither has run on GitHub yet, and no prebuilt release has been verified there (`native/README.md`, "Platforms" and "Releases").
+Status: the binding layer is complete for both kinds of session; the native provider speaks raw QUIC (`quic://host:port`) and WebTransport over HTTP/3 (`https://host:port/path`, the HTTP/3 layer in its shim), as a client and as a listener, tested against web-transport-quinn and headless Chromium; the web provider runs the binding over the browser's own WebTransport API, tested in headless Chrome 149 against the native provider's listeners and a Switchboard node behind them. Platforms: CI runs the shim's tests, clippy, the VM suite and the AOT smoke on Linux x64 and arm64, macOS arm64 and x64, and Windows x64 (MSVC), green on all five since 2026-10-12; everything, the browser suites included, runs on Linux x86-64 here; iOS and Android are only checked by the compiler. The release workflow has not run on GitHub yet, so no prebuilt release exists (`native/README.md`, "Platforms" and "Releases").
 
 | Library | What | Platforms |
 | --- | --- | --- |
@@ -126,7 +126,7 @@ tool/fetch_prebuilt.sh v0.1.0               # a release's libraries for linux_x6
                                             # against its SHA256SUMS, into native/sbq/prebuilt/
 ```
 
-A tag `v*` builds and attaches them (`.github/workflows/release.yml`, not yet run on GitHub); the pub package, once published, will ship them under `native/sbq/prebuilt/`, so that its users need neither Rust nor a download (`native/README.md`, "Releases"). With Rust, by hand:
+A tag `v*` builds and attaches them (`.github/workflows/release.yml`, not yet run on GitHub: no release exists yet); the pub package, once published, will ship them under `native/sbq/prebuilt/`, so that its users need neither Rust nor a download (`native/README.md`, "Releases"). With Rust, by hand:
 
 ```sh
 cd native/sbq

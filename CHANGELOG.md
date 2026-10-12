@@ -231,7 +231,9 @@ Authors:
   clean (`cargo check`, clippy) for macOS arm64 and x86-64, iOS and
   Android; its tests pass on aarch64 under qemu-user, and on Windows
   under wine with quinn-udp patched for wine's sockets outside the tree,
-  where the Windows Dart SDK also passes the VM suite and the AOT smoke.
+  where the Windows Dart SDK also passes the VM suite and the AOT smoke;
+  in CI, the shim's tests, the VM suite and the AOT smoke pass on all
+  five platforms, macOS and Windows with MSVC among them.
   `native/README.md`, "Platforms", says what ran where and what did not.
 * Fix (the shim): a listener's UDP socket on an IPv6 address is
   dual-stack where the platform allows it (`IPV6_V6ONLY` off before the
@@ -269,8 +271,9 @@ Authors:
   wait for each other, and a rerun leaves a published release as it is,
   after checking it against its own `SHA256SUMS`. Both workflows pin
   the Rust toolchain (1.99.0): the first CI run failed at clippy on
-  every platform with a lint of the runners' newer stable, in a test.
-  The release workflow has not run on GitHub yet. `tool/fetch_prebuilt.sh` downloads a release's
+  every platform with a lint of the runners' newer stable, in a test;
+  the second passed on all five. The release workflow has not run on
+  GitHub yet. `tool/fetch_prebuilt.sh` downloads a release's
   libraries, checks its `SHA256SUMS` (known paths, hashes, no
   duplicates) and the libraries against it, and replaces each under
   `native/sbq/prebuilt/` atomically; `native/sbq/.pubignore` lets them
