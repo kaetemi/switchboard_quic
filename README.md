@@ -30,6 +30,24 @@ final listener = await QuicSwitchboardListener.start(
 
 The provider's own configuration of a listener (its certificate, its windows) is the provider's; give it the node's `MuxOptions.initialWindow` as the stream receive window and a connection window of `MuxOptions.receiveHighWaterMarkBytes`, as `QuicSwitchboardBinding` does for the sessions it dials.
 
+## The native provider
+
+`package:switchboard_quic/switchboard_quic_native.dart` (Dart VM only) exports `NativeQuicProvider`: raw QUIC (`quic://host:port`, ALPN `switchboard`) over quinn, through the Rust shim in `native/sbq` (see `native/README.md`). quinn's stream priorities are strict between levels and round robin within one, so the provider puts the priority classes 1 (ordinary) and 0 (bulk) on one level and class 2 (control) above it (`NativeQuicStream.quinnPriority`).
+
+```dart
+final provider = NativeQuicProvider();
+final cert = NativeQuicProvider.generateSelfSigned('node.example');
+final listener = await provider.listen('0.0.0.0', 4433, QuicServerConfig(
+  alpn: const [quicAlpn],
+  certificateDer: cert.certificateDer,
+  privateKeyDer: cert.privateKeyDer,
+));
+final session = await provider.connect(Uri.parse('quic://node.example:4433'),
+    QuicClientConfig(alpn: const [quicAlpn], verifyCertificate: false));
+```
+
+The package's build hook supplies the shim: a prebuilt library from `native/sbq/prebuilt/<os>_<arch>/` when there is one, else `cargo build --release` for the host, so `dart run`, `dart test` and `dart build cli` need either a prebuilt library or a Rust toolchain. Compile programs ahead of time with `dart build cli`, which bundles the library; a `dart compile exe` binary finds it next to the executable or through `SBQ_LIBRARY`. WebTransport (`https://`) is not implemented by the native provider yet: the HTTP/3 session layer will sit between the shim's streams and the provider interface.
+
 ## Tests
 
 `dart test` (under a memory cap: `systemd-run --user --scope -q -p MemoryMax=4G -p MemorySwapMax=0 dart test -j 2`) runs on the VM against `test/fake_provider.dart`, an in-memory provider whose stream directions are delivered independently, each in order, with configurable delays (so that streams overtake one another and the control stream), stream and connection flow control, a stream limit, resets and `STOP_SENDING` with codes, FIN, and an exporter equal at both ends of a session and different per session (or none, as in a browser without `exportKeyingMaterial`). `test/vectors_test.dart` checks every byte vector of the binding page; `test/binding_test.dart` the connection and channel contracts; `test/switchboard_test.dart` two nodes end to end, a man in the middle and the proxy between the frame mux and the binding. `dart test -P node` runs the first two compiled to JavaScript on Node.js.
