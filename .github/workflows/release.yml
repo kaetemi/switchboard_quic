@@ -1,0 +1,117 @@
+# Polyverse Switchboard
+# Microservice Network Architecture
+# Copyright (C) 2018-2026  Jan BOON (Kaetemi)
+# Authors:
+#   Jan Boon <jan.boon@kaetemi.be>
+#   Claude Opus 5.5 <noreply@anthropic.com>
+#
+# The prebuilt shim of a release: on a tag v* (or by hand for an existing
+# tag), `cargo build --release` of native/sbq on each of the five platforms,
+# after its `cargo test`, attached to the GitHub release of the tag:
+#
+#   linux_x64-libsbq.so     linux_arm64-libsbq.so
+#   macos_arm64-libsbq.dylib  macos_x64-libsbq.dylib
+#   windows_x64-sbq.dll     SHA256SUMS
+#
+# Release assets have no directories, so each library is named
+# <os>_<arch>-<file>; SHA256SUMS lists them as <os>_<arch>/<file>, the layout
+# hook/build.dart reads under native/sbq/prebuilt/, where
+# tool/fetch_prebuilt.sh puts them after checking them against it (and where
+# `sha256sum -c` checks them again). A release the workflow creates stays a
+# draft until SHA256SUMS is attached. Only the gh CLI of the runners talks to
+# the release.
+
+name: release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: An existing tag to build (v...)
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  TAG: ${{ github.event_name == 'push' && github.ref_name || inputs.tag }}
+  GH_TOKEN: ${{ github.token }}
+  GH_REPO: ${{ github.repository }}
+
+jobs:
+  create:
+    runs-on: ubuntu-latest
+    steps:
+      - name: The release, as a draft unless it exists
+        run: |
+          gh release view "$TAG" > /dev/null 2>&1 ||
+            gh release create "$TAG" --verify-tag --draft --title "$TAG" \
+              --notes "The native shim for linux_x64, linux_arm64, macos_arm64, macos_x64 and windows_x64: see native/README.md, \"Releases\"."
+
+  build:
+    needs: create
+    name: ${{ matrix.platform }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      matrix:
+        include:
+          - { platform: linux_x64, runner: ubuntu-latest, file: libsbq.so }
+          - { platform: linux_arm64, runner: ubuntu-24.04-arm, file: libsbq.so }
+          - { platform: macos_arm64, runner: macos-latest, file: libsbq.dylib }
+          - { platform: macos_x64, runner: macos-15-intel, file: libsbq.dylib }
+          - { platform: windows_x64, runner: windows-latest, file: sbq.dll }
+    defaults:
+      run:
+        shell: bash
+    env:
+      # The DLL carries the C runtime instead of needing the VC++ redistributable.
+      CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS: -C target-feature=+crt-static
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ env.TAG }}
+
+      # The action's ref selects the toolchain (it has no version tags).
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: cargo test and build
+        working-directory: native/sbq
+        run: |
+          cargo test --locked
+          cargo build --release --locked
+
+      - name: Describe and upload
+        run: |
+          asset="${{ matrix.platform }}-${{ matrix.file }}"
+          mkdir -p dist
+          cp "native/sbq/target/release/${{ matrix.file }}" "dist/$asset"
+          # What the library needs, for the release notes (never fatal).
+          if command -v file > /dev/null; then file "dist/$asset" || true; fi
+          case "${{ matrix.platform }}" in
+            linux_*) echo "glibc symbols up to $(objdump -T "dist/$asset" | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -n 1)" || true ;;
+            macos_*) otool -l "dist/$asset" | grep -A 4 -E 'LC_BUILD_VERSION|LC_VERSION_MIN_MACOSX' || true ;;
+          esac
+          gh release upload "$TAG" "dist/$asset" --clobber
+
+  checksums:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: SHA256SUMS, then publish
+        run: |
+          mkdir dist
+          cd dist
+          gh release download "$TAG" --pattern '*_*-*sbq*'
+          for asset in *-*; do
+            platform=${asset%%-*}
+            mkdir -p "$platform"
+            mv "$asset" "$platform/${asset#*-}"
+          done
+          sha256sum -- */* > SHA256SUMS
+          cat SHA256SUMS
+          [ "$(wc -l < SHA256SUMS)" -eq 5 ] || { echo "expected 5 libraries" >&2; exit 1; }
+          gh release upload "$TAG" SHA256SUMS --clobber
+          gh release edit "$TAG" --draft=false

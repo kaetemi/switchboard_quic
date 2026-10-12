@@ -14,7 +14,7 @@ The binding of [Polyverse Switchboard](https://github.com/kaetemi/switchboard) t
 
 The binding is written once against a stream provider interface (`lib/src/provider/quic_provider.dart`), for two providers: the native provider over [quinn](https://github.com/quinn-rs/quinn) through FFI (a Rust shim in `native/`), and the web provider over the browser's WebTransport API.
 
-Status: the binding layer is complete for both kinds of session; the native provider speaks raw QUIC (`quic://host:port`) and WebTransport over HTTP/3 (`https://host:port/path`, the HTTP/3 layer in its shim), as a client and as a listener, tested against web-transport-quinn and headless Chromium; the web provider runs the binding over the browser's own WebTransport API, tested in headless Chrome 149 against the native provider's listeners and a Switchboard node behind them.
+Status: the binding layer is complete for both kinds of session; the native provider speaks raw QUIC (`quic://host:port`) and WebTransport over HTTP/3 (`https://host:port/path`, the HTTP/3 layer in its shim), as a client and as a listener, tested against web-transport-quinn and headless Chromium; the web provider runs the binding over the browser's own WebTransport API, tested in headless Chrome 149 against the native provider's listeners and a Switchboard node behind them. Platforms: everything runs on Linux x86-64; the shim's tests pass on Linux aarch64 under qemu, and the shim's tests, the VM suite and the AOT smoke on Windows x86-64 under wine (with quinn-udp patched for wine's sockets, outside the tree); macOS, iOS and Android are only checked by the compiler so far. CI covers Linux x64 and arm64, macOS arm64 and x64, and Windows x64, and releases carry the shim prebuilt for those five (`native/README.md`, "Platforms" and "Releases").
 
 | Library | What | Platforms |
 | --- | --- | --- |
@@ -118,7 +118,15 @@ A browser reaches a WebTransport listener with the W3C API: `new WebTransport('h
 
 ### Building the shim
 
-The package's build hook (`hook/build.dart`) supplies the shim to `dart run`, `dart test` and `dart build cli`: a prebuilt library from `native/sbq/prebuilt/<os>_<arch>/` when there is one, else `cargo build --release` for the host when `cargo` is on `PATH` (about a minute the first time), else a clear failure. So either place a prebuilt library there or install a Rust toolchain (<https://rustup.rs>; ring needs a C compiler). By hand:
+The package's build hook (`hook/build.dart`) supplies the shim to `dart run`, `dart test` and `dart build cli`: a prebuilt library from `native/sbq/prebuilt/<os>_<arch>/` when there is one, else `cargo build --release` for the host when cargo is found (on `PATH`, in `$CARGO_HOME/bin` or in `~/.cargo/bin`; about a minute the first time), else a clear failure; it never downloads anything, and never builds for iOS or Android. So either fetch a release's prebuilt libraries or install a Rust toolchain (<https://rustup.rs>; ring needs a C compiler, on Windows the MSVC build tools rustup asks for). Without Rust:
+
+```sh
+tool/fetch_prebuilt.sh v0.1.0               # a release's libraries for linux_x64, linux_arm64,
+                                            # macos_arm64, macos_x64 and windows_x64, checked
+                                            # against its SHA256SUMS, into native/sbq/prebuilt/
+```
+
+A tag `v*` builds and attaches them (`.github/workflows/release.yml`); the pub package, once published, will ship them under `native/sbq/prebuilt/` so that its users need neither (`native/README.md`, "Releases"). With Rust, by hand:
 
 ```sh
 cd native/sbq
@@ -127,7 +135,7 @@ cargo test                       # ABI self test
 cargo clippy --all-targets       # kept warning-free
 ```
 
-Compile programs ahead of time with `dart build cli`, which bundles the library (ship the bundle directory); a `dart compile exe` binary finds the library next to the executable, in `../lib`, or through `SBQ_LIBRARY`. The Dart layer refuses a library of another ABI version (`SBQ_ABI_VERSION`, now 4: WebTransport sessions), so a prebuilt library must come from the same version of the package. After an ABI change, regenerate `native/sbq/include/sbq.h` (cbindgen) and `lib/src/native/sbq_bindings.g.dart` (`dart run ffigen --config ffigen.yaml`) and bump `SBQ_ABI_VERSION`; `native/README.md` has the details, the ABI and the platforms.
+Compile programs ahead of time with `dart build cli`, which bundles the library (ship the bundle directory); a `dart compile exe` binary finds the library next to the executable, in `../lib`, or through `SBQ_LIBRARY`. On Windows, a listener on `::` takes IPv4 clients as on Linux and macOS (the shim turns `IPV6_V6ONLY` off); give listeners address literals, since `localhost` may resolve to `::1` first. The Dart layer refuses a library of another ABI version (`SBQ_ABI_VERSION`, now 4: WebTransport sessions), so a prebuilt library must come from the same version of the package. After an ABI change, regenerate `native/sbq/include/sbq.h` (cbindgen) and `lib/src/native/sbq_bindings.g.dart` (`dart run ffigen --config ffigen.yaml`) and bump `SBQ_ABI_VERSION`; `native/README.md` has the details, the ABI and the platforms.
 
 ## The web provider
 
@@ -169,8 +177,8 @@ Run every suite under a memory cap:
 ```sh
 systemd-run --user --scope -q -p MemoryMax=4G -p MemorySwapMax=0 dart test -j 2           # VM
 systemd-run --user --scope -q -p MemoryMax=4G -p MemorySwapMax=0 dart test -j 2 -P node   # Node.js
-(cd native/sbq && cargo test && cargo clippy --all-targets)
-TMPDIR=/some/scratch tool/aot_smoke.sh                                                   # AOT
+(cd native/sbq && cargo test && cargo clippy --all-targets -- -D warnings && cargo fmt --check)
+TMPDIR=/some/scratch tool/aot_smoke.sh                                                   # AOT (Linux, macOS, Git Bash)
 tool/browser_smoke.sh                                                                    # Chromium
 TMPDIR=/some/scratch tool/web_smoke.sh                                                   # the web provider in Chrome
 ```
@@ -180,3 +188,4 @@ TMPDIR=/some/scratch tool/web_smoke.sh                                          
 * `tool/aot_smoke.sh` compiles `tool/native_smoke.dart` (the provider, then the binding over it, over raw QUIC and over WebTransport) with `dart build cli` and with `dart compile exe` and runs both.
 * `tool/browser_smoke.sh` runs headless Chromium against a WebTransport listener of the native provider (see "Browsers and certificates").
 * `tool/web_smoke.sh` runs the web provider and the binding over it in headless Chrome (`dart test -P web`) against the native provider's listeners and a Switchboard node (see "The web provider").
+* CI (`.github/workflows/ci.yml`, on a push to master or by hand) runs the shim's `cargo fmt`, clippy and tests, `dart analyze`, `dart format`, the VM suite and the AOT smoke on Linux x64 and arm64, macOS arm64 and x64, and Windows x64, and the Node.js suite on Linux x64, with core checked out at the commit in `tool/core_commit.txt`, the one this package is tested against. The browser suites are not in CI yet.

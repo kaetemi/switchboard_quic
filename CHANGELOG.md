@@ -1,3 +1,14 @@
+<!--
+Polyverse Switchboard
+Microservice Network Architecture
+Copyright (C) 2018-2026  Jan BOON (Kaetemi)
+Authors:
+  Jan Boon <jan.boon@kaetemi.be>
+  Claude Fable 5.1 <noreply@anthropic.com>
+  Claude Opus 5.5 <noreply@anthropic.com>
+  GPT-6 Astra <noreply@openai.com>
+-->
+
 ## 0.1.0-dev.1
 
 * Package created: the provider interface the binding is written against.
@@ -215,3 +226,41 @@
   once the server has it: a reset that overtakes the stream's header loses
   it at a quinn server (no `RESET_STREAM_AT`), which then cannot tell the
   stream's session.
+* Platforms beyond Linux x86-64. The shim builds for Windows x86-64
+  (MinGW here; MSVC in CI and releases) and Linux aarch64, and checks
+  clean (`cargo check`, clippy) for macOS arm64 and x86-64, iOS and
+  Android; its tests pass on aarch64 under qemu-user, and on Windows
+  under wine with quinn-udp patched for wine's sockets outside the tree,
+  where the Windows Dart SDK also passes the VM suite and the AOT smoke.
+  `native/README.md`, "Platforms", says what ran where and what did not.
+* Fix (the shim): a listener's UDP socket on an IPv6 address is
+  dual-stack where the platform allows it (`IPV6_V6ONLY` off, as quinn
+  makes its client sockets). On Windows, whose IPv6 sockets are IPv6-only
+  by default, a listener on `::` took no IPv4 client; Linux and macOS
+  were dual-stack already (no ABI change).
+* The build hook finds cargo in `$CARGO_HOME/bin` and
+  `%USERPROFILE%\.cargo\bin` too; builds with an explicit `--target` when
+  rustc's host is of another architecture than the Dart VM (an x64 Dart
+  SDK under Rosetta 2 or Windows' emulation); refuses a library whose
+  header names another architecture or format than the target's (Dart
+  3.13 bundles it, and loading it fails with a misleading message); and
+  says that it builds nothing for iOS and Android. The `dart compile exe`
+  fallback loads the library with Apple's `RTLD_GLOBAL` on iOS too.
+* CI (`.github/workflows/ci.yml`): the shim and the Dart package on
+  Linux x64 and arm64, macOS arm64 and x64, and Windows x64, and the
+  Node.js suite on Linux x64, against the core commit recorded in
+  `tool/core_commit.txt` (`01ccd03`). Releases
+  (`.github/workflows/release.yml`, on a tag `v*`): the shim built on
+  those five platforms, attached as `<os>_<arch>-<file>` with a
+  `SHA256SUMS` of the `<os>_<arch>/<file>` layout the hook reads;
+  `tool/fetch_prebuilt.sh` downloads them, checks them and puts them
+  under `native/sbq/prebuilt/`, and `native/sbq/.pubignore` lets them
+  into a published package.
+* Portability of the tools and tests: `tool/aot_smoke.sh` runs under Git
+  Bash on Windows (`.exe`); `.gitattributes` keeps LF in Windows
+  checkouts; `tool/web_server.dart` watches SIGTERM only where it can be
+  watched; a native provider test no longer binds 127.0.0.2 (Linux routes
+  all of 127.0.0.0/8 to the loopback, macOS does not); the native smoke
+  waits for both `HELLO`s before it checks that they carry `EXPORTER` (a
+  channel's records may overtake the control stream, as a run under wine
+  showed).
