@@ -211,14 +211,18 @@ abstract final class StreamErrors {
     return _maxCode;
   }
 
-  /// A `WebTransportError` with [code] and [message]. Throws
-  /// [ArgumentError] where neither form of the constructor works (the
-  /// browser carries no code at all).
-  static JSObject create(int code, String message) {
+  /// A `WebTransportError` with [code] and [message], the reason of an
+  /// abort or a cancel. Where neither form of the constructor works, null
+  /// for code 0, which the browser sends for a reason that is no
+  /// `WebTransportError` ([maxCode] is 0 there: a larger code is an
+  /// [ArgumentError]).
+  static JSObject? create(int code, String message) {
     _probe();
     if (_specForm == false && _maxCode == 0) {
-      // Neither form of the constructor works: no code can be carried.
-      throw ArgumentError.value(code, 'code', 'no stream error code');
+      if (code != 0) {
+        throw ArgumentError.value(code, 'code', 'this browser sends 0 only');
+      }
+      return null;
     }
     final options = _ErrorInit(message: message, streamErrorCode: code);
     return _specForm == true

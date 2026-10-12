@@ -82,10 +82,10 @@ abstract interface class QuicSession {
   /// Opens a bidirectional stream. Waits for stream credit (a provider whose
   /// stack refuses a stream for want of credit instead of waiting waits
   /// itself, asking again); fails with [QuicException] once the session has
-  /// ended. Nothing is visible to the
-  /// peer until the first write. Waiting calls are served in order. A caller
-  /// that stops waiting (a timeout) resets the stream the call still yields,
-  /// since an opened stream holds a unit of the peer's stream limit.
+  /// ended. Nothing is visible to the peer until the first write. Waiting
+  /// calls are served in order. A caller that stops waiting (a timeout)
+  /// resets the stream the call still yields, since an opened stream holds
+  /// a unit of the peer's stream limit.
   Future<QuicStream> openStream();
 
   /// Streams the peer opened, in the order the stack delivers them (no
@@ -195,7 +195,9 @@ abstract interface class QuicStream {
   /// WebTransport application code (0 to 2^32 - 1) over WebTransport; one
   /// outside the range is an [ArgumentError], and so is one the stack
   /// cannot carry (an API may carry fewer codes than the protocol): a
-  /// provider never sends another code instead.
+  /// provider never sends another code instead. Over WebTransport without
+  /// `RESET_STREAM_AT`, a reset that overtakes the stream's header can leave
+  /// the peer unable to tell the stream's session: it never sees the stream.
   void reset(int code);
 
   /// Asks the peer to stop sending with [code] (`STOP_SENDING`). This
@@ -219,11 +221,11 @@ abstract interface class QuicStream {
   /// Completes when the peer's `STOP_SENDING` arrived (with its code) or
   /// when every byte of this side's direction was acknowledged after
   /// [finish] (null; where the stack does not tell acknowledgement, once it
-  /// reports the direction closed after the FIN). A STOP_SENDING without an application code fails
-  /// with [QuicStreamStopped] whose code is null, distinguishing it from
-  /// acknowledgement. With null at once when this side [reset] its
-  /// direction. A provider answers a `STOP_SENDING` itself by resetting its
-  /// direction with the same code (RFC 9000 section 3.5).
+  /// reports the direction closed after the FIN). A STOP_SENDING without an
+  /// application code fails with [QuicStreamStopped] whose code is null,
+  /// distinguishing it from acknowledgement. With null at once when this
+  /// side [reset] its direction. A provider answers a `STOP_SENDING` itself
+  /// by resetting its direction with the same code (RFC 9000 section 3.5).
   Future<int?> get stopped;
 }
 

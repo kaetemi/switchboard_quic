@@ -549,10 +549,6 @@ final class WebQuicSession implements QuicSession {
       }, onError: (Object _) {});
     }
     connecting.complete(this);
-    // A listener that subscribed while connecting: its pump saw
-    // `_connecting != null` and waits for this.
-    _pumpIncoming();
-    _pumpUnidirectional();
   }
 
   void _connectFailed(QuicException error, {bool abandon = false}) {
@@ -611,15 +607,11 @@ final class WebQuicSession implements QuicSession {
       );
       return;
     }
-    // Once this side closed, the close is the browser's stack's, and its
-    // `closed` tells neither delivery nor failure reliably: it ends as this
-    // close, not as a loss.
+    // A loss, also after this side's close: the browser resolves `closed`
+    // at once with the close it took, so a rejection means that the session
+    // had failed before the close could be sent.
     _ended(
-      _closeSent
-          ? QuicSessionEnd.closed(_closeCode, _closeReason, byPeer: false)
-          : QuicSessionEnd.lost(
-              error is JsError ? error.message : error.toString(),
-            ),
+      QuicSessionEnd.lost(error is JsError ? error.message : error.toString()),
     );
   }
 
@@ -1169,7 +1161,8 @@ final class WebQuicStream implements QuicStream {
   }
 
   /// The writable's `closed` rejected: the server's `STOP_SENDING`, the
-  /// end of the session, or this side's own reset (or released lock).
+  /// end of the session, this side's own reset (or released lock), or a
+  /// failure of the browser's, which ends this direction too.
   void _sendFailed(Object error) {
     if (_resetSent || _sendEnded) return;
     final e = error is JsError ? error : null;
@@ -1177,17 +1170,24 @@ final class WebQuicStream implements QuicStream {
       _peerStopped(e.streamErrorCode);
       return;
     }
+    final Object failure;
     if ((e != null && e.fromSession) || _session._end != null) {
       _session._sessionGone(e?.message ?? '$error');
-      final failure = _sendFailure = _session._sessionEndedError(e?.message);
-      _failWrites(failure);
-      if (!_stopped.isCompleted) {
-        _stopped
-          ..future.ignore()
-          ..completeError(failure);
-      }
-      _endSend();
+      failure = _session._sessionEndedError(e?.message);
+    } else {
+      failure = QuicException(
+        QuicExceptionKind.internal,
+        'the stream failed: $error',
+      );
     }
+    _sendFailure = failure;
+    _failWrites(failure);
+    if (!_stopped.isCompleted) {
+      _stopped
+        ..future.ignore()
+        ..completeError(failure);
+    }
+    _endSend();
   }
 
   void _peerStopped(int? code) {
