@@ -92,6 +92,36 @@ pub(crate) const FIELD_PATH: i32 = 2;
 pub(crate) const FIELD_ORIGIN: i32 = 3;
 pub(crate) const FIELD_PROTOCOLS: i32 = 4;
 
+/// Whether `SBQ_TRACE` is set: the HTTP/3 layer then writes what peers send (their SETTINGS,
+/// requests and responses, the stream types and capsules it ignores) to stderr, for interop
+/// work. Read once.
+fn tracing() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("SBQ_TRACE").is_some_and(|v| !v.is_empty() && v != "0"))
+}
+
+macro_rules! trace {
+    ($($arg:tt)*) => {
+        if tracing() {
+            eprintln!("sbq: {}", format_args!($($arg)*));
+        }
+    };
+}
+
+fn fields_text(fields: &[h3::Field]) -> String {
+    fields
+        .iter()
+        .map(|(n, v)| {
+            format!(
+                "{}: {}",
+                String::from_utf8_lossy(n),
+                String::from_utf8_lossy(v)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" | ")
+}
+
 // ---------------------------------------------------------------------------------------------
 // Reading.
 
@@ -327,6 +357,7 @@ impl Capsules {
                 Ok(Some(Capsule::Forbidden))
             }
             _ => {
+                trace!("capsule of type {t:#x} ({len} bytes): ignored");
                 self.skip(len).await.map_err(malformed)?;
                 Ok(Some(Capsule::Other))
             }
@@ -966,7 +997,10 @@ impl H3Conn {
                 None => abort(None, Some(&mut r.recv), err::H3_STREAM_CREATION_ERROR),
             },
             // Reserved and unknown types: abort reading (RFC 9114 section 6.2).
-            _ => abort(None, Some(&mut r.recv), err::H3_STREAM_CREATION_ERROR),
+            t => {
+                trace!("peer unidirectional stream of type {t:#x}: refused");
+                abort(None, Some(&mut r.recv), err::H3_STREAM_CREATION_ERROR)
+            }
         }
     }
 
@@ -999,6 +1033,17 @@ impl H3Conn {
         }
         let payload = r.take(len).await?;
         let settings = h3::parse_settings(&payload).map_err(|code| Fail::Conn(code, "SETTINGS"))?;
+        trace!(
+            "{} {}: peer SETTINGS {}",
+            if self.client { "client" } else { "server" },
+            self.conn.remote_address(),
+            settings
+                .order
+                .iter()
+                .map(|(k, v)| format!("{k:#x}={v}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
         if settings.datagrams() && self.conn.max_datagram_size().is_none() {
             return Err(Fail::Conn(
                 err::H3_SETTINGS_ERROR,
@@ -1228,6 +1273,11 @@ impl H3Conn {
             }
             Err(FieldError::TooLarge) => return Err(Fail::Stream(err::H3_EXCESSIVE_LOAD)),
         };
+        trace!(
+            "server {}: request {}",
+            self.conn.remote_address(),
+            fields_text(&fields)
+        );
         parse_request(&fields).map_err(|_| Fail::Stream(err::H3_MESSAGE_ERROR))
     }
 
@@ -1825,6 +1875,11 @@ pub async fn client_session(
                         ));
                     }
                 };
+                trace!(
+                    "client {}: response {}",
+                    h3.conn.remote_address(),
+                    fields_text(&fields)
+                );
                 let Ok(response) = parse_response(&fields) else {
                     let _ = tx.send(Write::Reset(err::H3_MESSAGE_ERROR));
                     abort(None, Some(&mut r.recv), err::H3_MESSAGE_ERROR);
