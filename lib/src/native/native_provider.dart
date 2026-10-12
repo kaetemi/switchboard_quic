@@ -6,6 +6,7 @@ Authors:
   Jan Boon <jan.boon@kaetemi.be>
   Claude Opus 5.5 <noreply@anthropic.com>
   GLM 5.3 Flash <noreply@z.ai>
+  GPT-6 Astra <noreply@openai.com>
 */
 
 /// The native stream provider: raw QUIC and WebTransport over HTTP/3, over
@@ -235,7 +236,8 @@ final class NativeQuicProvider implements QuicConnector {
   /// [origin] is sent as the `Origin` header (a browser always sends one; a
   /// node need not). Certificate verification is as for raw QUIC. The
   /// handshake deadline bounds the QUIC handshake and again the HTTP/3
-  /// exchange. The session has its QUIC connection to itself.
+  /// exchange (10 seconds for HTTP/3 when the configured deadline is zero).
+  /// The session has its QUIC connection to itself.
   Future<QuicSession> connectWebTransport(
     Uri endpoint,
     QuicClientConfig config, {
@@ -253,7 +255,17 @@ final class NativeQuicProvider implements QuicConnector {
         'an https:// endpoint needs a host: $endpoint',
       );
     }
+    if (endpoint.userInfo.isNotEmpty || endpoint.authority.contains('@')) {
+      throw ArgumentError.value(
+        endpoint,
+        'endpoint',
+        'userinfo is not allowed',
+      );
+    }
     final port = endpoint.hasPort ? endpoint.port : 443;
+    if (port <= 0 || port > 65535) {
+      throw ArgumentError.value(port, 'port', 'must be 1 to 65535');
+    }
     final hostPart = endpoint.host.contains(':')
         ? '[${endpoint.host}]'
         : endpoint.host;
@@ -321,8 +333,8 @@ final class NativeQuicProvider implements QuicConnector {
     QuicServerConfig config, {
     String? advertisedHost,
   }) async {
+    final name = utf8.encode(await _listenAddress(host));
     final rt = _Sbq.current;
-    final name = utf8.encode(host);
     final cfg = _serverConfig(config);
     final int h;
     try {
@@ -347,8 +359,10 @@ final class NativeQuicProvider implements QuicConnector {
   /// configuration's own [QuicServerConfig.alpn] is not used), HTTP/3 over
   /// them, and each extended CONNECT a session request, answered here:
   ///
-  /// * a request for another path than [path] (its query aside) is refused
-  ///   with 404;
+  /// * a request for another authority or path than this listener (its
+  ///   query aside) is refused with 404; [advertisedHost] names the served
+  ///   host, defaulting to [host]. A wildcard bind without [advertisedHost]
+  ///   accepts any host on its port;
   /// * one whose `Origin` is not among [allowedOrigins] with 403 (null, the
   ///   default, allows any; a request without `Origin` comes from a client
   ///   that is not a browser, and passes);
@@ -374,11 +388,24 @@ final class NativeQuicProvider implements QuicConnector {
     List<String> protocols = const ['switchboard'],
     String? advertisedHost,
   }) async {
-    if (!path.startsWith('/')) {
-      throw ArgumentError.value(path, 'path', 'must start with /');
+    if (!path.startsWith('/') || path.contains('?') || path.contains('#')) {
+      throw ArgumentError.value(
+        path,
+        'path',
+        'must be an absolute path without query or fragment',
+      );
     }
+    // Validate before allocating the listener; every served protocol must cross the ABI.
+    _alpnWire(protocols);
+    if (protocols.any((p) => p.codeUnits.any((c) => c < 0x20 || c > 0x7e))) {
+      throw ArgumentError.value(
+        protocols,
+        'protocols',
+        'must be printable ASCII',
+      );
+    }
+    final name = utf8.encode(await _listenAddress(host));
     final rt = _Sbq.current;
-    final name = utf8.encode(host);
     final cfg = _serverConfig(config, alpn: const [h3Alpn]);
     final int h;
     try {
@@ -401,9 +428,31 @@ final class NativeQuicProvider implements QuicConnector {
       h,
       endpoint,
       config.maxStreamsBidi,
-      path: path,
+      path: endpoint.path,
+      authorityHost:
+          advertisedHost != null || (host != '0.0.0.0' && host != '::')
+          ? endpoint.host
+          : null,
       allowedOrigins: allowedOrigins?.toSet(),
       protocols: List.unmodifiable(protocols),
+    );
+  }
+
+  static Future<String> _listenAddress(String host) async {
+    final address = InternetAddress.tryParse(host);
+    if (address != null) return address.address;
+    try {
+      final addresses = await InternetAddress.lookup(host);
+      if (addresses.isNotEmpty) return addresses.first.address;
+    } on SocketException catch (e) {
+      throw QuicException(
+        QuicExceptionKind.unreachable,
+        'cannot resolve listen host: $e',
+      );
+    }
+    throw QuicException(
+      QuicExceptionKind.unreachable,
+      'listen host has no addresses',
     );
   }
 
@@ -579,6 +628,7 @@ final class NativeWebTransportListener
     this.endpoint,
     this._maxIncoming, {
     required this.path,
+    required this.authorityHost,
     required this.allowedOrigins,
     required this.protocols,
   }) {
@@ -598,6 +648,9 @@ final class NativeWebTransportListener
   /// The path sessions are accepted on.
   final String path;
 
+  // A wildcard bind without advertisedHost accepts any host on its port.
+  final String? authorityHost;
+
   /// The origins a browser's session may come from; null for any.
   final Set<String>? allowedOrigins;
 
@@ -611,8 +664,9 @@ final class NativeWebTransportListener
   @override
   Stream<QuicSession> get sessions => _sessions.stream;
 
-  /// Requests answered so far by status (200 for an accepted one), for logs
-  /// and tests.
+  /// Requests answered here by status (200 for an accepted one), for logs
+  /// and tests. Excludes refusals in the shim, including requests arriving
+  /// after this listener closed and requests that exceeded native limits.
   final Map<int, int> answered = {};
 
   @override
@@ -630,7 +684,8 @@ final class NativeWebTransportListener
     var status = 0;
     if (_closed) {
       status = 503;
-    } else if (request.path.split('?').first != path) {
+    } else if (!_acceptsAuthority(request.authority) ||
+        request.path.split('?').first != path) {
       status = 404;
     } else if (request.origin != null &&
         allowedOrigins != null &&
@@ -646,8 +701,9 @@ final class NativeWebTransportListener
       if (selected == null) status = 400;
     }
     if (status != 0) {
-      answered[status] = (answered[status] ?? 0) + 1;
-      sbq_wt_reject(session, status);
+      if (sbq_wt_reject(session, status) == SBQ_OK) {
+        answered[status] = (answered[status] ?? 0) + 1;
+      }
       sbq_conn_release(session);
       return;
     }
@@ -668,6 +724,24 @@ final class NativeWebTransportListener
         request: request,
       ),
     );
+  }
+
+  bool _acceptsAuthority(String authority) {
+    try {
+      final uri = Uri.tryParse('https://$authority');
+      return uri != null &&
+          uri.host.isNotEmpty &&
+          uri.userInfo.isEmpty &&
+          !uri.authority.contains('@') &&
+          uri.path.isEmpty &&
+          !uri.hasQuery &&
+          !uri.hasFragment &&
+          uri.port == port &&
+          (authorityHost == null || uri.host == authorityHost!.toLowerCase());
+    } on FormatException {
+      // Simple Uri parsing can defer validation until a getter (notably port).
+      return false;
+    }
   }
 
   /// Stops accepting: new connections are refused, and requests on the
@@ -700,7 +774,11 @@ final class _WebTransportRequest {
   factory _WebTransportRequest.read(int session, int draft) {
     String? field(int f) =>
         _Sbq.text((b) => sbq_wt_request(session, f, b.address, b.length));
-    final wire = utf8.encode(field(SBQ_WT_PROTOCOLS) ?? '');
+    final wire =
+        _Sbq.bytes(
+          (b) => sbq_wt_request(session, SBQ_WT_PROTOCOLS, b.address, b.length),
+        ) ??
+        Uint8List(0);
     final protocols = <String>[];
     for (var i = 0; i < wire.length;) {
       final n = wire[i];
@@ -925,7 +1003,8 @@ final class NativeQuicSession implements QuicSession {
   /// WebTransport: `WT_CLOSE_SESSION` with the code (0 to 2^32 - 1) and the
   /// reason, then FIN on the CONNECT stream; the shim closes the QUIC
   /// connection once the peer has closed the CONNECT stream in turn, or
-  /// after a bounded wait.
+  /// after a bounded wait. Completion waits for that close attempt, so
+  /// disposing the provider after `await close()` does not pre-empt it.
   @override
   Future<void> close(int code, String reason) {
     _checkCode(code, webTransport: isWebTransport);
@@ -1580,9 +1659,9 @@ final class _Sbq {
   void release() {
     if (--_live > 0 || _down) return;
     _bell.keepIsolateAlive = false;
-    scheduleMicrotask(() {
-      if (_live == 0) shutdown();
-    });
+    // Finish context cleanup before completing futures can let an owning isolate exit.
+    // WebTransport CLOSED already waits for its bounded CONNECT close in the shim.
+    shutdown();
   }
 
   void shutdown() {
@@ -1673,6 +1752,12 @@ final class _Sbq {
   /// A string the shim copies out: called with a buffer, returns the full
   /// length (or a negative error, giving null).
   static String? text(int Function(Uint8List buffer) call) {
+    final value = bytes(call);
+    return value == null ? null : utf8.decode(value, allowMalformed: true);
+  }
+
+  // Binary ABI fields must preserve length octets, including 0x80 through 0xff.
+  static Uint8List? bytes(int Function(Uint8List buffer) call) {
     var buffer = Uint8List(256);
     var n = call(buffer);
     if (n > buffer.length) {
@@ -1680,7 +1765,7 @@ final class _Sbq {
       n = call(buffer);
     }
     if (n < 0) return null;
-    return utf8.decode(buffer.sublist(0, n), allowMalformed: true);
+    return buffer.sublist(0, n);
   }
 
   static String lastError() =>

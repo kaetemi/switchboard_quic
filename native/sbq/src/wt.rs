@@ -5,6 +5,7 @@ Copyright (C) 2018-2026  Jan BOON (Kaetemi)
 Authors:
   Jan Boon <jan.boon@kaetemi.be>
   Claude Opus 5.5 <noreply@anthropic.com>
+  GPT-6 Astra <noreply@openai.com>
 */
 
 //! WebTransport over HTTP/3 (draft-ietf-webtrans-http3), the pure parts: error codes and the
@@ -180,40 +181,98 @@ impl Sf<'_> {
         c.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&c)
     }
 
+    fn number(&mut self, integer_only: bool) -> Option<()> {
+        if self.peek() == Some(b'-') {
+            self.i += 1;
+        }
+        let start = self.i;
+        while matches!(self.peek(), Some(b'0'..=b'9')) {
+            self.i += 1;
+        }
+        let digits = self.i - start;
+        if digits == 0 || digits > 15 {
+            return None;
+        }
+        if self.peek() == Some(b'.') {
+            if integer_only || digits > 12 {
+                return None;
+            }
+            self.i += 1;
+            let start = self.i;
+            while matches!(self.peek(), Some(b'0'..=b'9')) {
+                self.i += 1;
+            }
+            if !(1..=3).contains(&(self.i - start)) {
+                return None;
+            }
+        }
+        Some(())
+    }
+
+    fn display_string(&mut self) -> Option<()> {
+        self.i += 1; // %
+        if self.peek()? != b'"' {
+            return None;
+        }
+        self.i += 1;
+        let mut decoded = Vec::new();
+        loop {
+            let c = self.peek()?;
+            self.i += 1;
+            match c {
+                b'"' => return std::str::from_utf8(&decoded).ok().map(|_| ()),
+                b'%' => {
+                    let mut octet = 0;
+                    for _ in 0..2 {
+                        let digit = match self.peek()? {
+                            c @ b'0'..=b'9' => c - b'0',
+                            c @ b'a'..=b'f' => c - b'a' + 10,
+                            _ => return None,
+                        };
+                        self.i += 1;
+                        octet = octet * 16 + digit;
+                    }
+                    decoded.push(octet);
+                }
+                0x20..=0x7e => decoded.push(c),
+                _ => return None,
+            }
+        }
+    }
+
     /// Any bare item (the values of parameters), validated and discarded.
     fn bare_item(&mut self) -> Option<()> {
         match self.peek()? {
             b'"' => self.string().map(|_| ()),
-            b'-' | b'0'..=b'9' => {
-                if self.peek() == Some(b'-') {
-                    self.i += 1;
-                }
-                let start = self.i;
-                while matches!(self.peek(), Some(b'0'..=b'9' | b'.')) {
-                    self.i += 1;
-                }
-                (self.i > start).then_some(())
-            }
+            b'-' | b'0'..=b'9' => self.number(false),
             b'?' => {
                 self.i += 1;
                 matches!(self.peek(), Some(b'0' | b'1')).then(|| self.i += 1)
             }
             b':' => {
                 self.i += 1;
-                while matches!(self.peek(), Some(c) if c.is_ascii_alphanumeric() || c == b'+' || c == b'/' || c == b'=')
+                let start = self.i;
+                while matches!(self.peek(), Some(c) if c.is_ascii_alphanumeric() || c == b'+' || c == b'/')
                 {
                     self.i += 1;
+                }
+                let digits = self.i - start;
+                let start = self.i;
+                while self.peek() == Some(b'=') {
+                    self.i += 1;
+                }
+                let padding = self.i - start;
+                // Missing padding and nonzero pad bits are tolerated by RFC 9651 4.2.7.
+                if digits % 4 == 1 || padding > 2 || (padding > 0 && (digits + padding) % 4 != 0) {
+                    return None;
                 }
                 (self.peek()? == b':').then(|| self.i += 1)
             }
             b'@' => {
                 self.i += 1;
-                self.bare_item()
+                self.number(true)
             }
-            b'%' => {
-                self.i += 1;
-                self.string().map(|_| ())
-            }
+            b'%' => self.display_string(),
             c if c.is_ascii_alphabetic() || c == b'*' => {
                 while matches!(self.peek(), Some(c) if Self::is_tchar(c) || c == b':' || c == b'/')
                 {
@@ -456,5 +515,51 @@ mod tests {
             parse_string_list(round.as_bytes()),
             Some(vec!["q\"\\".into(), "switchboard".into()])
         );
+    }
+    #[test]
+    fn structured_parameter_grammar_and_truncations() {
+        for param in [
+            "@-123",
+            "999999999999999",
+            "-999999999999.999",
+            ":aGk:",
+            "%\"%c3%a9\"",
+            "%\"back\\slash\"",
+            "?0",
+        ] {
+            let field = format!("\"switchboard\";p={param}");
+            assert!(parse_string_item(field.as_bytes()).is_some(), "{field}");
+        }
+        for param in [
+            "@@1",
+            "@?1",
+            "@1.0",
+            "-.",
+            "1..0",
+            "1.",
+            "1.0000",
+            "1234567890123456",
+            "1234567890123.0",
+            ":a:",
+            ":a=b:",
+            ":aGk===:",
+            "%\"%FF\"",
+            "%\"%ff\"",
+            "%\"%c3\"",
+            "%\"%xx\"",
+        ] {
+            let field = format!("\"switchboard\";p={param}");
+            assert_eq!(parse_string_item(field.as_bytes()), None, "{field}");
+            assert_eq!(parse_string_list(field.as_bytes()), None, "{field}");
+        }
+        // The former recursive date parser could exhaust a worker's stack at the field limit.
+        let recursive = format!("\"switchboard\";p={}0", "@".repeat(16_000));
+        assert_eq!(parse_string_item(recursive.as_bytes()), None);
+        for field in [r#""a\"b";p=%"%c3%a9""#, r#""a";p=:aGk=:, "b";q=@12"#] {
+            for end in 0..=field.len() {
+                let _ = parse_string_list(&field.as_bytes()[..end]);
+                let _ = parse_string_item(&field.as_bytes()[..end]);
+            }
+        }
     }
 }

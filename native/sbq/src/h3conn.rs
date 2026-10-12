@@ -5,6 +5,7 @@ Copyright (C) 2018-2026  Jan BOON (Kaetemi)
 Authors:
   Jan Boon <jan.boon@kaetemi.be>
   Claude Opus 5.5 <noreply@anthropic.com>
+  GPT-6 Astra <noreply@openai.com>
 */
 
 //! The HTTP/3 layer of a QUIC connection that negotiated `h3`, and the WebTransport sessions on
@@ -36,8 +37,9 @@ Authors:
 //! Locks: the connection's `state` and a session's `st` are never held together, nor while a
 //! stream is registered; events are posted to the context's queue only.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
+use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
@@ -155,10 +157,69 @@ fn exact_fail(e: ReadExactError) -> Fail {
     }
 }
 
+/// Stream ownership includes explicit cancellation, including future cancellation at an await.
+struct Receive(Option<RecvStream>);
+
+impl Receive {
+    fn take(mut self) -> RecvStream {
+        self.0.take().expect("owned receive stream")
+    }
+}
+impl Deref for Receive {
+    type Target = RecvStream;
+    fn deref(&self) -> &RecvStream {
+        self.0.as_ref().expect("owned receive stream")
+    }
+}
+impl DerefMut for Receive {
+    fn deref_mut(&mut self) -> &mut RecvStream {
+        self.0.as_mut().expect("owned receive stream")
+    }
+}
+impl Drop for Receive {
+    fn drop(&mut self) {
+        if let Some(r) = self.0.as_mut() {
+            let _ = r.stop(varint(err::H3_REQUEST_CANCELLED));
+        }
+    }
+}
+
+struct SendGuard(Option<SendStream>);
+impl SendGuard {
+    fn take(mut self) -> SendStream {
+        self.0.take().expect("owned send stream")
+    }
+}
+impl Deref for SendGuard {
+    type Target = SendStream;
+    fn deref(&self) -> &SendStream {
+        self.0.as_ref().expect("owned send stream")
+    }
+}
+impl DerefMut for SendGuard {
+    fn deref_mut(&mut self) -> &mut SendStream {
+        self.0.as_mut().expect("owned send stream")
+    }
+}
+impl Drop for SendGuard {
+    fn drop(&mut self) {
+        if let Some(s) = self.0.as_mut() {
+            let _ = s.reset(varint(err::H3_REQUEST_CANCELLED));
+        }
+    }
+}
+
+fn frame_failure(e: Fail) -> Fail {
+    match e {
+        Fail::Fin => Fail::Conn(err::H3_FRAME_ERROR, "truncated frame"),
+        e => e,
+    }
+}
+
 /// Reads a stream exactly as far as asked, never beyond: what follows stays in quinn for the
 /// next reader (the embedder, after a stream header).
 struct Reader {
-    recv: RecvStream,
+    recv: Receive,
 }
 
 impl Reader {
@@ -181,7 +242,7 @@ impl Reader {
 
     async fn take(&mut self, n: u64) -> Result<Vec<u8>, Fail> {
         let mut v = vec![0u8; n as usize];
-        self.exact(&mut v).await?;
+        self.exact(&mut v).await.map_err(frame_failure)?;
         Ok(v)
     }
 
@@ -191,7 +252,7 @@ impl Reader {
             let max = n.min(65536) as usize;
             match self.recv.read_chunk(max, true).await.map_err(read_fail)? {
                 Some(c) => n -= c.bytes.len() as u64,
-                None => return Err(Fail::Fin),
+                None => return Err(frame_failure(Fail::Fin)),
             }
         }
         Ok(())
@@ -199,7 +260,7 @@ impl Reader {
 
     /// A frame header; None at FIN before it. A FIN inside it is a frame error.
     async fn frame_header(&mut self) -> Result<Option<(u64, u64)>, Fail> {
-        let Some(t) = self.varint().await? else {
+        let Some(t) = self.varint().await.map_err(frame_failure)? else {
             return Ok(None);
         };
         match self.varint().await {
@@ -238,6 +299,7 @@ struct Capsules {
     r: Reader,
     /// Bytes left in the current DATA frame.
     left: u64,
+    trailers: bool,
 }
 
 enum Capsule {
@@ -253,13 +315,26 @@ impl Capsules {
     /// Moves to the next DATA payload byte, skipping other frames; false at FIN between frames.
     async fn data(&mut self) -> Result<bool, Fail> {
         while self.left == 0 {
+            tokio::task::yield_now().await;
             let Some((t, len)) = self.r.frame_header().await? else {
                 return Ok(false);
             };
             match t {
+                frame::DATA if self.trailers => {
+                    return Err(Fail::Conn(err::H3_FRAME_UNEXPECTED, "DATA after trailers"))
+                }
                 frame::DATA => self.left = len,
                 frame::HEADERS if len > MAX_FIELD_SECTION as u64 => {
                     return Err(Fail::Stream(err::H3_EXCESSIVE_LOAD))
+                }
+                frame::HEADERS => {
+                    if self.trailers {
+                        return Err(Fail::Conn(err::H3_FRAME_UNEXPECTED, "second trailers"));
+                    }
+                    let fields = decode_fields(&self.r.take(len).await?)?;
+                    check_fields(&fields, |_, _| Err(()), |_, _| {})
+                        .map_err(|_| Fail::Stream(err::H3_MESSAGE_ERROR))?;
+                    self.trailers = true;
                 }
                 frame::WT_STREAM => {
                     return Err(Fail::Conn(err::H3_FRAME_ERROR, "WT_STREAM inside a stream"))
@@ -287,8 +362,11 @@ impl Capsules {
             if !self.data().await? {
                 return Err(Fail::Fin);
             }
-            let n = (buf.len() - off).min(self.left as usize);
-            self.r.exact(&mut buf[off..off + n]).await?;
+            let n = (buf.len() - off).min(self.left.min(usize::MAX as u64) as usize);
+            self.r
+                .exact(&mut buf[off..off + n])
+                .await
+                .map_err(frame_failure)?;
             self.left -= n as u64;
             off += n;
         }
@@ -323,12 +401,12 @@ impl Capsules {
     /// The next capsule; None at FIN between capsules. A malformed capsule is a stream error
     /// (H3_MESSAGE_ERROR), as is a truncated one.
     async fn next(&mut self) -> Result<Option<Capsule>, Fail> {
-        let Some(t) = self.varint().await? else {
-            return Ok(None);
-        };
         let malformed = |e: Fail| match e {
             Fail::Fin => Fail::Stream(err::H3_MESSAGE_ERROR),
             e => e,
+        };
+        let Some(t) = self.varint().await.map_err(malformed)? else {
+            return Ok(None);
         };
         let len = self
             .varint()
@@ -350,7 +428,9 @@ impl Capsules {
                 Ok(Some(Capsule::Close(code, message)))
             }
             wt::capsule::WT_DRAIN_SESSION => {
-                self.skip(len).await.map_err(malformed)?;
+                if len != 0 {
+                    return Err(Fail::Stream(err::H3_MESSAGE_ERROR));
+                }
                 Ok(Some(Capsule::Drain))
             }
             wt::capsule::WT_MAX_STREAM_DATA | wt::capsule::WT_STREAM_DATA_BLOCKED => {
@@ -419,6 +499,17 @@ fn connection_specific(name: &[u8]) -> bool {
     )
 }
 
+fn token_char(c: u8) -> bool {
+    c.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&c)
+}
+
+fn decode_fields(b: &[u8]) -> Result<Vec<h3::Field>, Fail> {
+    h3::decode_field_section(b, MAX_FIELD_SECTION).map_err(|e| match e {
+        FieldError::Qpack => Fail::Conn(err::QPACK_DECOMPRESSION_FAILED, "a field section"),
+        FieldError::TooLarge => Fail::Stream(err::H3_EXCESSIVE_LOAD),
+    })
+}
+
 /// Checks the generic rules of a message's fields (RFC 9114 section 4.2 and 4.3): lowercase
 /// names, pseudo-header fields first and at most once each, no connection-specific fields, no
 /// NUL, CR or LF in a value. Calls `pseudo` and `regular` with each field.
@@ -432,7 +523,14 @@ fn check_fields(
     for (name, value) in fields {
         if name.is_empty()
             || name.iter().any(|c| c.is_ascii_uppercase())
-            || value.iter().any(|&c| c == 0 || c == b'\r' || c == b'\n')
+            || !name
+                .strip_prefix(b":")
+                .unwrap_or(name)
+                .iter()
+                .all(|&c| token_char(c))
+            || value.iter().any(|&c| (c < 0x20 && c != b'\t') || c == 0x7f)
+            || matches!(value.first(), Some(b' ' | b'\t'))
+            || matches!(value.last(), Some(b' ' | b'\t'))
         {
             return Err(());
         }
@@ -444,7 +542,9 @@ fn check_fields(
             pseudo(name, value)?;
         } else {
             seen_regular = true;
-            if connection_specific(name) || (name == b"te" && value != b"trailers") {
+            if connection_specific(name)
+                || (name == b"te" && !value.eq_ignore_ascii_case(b"trailers"))
+            {
                 return Err(());
             }
             regular(name, value);
@@ -457,8 +557,12 @@ fn check_fields(
 fn parse_request(fields: &[h3::Field]) -> Result<Request, ()> {
     let mut r = Request::default();
     let mut scheme = None;
+    let mut has_path = false;
     let mut protocols: Vec<u8> = Vec::new();
     let mut has_protocols = false;
+    let mut duplicate_origin = false;
+    let mut host = None;
+    let mut duplicate_host = false;
     check_fields(
         fields,
         |name, value| {
@@ -466,15 +570,25 @@ fn parse_request(fields: &[h3::Field]) -> Result<Request, ()> {
                 b":method" => r.method = value.to_vec(),
                 b":scheme" => scheme = Some(value.to_vec()),
                 b":authority" => r.authority = value.to_vec(),
-                b":path" => r.path = value.to_vec(),
+                b":path" => {
+                    has_path = true;
+                    r.path = value.to_vec();
+                }
                 b":protocol" => r.protocol = Some(value.to_vec()),
                 _ => return Err(()),
             }
             Ok(())
         },
         |name, value| match name {
-            b"origin" if r.origin.is_none() => r.origin = Some(value.to_vec()),
-            b"sec-webtransport-http3-draft02" => r.draft02 = true,
+            b"origin" => {
+                duplicate_origin |= r.origin.is_some();
+                r.origin = Some(value.to_vec());
+            }
+            b"host" => {
+                duplicate_host |= host.is_some();
+                host = Some(value.to_vec());
+            }
+            b"sec-webtransport-http3-draft02" => r.draft02 |= value == b"1",
             b"wt-available-protocols" => {
                 // Several field lines are one list, joined with commas (RFC 9651).
                 if has_protocols {
@@ -486,24 +600,38 @@ fn parse_request(fields: &[h3::Field]) -> Result<Request, ()> {
             _ => {}
         },
     )?;
-    if r.method.is_empty() {
+    if r.method.is_empty() || !r.method.iter().all(|&c| token_char(c)) || duplicate_origin {
         return Err(());
     }
     if r.method == b"CONNECT" && r.protocol.is_none() {
         // A classic CONNECT names an authority only.
-        if r.authority.is_empty() || scheme.is_some() || !r.path.is_empty() {
+        if r.authority.is_empty() || scheme.is_some() || has_path {
             return Err(());
         }
     } else {
         // Extended CONNECT (RFC 9220) and the other methods name a scheme and a path.
-        if scheme.is_none() || r.path.is_empty() {
+        if scheme.as_ref().is_none_or(Vec::is_empty) || r.path.is_empty() {
             return Err(());
         }
         if r.protocol.is_some() && (r.method != b"CONNECT" || r.authority.is_empty()) {
             return Err(());
         }
     }
-    if r.webtransport() && scheme.as_deref() != Some(b"https") {
+    if host
+        .as_ref()
+        .is_some_and(|h| !r.authority.is_empty() && !h.eq_ignore_ascii_case(&r.authority))
+    {
+        return Err(());
+    }
+    if r.webtransport()
+        && (scheme.as_deref() != Some(b"https")
+            || r.path.first() != Some(&b'/')
+            || r.path.contains(&b'#')
+            || r.path.iter().any(|&c| !(0x21..=0x7e).contains(&c))
+            || r.authority
+                .iter()
+                .any(|&c| !(0x21..=0x7e).contains(&c) || b"/@?#\\".contains(&c)))
+    {
         return Err(());
     }
     if has_protocols {
@@ -533,7 +661,14 @@ fn parse_response(fields: &[h3::Field]) -> Result<Response, ()> {
             Ok(())
         },
         |name, value| match name {
-            b"wt-protocol" if protocol.is_none() => protocol = Some(value.to_vec()),
+            b"wt-protocol" => {
+                if let Some(p) = protocol.as_mut() {
+                    p.push(b',');
+                    p.extend_from_slice(value);
+                } else {
+                    protocol = Some(value.to_vec());
+                }
+            }
             b"sec-webtransport-http3-draft" => draft02 |= value == b"draft02",
             _ => {}
         },
@@ -608,12 +743,43 @@ pub enum Phase {
 /// What a session's writer task does with its CONNECT stream, in order.
 enum Write {
     Bytes(Vec<u8>),
-    /// FIN, then wait for its acknowledgement (within the close wait), then reset and stop
-    /// these streams of the session with WT_SESSION_GONE: when this side closes a session, its
-    /// peer learns of the close before it sees the resets, which would otherwise race the close
-    /// capsule and look like aborts of the streams.
-    Finish(Vec<Arc<StreamObj>>),
+    /// FIN, then wait for its acknowledgement within the close wait.
+    Finish,
+    /// A close capsule and FIN own the deferred resets and CLOSED notification even if writing
+    /// fails or is cancelled. Receipt of the close precedes the resets on the normal path.
+    Close(Vec<u8>, DeferredStreams, ClosedNotification),
     Reset(u64),
+}
+
+/// Reporting a local close lets the embedder tear down its context. Keep that notification
+/// until the CONNECT close is acknowledged (or its bounded attempt ends), including failures
+/// and cancellation. The end info itself is recorded synchronously so further I/O fails now.
+struct ClosedNotification {
+    ctx: Arc<Ctx>,
+    handle: u64,
+    code: u64,
+    report: bool,
+}
+impl Drop for ClosedNotification {
+    fn drop(&mut self) {
+        if self.report {
+            self.ctx.post(
+                SBQ_EV_CLOSED,
+                self.handle,
+                SBQ_CLOSE_APP_LOCAL,
+                self.code as i64,
+            );
+        }
+    }
+}
+
+struct DeferredStreams(Vec<Arc<StreamObj>>);
+impl Drop for DeferredStreams {
+    fn drop(&mut self) {
+        for s in &self.0 {
+            s.session_gone();
+        }
+    }
 }
 
 /// The WebTransport part of a session's `ConnObj`.
@@ -635,6 +801,8 @@ pub struct SessionState {
     /// The protocol selected (empty: none).
     pub protocol: Vec<u8>,
     writer: Option<mpsc::UnboundedSender<Write>>,
+    writer_task: Option<AbortHandle>,
+    reader_task: Option<AbortHandle>,
     /// A server's CONNECT stream reader, until the request is answered.
     reader: Option<Reader>,
     /// The session went live once (its protocol is known).
@@ -655,6 +823,8 @@ impl WtSession {
                 version: VERSION_DRAFT07,
                 protocol: Vec::new(),
                 writer: None,
+                writer_task: None,
+                reader_task: None,
                 reader: None,
                 established: false,
                 drain_sent: false,
@@ -712,16 +882,25 @@ enum Slot {
         peer: bool,
         us: bool,
         since: Instant,
+        tasks: Vec<AbortHandle>,
     },
 }
 
 struct State {
-    control: Option<SendStream>,
+    control: Option<SendGuard>,
     peer_settings: Option<Arc<PeerSettings>>,
     seen_control: bool,
     seen_encoder: bool,
     seen_decoder: bool,
     sessions: HashMap<u64, Slot>,
+    /// QUIC accepts peer bidirectional streams in ID order. An older ID that is neither
+    /// still being classified nor a session can never become a session later. This avoids
+    /// retaining unbounded closed-session history on a long-lived pooled connection.
+    last_peer_bidi: Option<u64>,
+    classifying: HashSet<u64>,
+    /// Includes answered/expired requests whose ABI handles the embedder has not released.
+    /// Otherwise a stalled embedder could accumulate unlimited WT_REQUEST/CLOSED events.
+    handles: Vec<Weak<ConnObj>>,
     /// Sessions that ended recently (their streams are refused with WT_SESSION_GONE).
     gone: VecDeque<u64>,
     held: Vec<(u64, Held, Instant)>,
@@ -730,6 +909,26 @@ struct State {
     goaway: Option<u64>,
     max_push_id: Option<u64>,
     tasks: Vec<AbortHandle>,
+    stopped: bool,
+}
+
+struct Classification {
+    h3: Arc<H3Conn>,
+    sid: u64,
+}
+impl Drop for Classification {
+    fn drop(&mut self) {
+        let absent = {
+            let mut st = lock(&self.h3.state);
+            st.classifying.remove(&self.sid);
+            !st.sessions.contains_key(&self.sid)
+        };
+        if absent {
+            for held in self.h3.take_held(self.sid) {
+                held.reject(wt::err::WT_SESSION_GONE);
+            }
+        }
+    }
 }
 
 /// The HTTP/3 connection under one or more sessions.
@@ -776,12 +975,16 @@ impl H3Conn {
                 seen_encoder: false,
                 seen_decoder: false,
                 sessions: HashMap::new(),
+                last_peer_bidi: None,
+                classifying: HashSet::new(),
+                handles: Vec::new(),
                 gone: VecDeque::new(),
                 held: Vec::new(),
                 idle_since: Instant::now(),
                 goaway: None,
                 max_push_id: None,
                 tasks: Vec::new(),
+                stopped: false,
             }),
             settings,
             local_close: Mutex::new(None),
@@ -800,14 +1003,28 @@ impl H3Conn {
         h3.spawn(async move {
             while let Ok(recv) = h.conn.accept_uni().await {
                 let g = h.clone();
-                h.spawn(async move { g.uni(recv).await });
+                let r = Reader {
+                    recv: Receive(Some(recv)),
+                };
+                h.spawn(g.uni(r));
             }
         });
         let h = h3.clone();
         h3.spawn(async move {
             while let Ok((send, recv)) = h.conn.accept_bi().await {
                 let g = h.clone();
-                h.spawn(async move { g.bi(send, recv).await });
+                let sid = stream_id(&send);
+                {
+                    let mut st = lock(&h.state);
+                    st.last_peer_bidi = Some(sid);
+                    st.classifying.insert(sid);
+                }
+                let classification = Classification { h3: h.clone(), sid };
+                let send = SendGuard(Some(send));
+                let r = Reader {
+                    recv: Receive(Some(recv)),
+                };
+                h.spawn(g.bi(send, r, classification));
             }
         });
         let h = h3.clone();
@@ -821,14 +1038,20 @@ impl H3Conn {
         h3
     }
 
-    fn spawn<F>(&self, f: F)
+    fn spawn<F>(&self, f: F) -> AbortHandle
     where
         F: Future<Output = ()> + Send + 'static,
     {
         let t = rt().spawn(f);
         let mut st = lock(&self.state);
         st.tasks.retain(|t| !t.is_finished());
-        st.tasks.push(t.abort_handle());
+        let handle = t.abort_handle();
+        if st.stopped {
+            handle.abort();
+        } else {
+            st.tasks.push(handle.clone());
+        }
+        handle
     }
 
     /// Closes the QUIC connection with an HTTP/3 code (the first close wins).
@@ -882,6 +1105,7 @@ impl H3Conn {
     fn ended(&self, e: &ConnectionError) {
         let (sessions, tasks) = {
             let mut st = lock(&self.state);
+            st.stopped = true;
             let sessions: Vec<Arc<ConnObj>> = st
                 .sessions
                 .drain()
@@ -890,16 +1114,25 @@ impl H3Conn {
                     Slot::Closing { .. } => None,
                 })
                 .collect();
-            st.held.clear();
+            for (_, held, _) in st.held.drain(..) {
+                held.reject(wt::err::WT_SESSION_GONE);
+            }
             st.control = None;
             (sessions, std::mem::take(&mut st.tasks))
         };
         let info = self.lost_info(e);
         for o in sessions {
             if let Some(wt) = o.wt.as_ref() {
-                lock(&wt.st).phase = Phase::Ended;
+                let mut st = lock(&wt.st);
+                st.phase = Phase::Ended;
+                st.reader.take();
+                st.writer.take();
             }
             o.finish(info.clone());
+            streams_gone(&o);
+            for task in lock(&o.tasks).drain(..) {
+                task.abort();
+            }
         }
         for t in tasks {
             t.abort();
@@ -908,17 +1141,33 @@ impl H3Conn {
     }
 
     async fn open_control(self: Arc<Self>) {
-        let Ok(mut s) = self.conn.open_uni().await else {
+        let Ok(s) = self.conn.open_uni().await else {
             return;
         };
-        if s.write_all(&control_stream_start(self.client))
-            .await
-            .is_err()
-        {
+        let mut s = SendGuard(Some(s));
+        if !matches!(
+            within(
+                self.request_timeout,
+                s.write_all(&control_stream_start(self.client))
+            )
+            .await,
+            Some(Ok(()))
+        ) {
+            self.fail(
+                err::H3_CLOSED_CRITICAL_STREAM,
+                "cannot write the control stream",
+            );
             return;
         }
-        // Kept open for the life of the connection: closing it is a connection error.
+        // A peer stopping our control stream is also a critical-stream failure.
+        let stopped = s.stopped();
         lock(&self.state).control = Some(s);
+        if stopped.await.is_ok() {
+            self.fail(
+                err::H3_CLOSED_CRITICAL_STREAM,
+                "our control stream was stopped",
+            );
+        }
     }
 
     /// The peer's SETTINGS, once they arrived; None when the connection ended first.
@@ -932,8 +1181,8 @@ impl H3Conn {
 
     // --- The peer's unidirectional streams.
 
-    async fn uni(self: Arc<Self>, recv: RecvStream) {
-        let mut r = Reader { recv };
+    async fn uni(self: Arc<Self>, mut r: Reader) {
+        let started = Instant::now();
         let ty = match within(self.request_timeout, r.varint()).await {
             Some(Ok(Some(t))) => t,
             // Nothing to keep, but stopped explicitly rather than dropped (quinn stops a dropped
@@ -992,8 +1241,13 @@ impl H3Conn {
                     self.fail(err::H3_STREAM_CREATION_ERROR, "a push stream from a client")
                 }
             }
-            stream_type::WEBTRANSPORT => match within(self.request_timeout, r.varint()).await {
-                Some(Ok(Some(sid))) => self.route(sid, Held::Uni(r.recv)),
+            stream_type::WEBTRANSPORT => match within(
+                self.request_timeout.saturating_sub(started.elapsed()),
+                r.varint(),
+            )
+            .await
+            {
+                Some(Ok(Some(sid))) => self.route(sid, Held::Uni(r.recv.take())),
                 _ => abort(None, Some(&mut r.recv), err::H3_STREAM_CREATION_ERROR),
             },
             // Reserved and unknown types: abort reading (RFC 9114 section 6.2).
@@ -1054,6 +1308,7 @@ impl H3Conn {
         lock(&self.state).peer_settings = Some(settings.clone());
         self.settings.send_replace(Some(settings));
         loop {
+            tokio::task::yield_now().await;
             let (t, len) = r.frame_header().await?.ok_or(Fail::Fin)?;
             match t {
                 frame::GOAWAY => {
@@ -1085,6 +1340,10 @@ impl H3Conn {
                 }
                 frame::CANCEL_PUSH => {
                     r.varint_payload(len).await?;
+                    return Err(Fail::Conn(
+                        err::H3_ID_ERROR,
+                        "CANCEL_PUSH for an unpromised push",
+                    ));
                 }
                 frame::WT_STREAM => {
                     return Err(Fail::Conn(
@@ -1117,16 +1376,51 @@ impl H3Conn {
             })
             .collect();
         for o in sessions {
-            post_draining(&o);
+            if self.client
+                && o.wt.as_ref().is_some_and(|w| {
+                    let connecting = lock(&w.st).phase == Phase::Connecting;
+                    connecting
+                        && w.sid()
+                            .is_some_and(|sid| lock(&self.state).goaway.is_some_and(|id| sid >= id))
+                })
+            {
+                // One client session per connection; closing it also wakes the response reader.
+                if let Some(h3) = o.wt.as_ref().and_then(WtSession::h3) {
+                    connect_failed(
+                        &o,
+                        Some(&h3),
+                        CloseInfo {
+                            kind: SBQ_CLOSE_H3_REMOTE,
+                            code: err::H3_REQUEST_REJECTED,
+                            reason: b"GOAWAY rejected the CONNECT request".to_vec(),
+                        },
+                    );
+                }
+            } else {
+                post_draining(&o);
+            }
         }
     }
 
     // --- The peer's bidirectional streams.
 
-    async fn bi(self: Arc<Self>, mut send: SendStream, recv: RecvStream) {
-        let mut r = Reader { recv };
-        let first = match within(self.request_timeout, r.varint()).await {
+    async fn bi(
+        self: Arc<Self>,
+        mut send: SendGuard,
+        mut r: Reader,
+        _classification: Classification,
+    ) {
+        let started = Instant::now();
+        let first = match within(
+            self.request_timeout.saturating_sub(started.elapsed()),
+            r.varint(),
+        )
+        .await
+        {
             Some(Ok(Some(t))) => t,
+            Some(Err(Fail::Fin)) => {
+                return self.fail(err::H3_FRAME_ERROR, "truncated stream frame type");
+            }
             // FIN, a reset, or nothing in time: nothing to keep, both directions ended explicitly
             // rather than dropped.
             _ => {
@@ -1138,8 +1432,13 @@ impl H3Conn {
             }
         };
         if first == frame::WT_STREAM {
-            match within(self.request_timeout, r.varint()).await {
-                Some(Ok(Some(sid))) => self.route(sid, Held::Bi(send, r.recv)),
+            match within(
+                self.request_timeout.saturating_sub(started.elapsed()),
+                r.varint(),
+            )
+            .await
+            {
+                Some(Ok(Some(sid))) => self.route(sid, Held::Bi(send.take(), r.recv.take())),
                 _ => abort(
                     Some(&mut send),
                     Some(&mut r.recv),
@@ -1154,7 +1453,7 @@ impl H3Conn {
                 "a server-initiated stream that is not WebTransport",
             );
         }
-        self.request(first, send, r).await;
+        self.request(first, send, r, started).await;
     }
 
     /// Routes a WebTransport data stream to its session, holds it until the session exists, or
@@ -1180,7 +1479,14 @@ impl H3Conn {
                     None => Do::Reject(s, wt::err::WT_SESSION_GONE),
                 },
                 Some(Slot::Closing { .. }) => Do::Reject(s, wt::err::WT_SESSION_GONE),
-                None if st.gone.contains(&sid) => Do::Reject(s, wt::err::WT_SESSION_GONE),
+                _ if st.stopped => Do::Reject(s, wt::err::WT_SESSION_GONE),
+                None if st.gone.contains(&sid)
+                    || (!self.client
+                        && st.last_peer_bidi.is_some_and(|last| sid <= last)
+                        && !st.classifying.contains(&sid)) =>
+                {
+                    Do::Reject(s, wt::err::WT_SESSION_GONE)
+                }
                 // Pending, or not seen yet.
                 _ => {
                     if st.held.len() >= MAX_BUFFERED_STREAMS {
@@ -1210,51 +1516,64 @@ impl H3Conn {
     }
 
     /// Reads a request until its HEADERS.
-    async fn read_request(&self, first: u64, r: &mut Reader) -> Result<Request, Fail> {
-        let headers = within(self.request_timeout, async {
-            let mut t = first;
-            let mut skipped = 0u64;
-            loop {
-                let len = r.varint().await?.ok_or(Fail::Fin)?;
-                match t {
-                    frame::HEADERS => {
-                        if len > MAX_FIELD_SECTION as u64 {
-                            return Err(Fail::Stream(err::H3_EXCESSIVE_LOAD));
+    async fn read_request(
+        &self,
+        first: u64,
+        r: &mut Reader,
+        started: Instant,
+    ) -> Result<Request, Fail> {
+        let headers = within(
+            self.request_timeout.saturating_sub(started.elapsed()),
+            async {
+                let mut t = first;
+                let mut skipped = 0u64;
+                loop {
+                    let len = r
+                        .varint()
+                        .await
+                        .map_err(frame_failure)?
+                        .ok_or_else(|| frame_failure(Fail::Fin))?;
+                    match t {
+                        frame::HEADERS => {
+                            if len > MAX_FIELD_SECTION as u64 {
+                                return Err(Fail::Stream(err::H3_EXCESSIVE_LOAD));
+                            }
+                            return r.take(len).await;
                         }
-                        return r.take(len).await;
-                    }
-                    frame::DATA => {
-                        return Err(Fail::Conn(err::H3_FRAME_UNEXPECTED, "DATA before HEADERS"))
-                    }
-                    frame::PUSH_PROMISE => {
-                        return Err(Fail::Conn(
-                            err::H3_FRAME_UNEXPECTED,
-                            "PUSH_PROMISE from a client",
-                        ))
-                    }
-                    frame::WT_STREAM => {
-                        return Err(Fail::Conn(
-                            err::H3_FRAME_ERROR,
-                            "WT_STREAM inside a request",
-                        ))
-                    }
-                    t if forbidden_on_request(t) => {
-                        return Err(Fail::Conn(
-                            err::H3_FRAME_UNEXPECTED,
-                            "unexpected frame on a request",
-                        ))
-                    }
-                    _ => {
-                        skipped += len;
-                        if skipped > MAX_SKIP_BEFORE_HEADERS {
-                            return Err(Fail::Stream(err::H3_EXCESSIVE_LOAD));
+                        frame::DATA => {
+                            return Err(Fail::Conn(err::H3_FRAME_UNEXPECTED, "DATA before HEADERS"))
                         }
-                        r.skip(len).await?;
+                        frame::PUSH_PROMISE => {
+                            return Err(Fail::Conn(
+                                err::H3_FRAME_UNEXPECTED,
+                                "PUSH_PROMISE from a client",
+                            ))
+                        }
+                        frame::WT_STREAM => {
+                            return Err(Fail::Conn(
+                                err::H3_FRAME_ERROR,
+                                "WT_STREAM inside a request",
+                            ))
+                        }
+                        t if forbidden_on_request(t) => {
+                            return Err(Fail::Conn(
+                                err::H3_FRAME_UNEXPECTED,
+                                "unexpected frame on a request",
+                            ))
+                        }
+                        _ => {
+                            skipped = skipped.saturating_add(len).saturating_add(2);
+                            if skipped > MAX_SKIP_BEFORE_HEADERS {
+                                return Err(Fail::Stream(err::H3_EXCESSIVE_LOAD));
+                            }
+                            r.skip(len).await?;
+                        }
                     }
+                    tokio::task::yield_now().await;
+                    t = r.varint().await.map_err(frame_failure)?.ok_or(Fail::Fin)?;
                 }
-                t = r.varint().await?.ok_or(Fail::Fin)?;
-            }
-        })
+            },
+        )
         .await
         .ok_or(Fail::Stream(err::H3_REQUEST_INCOMPLETE))??;
         let fields = match h3::decode_field_section(&headers, MAX_FIELD_SECTION) {
@@ -1277,8 +1596,14 @@ impl H3Conn {
 
     /// Handles a request stream: a WebTransport request becomes a pending session and a
     /// WT_REQUEST event; any other request is answered 404, and a malformed one refused.
-    async fn request(self: Arc<Self>, first: u64, mut send: SendStream, mut r: Reader) {
-        let request = match self.read_request(first, &mut r).await {
+    async fn request(
+        self: Arc<Self>,
+        first: u64,
+        mut send: SendGuard,
+        mut r: Reader,
+        started: Instant,
+    ) {
+        let request = match self.read_request(first, &mut r, started).await {
             Ok(req) => req,
             Err(Fail::Conn(code, why)) => return self.fail(code, why),
             Err(Fail::Stream(code)) => {
@@ -1289,13 +1614,15 @@ impl H3Conn {
             Err(Fail::Lost) => return,
         };
         if !request.webtransport() {
-            return answer(send, r, 404).await;
+            return answer(send, r, 404, self.request_timeout).await;
         }
         // The draft: no WebTransport request is processed before the client's SETTINGS.
-        let Some(settings) = within(self.request_timeout, self.peer_settings())
-            .await
-            .flatten()
-        else {
+        let Some(settings) = within(
+            self.request_timeout.saturating_sub(started.elapsed()),
+            self.peer_settings(),
+        )
+        .await
+        .flatten() else {
             return abort(Some(&mut send), Some(&mut r.recv), err::H3_REQUEST_REJECTED);
         };
         if !settings.webtransport() {
@@ -1307,7 +1634,16 @@ impl H3Conn {
             .as_ref()
             .is_some_and(|c| c.load(Ordering::Relaxed))
         {
-            return answer(send, r, 503).await;
+            return answer(send, r, 503, self.request_timeout).await;
+        }
+        // The ABI represents protocols with a nonzero one-byte length. Refuse an offer
+        // outside that bound instead of silently turning it into "no protocol offered".
+        if request
+            .protocols
+            .as_ref()
+            .is_some_and(|p| p.iter().any(|p| p.is_empty() || p.len() > 255))
+        {
+            return answer(send, r, 400, self.request_timeout).await;
         }
         let version = if request.draft02 || settings.draft07_sessions() == 0 {
             VERSION_DRAFT02
@@ -1326,11 +1662,13 @@ impl H3Conn {
                 .values()
                 .filter(|s| !matches!(s, Slot::Closing { .. }))
                 .count() as u64;
-            if open >= MAX_SESSIONS {
+            st.handles.retain(|w| w.strong_count() > 0);
+            if st.stopped || open >= MAX_SESSIONS || st.handles.len() >= MAX_SESSIONS as usize {
                 drop(st);
                 return abort(Some(&mut send), Some(&mut r.recv), err::H3_REQUEST_REJECTED);
             }
             st.sessions.insert(sid, Slot::Pending(Arc::downgrade(&o)));
+            st.handles.push(Arc::downgrade(&o));
         }
         let (tx, rx) = mpsc::unbounded_channel();
         {
@@ -1341,7 +1679,8 @@ impl H3Conn {
             st.writer = Some(tx);
             st.reader = Some(r);
         }
-        self.spawn(writer(self.clone(), sid, send, rx));
+        let task = self.spawn(writer(Arc::downgrade(&o), self.clone(), sid, send, rx));
+        lock(&o.wt.as_ref().expect("a session").st).writer_task = Some(task);
         lock(&CONNS).insert(o.handle, o.clone());
         if o.ctx.is_closed() {
             if let Some(o) = lock(&CONNS).remove(&o.handle) {
@@ -1375,9 +1714,17 @@ impl H3Conn {
 
     /// The session `sid` is live (its slot was pending): deliver what was held for it.
     fn set_live(&self, sid: u64, o: &Arc<ConnObj>) {
-        lock(&self.state)
-            .sessions
-            .insert(sid, Slot::Live(Arc::downgrade(o)));
+        {
+            let mut st = lock(&self.state);
+            if st.stopped {
+                return;
+            }
+            // An ended session must not be revived by a concurrent accept or handshake.
+            if !matches!(st.sessions.get(&sid), Some(Slot::Pending(_))) {
+                return;
+            }
+            st.sessions.insert(sid, Slot::Live(Arc::downgrade(o)));
+        }
         for s in self.take_held(sid) {
             deliver(o, s);
         }
@@ -1400,15 +1747,27 @@ impl H3Conn {
     }
 
     /// The session `sid` ended after it was established: its CONNECT stream is closing.
-    fn closing(&self, sid: u64) {
+    fn closing(self: &Arc<Self>, sid: u64, o: &ConnObj) {
+        let tasks = {
+            let st = lock(&o.wt.as_ref().expect("a session").st);
+            st.writer_task
+                .iter()
+                .chain(st.reader_task.iter())
+                .cloned()
+                .collect()
+        };
         {
             let mut st = lock(&self.state);
+            if st.stopped {
+                return;
+            }
             st.sessions.insert(
                 sid,
                 Slot::Closing {
                     peer: false,
                     us: false,
                     since: Instant::now(),
+                    tasks,
                 },
             );
             remember_gone(&mut st, sid);
@@ -1417,6 +1776,11 @@ impl H3Conn {
             s.reject(wt::err::WT_SESSION_GONE);
         }
         self.check_close();
+        let h = self.clone();
+        self.spawn(async move {
+            tokio::time::sleep(h.close_wait()).await;
+            h.check_close();
+        });
     }
 
     /// Progress of a closing CONNECT stream.
@@ -1443,25 +1807,34 @@ impl H3Conn {
     /// close of a session reaches the peer before the connection's.
     fn check_close(&self) {
         let wait = self.close_wait();
-        let close = {
+        let (close, tasks) = {
             let mut st = lock(&self.state);
             let mut done = Vec::new();
             for (sid, s) in &st.sessions {
-                if let Slot::Closing { peer, us, since } = s {
+                if let Slot::Closing {
+                    peer, us, since, ..
+                } = s
+                {
                     if (*peer && *us) || since.elapsed() >= wait {
                         done.push(*sid);
                     }
                 }
             }
             let closed_one = !done.is_empty();
+            let mut tasks = Vec::new();
             for sid in done {
-                st.sessions.remove(&sid);
+                if let Some(Slot::Closing { tasks: ended, .. }) = st.sessions.remove(&sid) {
+                    tasks.extend(ended);
+                }
             }
             if st.sessions.is_empty() && closed_one {
                 st.idle_since = Instant::now();
             }
-            closed_one && st.sessions.is_empty()
+            (closed_one && st.sessions.is_empty(), tasks)
         };
+        for task in tasks {
+            task.abort();
+        }
         if close {
             self.close(err::H3_NO_ERROR, b"");
         }
@@ -1484,7 +1857,8 @@ impl H3Conn {
                     .into_iter()
                     .partition(|(_, _, at)| at.elapsed() >= timeout);
                 st.held = keep;
-                let idle = st.sessions.is_empty() && st.idle_since.elapsed() >= timeout;
+                let idle =
+                    !self.client && st.sessions.is_empty() && st.idle_since.elapsed() >= timeout;
                 (old, idle)
             };
             for (_, s, _) in expired {
@@ -1500,11 +1874,20 @@ impl H3Conn {
 
 /// Answers a request that is not a session: the response, FIN, and the rest of the request
 /// left unread.
-async fn answer(mut send: SendStream, mut r: Reader, status: u16) {
-    let _ = send
-        .write_all(&response_frame(status, VERSION_DRAFT07, None))
-        .await;
-    let _ = send.finish();
+async fn answer(mut send: SendGuard, mut r: Reader, status: u16, timeout: Duration) {
+    if !matches!(
+        within(
+            timeout,
+            send.write_all(&response_frame(status, VERSION_DRAFT07, None))
+        )
+        .await,
+        Some(Ok(()))
+    ) {
+        return;
+    }
+    if send.finish().is_ok() {
+        drop(send.take());
+    }
     let _ = r.recv.stop(varint(err::H3_NO_ERROR));
 }
 
@@ -1574,29 +1957,81 @@ fn streams_gone(o: &ConnObj) {
 /// A session's writer task: writes its CONNECT stream in order, and reports this side's close
 /// of it.
 async fn writer(
+    o: Weak<ConnObj>,
     h3: Arc<H3Conn>,
     sid: u64,
-    mut send: SendStream,
+    mut send: SendGuard,
     mut rx: mpsc::UnboundedReceiver<Write>,
 ) {
-    while let Some(w) = rx.recv().await {
+    let mut failed = false;
+    loop {
+        let w = tokio::select! {
+            w = rx.recv() => w,
+            stopped = send.stopped() => { failed = stopped.is_ok(); None },
+        };
+        let Some(w) = w else { break };
         match w {
             Write::Bytes(b) => {
-                if send.write_all(&b).await.is_err() {
+                if !matches!(
+                    within(h3.request_timeout, send.write_all(&b)).await,
+                    Some(Ok(()))
+                ) {
+                    failed = true;
                     break;
                 }
             }
-            Write::Finish(streams) => {
+            Write::Close(b, streams, notification) => {
+                // The enclosing timeout and the slot's closing timer cover a peer that gives
+                // no send credit, never acknowledges the FIN, or leaves CONNECT open forever.
+                let _ = within(h3.close_wait(), async {
+                    send.write_all(&b).await.ok()?;
+                    send.finish().ok()?;
+                    send.stopped().await.ok()
+                })
+                .await;
+                drop(streams);
+                drop(notification);
+                break;
+            }
+            Write::Finish => {
                 let _ = send.finish();
                 let _ = within(h3.close_wait(), send.stopped()).await;
-                for s in streams {
-                    s.session_gone();
-                }
                 break;
             }
             Write::Reset(code) => {
                 let _ = send.reset(varint(code));
+                // A reset has no stopped() acknowledgement to wait for. Allow it a flight
+                // before the final session takes down the QUIC connection beneath it.
+                tokio::time::sleep(h3.close_wait()).await;
                 break;
+            }
+        }
+    }
+    // A failed writer must not leave a session live waiting for a read that may never end.
+    // Dropping rx also runs the deferred resets of any close queued behind the failed write.
+    drop(rx);
+    if failed {
+        if let Some(o) = o.upgrade() {
+            let info = CloseInfo {
+                kind: SBQ_CLOSE_SESSION_RESET,
+                code: 0,
+                reason: b"the CONNECT send direction ended".to_vec(),
+            };
+            let phase = lock(&o.wt.as_ref().expect("a session").st).phase;
+            match phase {
+                Phase::Live => end_session(&o, info, None),
+                Phase::Pending => {
+                    let mut st = lock(&o.wt.as_ref().expect("a session").st);
+                    st.phase = Phase::Ended;
+                    st.reader.take();
+                    drop(st);
+                    h3.forget(sid);
+                    o.finish(info);
+                }
+                // A rejection may stop the request body before its response arrives.
+                // The response reader (and handshake deadline) decides the connect outcome.
+                Phase::Connecting => {}
+                Phase::Ended => {}
             }
         }
     }
@@ -1606,7 +2041,11 @@ async fn writer(
 /// A live session's capsule task: reads its CONNECT stream until the session ends, and on
 /// until the peer has closed the stream.
 async fn capsules(o: Weak<ConnObj>, h3: Arc<H3Conn>, sid: u64, r: Reader) {
-    let mut c = Capsules { r, left: 0 };
+    let mut c = Capsules {
+        r,
+        left: 0,
+        trailers: false,
+    };
     loop {
         let next = c.next().await;
         let Some(o) = o.upgrade() else {
@@ -1621,9 +2060,32 @@ async fn capsules(o: Weak<ConnObj>, h3: Arc<H3Conn>, sid: u64, r: Reader) {
                 .is_some_and(|w| lock(&w.st).phase == Phase::Live);
         match next {
             Ok(Some(Capsule::Close(code, message))) if live => {
-                remote_close(&o, code, &message);
-                // Nothing more is read: the peer is done with the stream.
-                let _ = c.r.recv.stop(varint(wt::err::WT_SESSION_GONE));
+                end_session(
+                    &o,
+                    CloseInfo {
+                        kind: SBQ_CLOSE_APP_REMOTE,
+                        code: u64::from(code),
+                        reason: message,
+                    },
+                    None,
+                );
+                let extra = if c.left > 0 {
+                    true
+                } else {
+                    matches!(
+                        within(h3.close_wait(), c.r.recv.read(&mut [0u8; 1])).await,
+                        Some(Ok(Some(_)))
+                    )
+                };
+                let last = if extra {
+                    let _ = c.r.recv.stop(varint(err::H3_MESSAGE_ERROR));
+                    Write::Reset(err::H3_MESSAGE_ERROR)
+                } else {
+                    Write::Finish
+                };
+                if let Some(tx) = lock(&o.wt.as_ref().expect("a session").st).writer.as_ref() {
+                    let _ = tx.send(last);
+                }
                 break;
             }
             Ok(Some(Capsule::Drain)) if live => post_draining(&o),
@@ -1683,21 +2145,25 @@ async fn capsules(o: Weak<ConnObj>, h3: Arc<H3Conn>, sid: u64, r: Reader) {
 /// reset (`last`), and its slot closing.
 fn end_session(o: &Arc<ConnObj>, info: CloseInfo, last: Option<Write>) {
     let Some(wt) = o.wt.as_ref() else { return };
-    {
+    let tx = {
         let mut st = lock(&wt.st);
         if st.phase != Phase::Live {
             return;
         }
         st.phase = Phase::Ended;
-        if let (Some(tx), Some(w)) = (st.writer.as_ref(), last) {
-            let _ = tx.send(w);
-        }
-    }
-    o.finish(info);
-    streams_gone(o);
+        st.writer.clone()
+    };
     if let (Some(h3), Some(sid)) = (wt.h3(), wt.sid()) {
-        h3.closing(sid);
+        h3.closing(sid, o);
     }
+    if let (Some(tx), Some(w)) = (tx, last) {
+        let _ = tx.send(w);
+    }
+    for task in lock(&o.tasks).drain(..) {
+        task.abort();
+    }
+    streams_gone(o);
+    o.finish(info);
 }
 
 fn remote_close(o: &Arc<ConnObj>, code: u32, message: &[u8]) {
@@ -1708,7 +2174,7 @@ fn remote_close(o: &Arc<ConnObj>, code: u32, message: &[u8]) {
             code: u64::from(code),
             reason: message.to_vec(),
         },
-        Some(Write::Finish(Vec::new())),
+        Some(Write::Finish),
     );
 }
 
@@ -1738,6 +2204,29 @@ pub struct ClientRequest {
     pub protocols: Vec<Vec<u8>>,
 }
 
+fn response_read_failure(h3: &H3Conn, e: Fail) -> CloseInfo {
+    match e {
+        Fail::Conn(code, why) => {
+            h3.fail(code, why);
+            h3.lost_info(&ConnectionError::LocallyClosed)
+        }
+        Fail::Reset(code) => CloseInfo {
+            kind: SBQ_CLOSE_SESSION_RESET,
+            code,
+            reason: b"the peer reset the CONNECT response".to_vec(),
+        },
+        _ => h3
+            .conn
+            .close_reason()
+            .map(|e| h3.lost_info(&e))
+            .unwrap_or(CloseInfo {
+                kind: SBQ_CLOSE_SESSION_RESET,
+                code: 0,
+                reason: b"the CONNECT response ended".to_vec(),
+            }),
+    }
+}
+
 /// The client side of a session, once its QUIC connection is up: the server's SETTINGS, the
 /// CONNECT request, the response. CONNECTED is posted on a 2xx; anything else is the CLOSED
 /// info to report.
@@ -1758,7 +2247,9 @@ pub async fn client_session(
     let Some(settings) = h3.peer_settings().await else {
         return Err(lost(h3.conn.close_reason()));
     };
-    if !settings.webtransport() || settings.get(setting::ENABLE_CONNECT_PROTOCOL) != Some(1) {
+    if !settings.webtransport()
+        || (!settings.draft02() && settings.get(setting::ENABLE_CONNECT_PROTOCOL) != Some(1))
+    {
         let why = b"the server does not support WebTransport";
         h3.close(wt::err::WT_REQUIREMENTS_NOT_MET, why);
         return Err(CloseInfo {
@@ -1767,15 +2258,41 @@ pub async fn client_session(
             reason: why.to_vec(),
         });
     }
+    if lock(&h3.state).goaway.is_some() {
+        return Err(CloseInfo {
+            kind: SBQ_CLOSE_H3_REMOTE,
+            code: err::H3_REQUEST_REJECTED,
+            reason: b"GOAWAY before the CONNECT request".to_vec(),
+        });
+    }
     let (send, recv) = h3.conn.open_bi().await.map_err(|e| lost(Some(e)))?;
     let sid = stream_id(&send);
     *lock(&wt.id) = Some(sid);
-    lock(&h3.state)
-        .sessions
-        .insert(sid, Slot::Pending(Arc::downgrade(o)));
+    {
+        let mut st = lock(&h3.state);
+        if st.goaway.is_some() || st.stopped {
+            drop(st);
+            let mut send = send;
+            let mut recv = recv;
+            abort(Some(&mut send), Some(&mut recv), err::H3_REQUEST_REJECTED);
+            return Err(CloseInfo {
+                kind: SBQ_CLOSE_H3_REMOTE,
+                code: err::H3_REQUEST_REJECTED,
+                reason: b"GOAWAY before the CONNECT request".to_vec(),
+            });
+        }
+        st.sessions.insert(sid, Slot::Pending(Arc::downgrade(o)));
+    }
     let (tx, rx) = mpsc::unbounded_channel();
     lock(&wt.st).writer = Some(tx.clone());
-    h3.spawn(writer(h3.clone(), sid, send, rx));
+    let task = h3.spawn(writer(
+        Arc::downgrade(o),
+        h3.clone(),
+        sid,
+        SendGuard(Some(send)),
+        rx,
+    ));
+    lock(&wt.st).writer_task = Some(task);
     // The request.
     let protocols = (!req.protocols.is_empty()).then(|| wt::sf_string_list(&req.protocols));
     let mut fields: Vec<(&[u8], &[u8])> = vec![
@@ -1797,12 +2314,16 @@ pub async fn client_session(
         &h3::encode_field_section(&fields),
     )));
     // The response: interim ones skipped, the final one decides.
-    let mut r = Reader { recv };
+    let mut r = Reader {
+        recv: Receive(Some(recv)),
+    };
     let refused = |h3: &H3Conn, info: CloseInfo| {
         h3.forget(sid);
         info
     };
+    let mut response_bytes = 0u64;
     let response = loop {
+        tokio::task::yield_now().await;
         let header = match r.frame_header().await {
             Ok(Some(h)) => h,
             Ok(None) | Err(Fail::Fin) => {
@@ -1832,6 +2353,11 @@ pub async fn client_session(
             Err(_) => return Err(lost(h3.conn.close_reason())),
         };
         let (t, len) = header;
+        response_bytes = response_bytes.saturating_add(len).saturating_add(2);
+        if response_bytes > MAX_SKIP_BEFORE_HEADERS {
+            h3.fail(err::H3_EXCESSIVE_LOAD, "too much before the final response");
+            return Err(h3.lost_info(&ConnectionError::LocallyClosed));
+        }
         match t {
             frame::HEADERS => {
                 if len > MAX_FIELD_SECTION as u64 {
@@ -1849,7 +2375,7 @@ pub async fn client_session(
                 let b = r
                     .take(len)
                     .await
-                    .map_err(|_| lost(h3.conn.close_reason()))?;
+                    .map_err(|e| response_read_failure(h3, e))?;
                 let fields = match h3::decode_field_section(&b, MAX_FIELD_SECTION) {
                     Ok(f) => f,
                     Err(FieldError::Qpack) => {
@@ -1910,12 +2436,12 @@ pub async fn client_session(
                 }
                 r.skip(len)
                     .await
-                    .map_err(|_| lost(h3.conn.close_reason()))?;
+                    .map_err(|e| response_read_failure(h3, e))?;
             }
         }
     };
     if !(200..300).contains(&response.status) {
-        let _ = tx.send(Write::Finish(Vec::new()));
+        let _ = tx.send(Write::Finish);
         let _ = r.recv.stop(varint(err::H3_NO_ERROR));
         return Err(refused(
             h3,
@@ -1925,6 +2451,16 @@ pub async fn client_session(
                 reason: format!("HTTP status {}", response.status).into_bytes(),
             },
         ));
+    }
+    if !response.draft02
+        && (settings.draft07_sessions() == 0
+            || settings.get(setting::ENABLE_CONNECT_PROTOCOL) != Some(1))
+    {
+        h3.fail(
+            wt::err::WT_REQUIREMENTS_NOT_MET,
+            "missing draft-02 response header",
+        );
+        return Err(h3.lost_info(&ConnectionError::LocallyClosed));
     }
     let protocol = match response.protocol {
         Some(p) if !req.protocols.iter().any(|o| o.as_slice() == p.as_bytes()) => {
@@ -1966,7 +2502,8 @@ pub async fn client_session(
     if lock(&h3.state).goaway.is_some() {
         post_draining(o);
     }
-    h3.spawn(capsules(Arc::downgrade(o), h3.clone(), sid, r));
+    let task = h3.spawn(capsules(Arc::downgrade(o), h3.clone(), sid, r));
+    lock(&wt.st).reader_task = Some(task);
     Ok(())
 }
 
@@ -1986,6 +2523,16 @@ pub fn connect_failed(o: &Arc<ConnObj>, h3: Option<&Arc<H3Conn>>, info: CloseInf
             h3.forget(sid);
         }
         h3.close(err::H3_NO_ERROR, b"");
+    }
+}
+
+fn keep_reader_task(wt: &WtSession, h3: &H3Conn, sid: u64, task: AbortHandle) {
+    lock(&wt.st).reader_task = Some(task.clone());
+    let mut st = lock(&h3.state);
+    match st.sessions.get_mut(&sid) {
+        Some(Slot::Pending(_) | Slot::Live(_)) if !task.is_finished() => {}
+        Some(Slot::Closing { tasks, .. }) => tasks.push(task),
+        _ => task.abort(),
     }
 }
 
@@ -2023,6 +2570,20 @@ pub fn accept(o: &Arc<ConnObj>, protocol: &[u8]) -> i32 {
     let (Some(h3), Some(sid)) = (wt.h3(), wt.sid()) else {
         return SBQ_ERR_STATE as i32;
     };
+    if h3
+        .listener_closed
+        .as_ref()
+        .is_some_and(|closed| closed.load(Ordering::Relaxed))
+    {
+        if refuse(o, 503) {
+            o.finish(CloseInfo {
+                kind: SBQ_CLOSE_REFUSED,
+                code: 503,
+                reason: b"the listener closed before the request was answered".to_vec(),
+            });
+        }
+        return SBQ_ERR_STATE as i32;
+    }
     let reader = {
         let mut st = lock(&wt.st);
         if st.phase != Phase::Pending {
@@ -2056,7 +2617,8 @@ pub fn accept(o: &Arc<ConnObj>, protocol: &[u8]) -> i32 {
         post_draining(o);
     }
     if let Some(r) = reader {
-        h3.spawn(capsules(Arc::downgrade(o), h3.clone(), sid, r));
+        let task = h3.spawn(capsules(Arc::downgrade(o), h3.clone(), sid, r));
+        keep_reader_task(wt, &h3, sid, task);
     }
     SBQ_OK as i32
 }
@@ -2078,7 +2640,7 @@ fn refuse(o: &Arc<ConnObj>, status: u16) -> bool {
         st.phase = Phase::Ended;
         if let Some(tx) = st.writer.as_ref() {
             let _ = tx.send(Write::Bytes(response_frame(status, st.version, None)));
-            let _ = tx.send(Write::Finish(Vec::new()));
+            let _ = tx.send(Write::Finish);
         }
         if let Some(mut r) = st.reader.take() {
             let _ = r.recv.stop(varint(err::H3_NO_ERROR));
@@ -2092,11 +2654,13 @@ fn refuse(o: &Arc<ConnObj>, status: u16) -> bool {
 }
 
 /// Records how a session ended without reporting it (no CLOSED follows).
-fn end_quietly(o: &ConnObj, info: CloseInfo) {
+fn end_quietly(o: &ConnObj, info: CloseInfo) -> bool {
     let mut end = lock(&o.end);
-    if end.is_none() {
-        *end = Some(info);
+    if end.is_some() {
+        return false;
     }
+    *end = Some(info);
+    true
 }
 
 /// Refuses a pending session with an HTTP status (300 to 599). Its handle stays until released;
@@ -2141,11 +2705,15 @@ pub fn drain(o: &ConnObj) -> i32 {
 
 /// Closes a session with an application code (u32) and a message (cut to 1024 bytes): a live
 /// session sends WT_CLOSE_SESSION and FIN; a client still connecting is abandoned; a pending
-/// request is refused 503. CLOSED (APP_LOCAL) is posted when `report`.
+/// request is refused 503. When `report`, a live session posts CLOSED (APP_LOCAL) after its
+/// bounded CONNECT close attempt; further application I/O fails immediately.
 pub fn close(o: &Arc<ConnObj>, code: u64, message: &[u8], report: bool) -> i32 {
     let Some(wt) = o.wt.as_ref() else {
         return SBQ_ERR_ARG as i32;
     };
+    if std::str::from_utf8(message).is_err() {
+        return SBQ_ERR_ARG as i32;
+    }
     let Ok(code32) = u32::try_from(code) else {
         return SBQ_ERR_ARG as i32;
     };
@@ -2191,26 +2759,38 @@ pub fn close(o: &Arc<ConnObj>, code: u64, message: &[u8], report: bool) -> i32 {
             }
         }
         Phase::Live => {
-            {
+            let (tx, streams) = {
                 let mut st = lock(&wt.st);
                 if st.phase != Phase::Live {
                     return SBQ_OK as i32;
                 }
                 st.phase = Phase::Ended;
-                if let Some(tx) = st.writer.as_ref() {
-                    let capsule = wt::close_capsule(code32, &message);
-                    let _ = tx.send(Write::Bytes(h3::frame(frame::DATA, &capsule)));
-                    // The streams are held until then, also once released.
-                    let _ = tx.send(Write::Finish(session_streams(o)));
+                let streams = DeferredStreams(session_streams(o));
+                for stream in &streams.0 {
+                    stream.session_ended();
                 }
-            }
-            if report {
-                o.finish(info);
-            } else {
-                end_quietly(o, info);
-            }
+                (st.writer.clone(), streams)
+            };
+            let recorded = end_quietly(o, info);
+            let notification = ClosedNotification {
+                ctx: o.ctx.clone(),
+                handle: o.handle,
+                code,
+                report: report && recorded,
+            };
             if let (Some(h3), Some(sid)) = (wt.h3(), wt.sid()) {
-                h3.closing(sid);
+                h3.closing(sid, o);
+            }
+            if let Some(tx) = tx {
+                let capsule = wt::close_capsule(code32, &message);
+                let _ = tx.send(Write::Close(
+                    h3::frame(frame::DATA, &capsule),
+                    streams,
+                    notification,
+                ));
+            }
+            for task in lock(&o.tasks).drain(..) {
+                task.abort();
             }
         }
     }
@@ -2255,4 +2835,86 @@ pub fn protocol(o: &ConnObj) -> Option<Vec<u8>> {
 /// HTTP/3 layer's, which closes it once its sessions are done.
 pub fn release(o: &Arc<ConnObj>) {
     close(o, 0, b"", false);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn request() -> Vec<h3::Field> {
+        [
+            (b":method".as_slice(), b"CONNECT".as_slice()),
+            (b":protocol", b"webtransport"),
+            (b":scheme", b"https"),
+            (b":authority", b"example.test"),
+            (b":path", b"/sb"),
+        ]
+        .into_iter()
+        .map(|(n, v)| (n.to_vec(), v.to_vec()))
+        .collect()
+    }
+
+    #[test]
+    fn request_field_validation() {
+        let good = request();
+        assert!(parse_request(&good).is_ok());
+        for index in 0..good.len() {
+            let mut fields = good.clone();
+            fields.remove(index);
+            assert!(parse_request(&fields).is_err(), "missing {index}");
+            let mut fields = good.clone();
+            fields.insert(index, fields[index].clone());
+            assert!(parse_request(&fields).is_err(), "duplicate {index}");
+        }
+        for (name, value) in [
+            (b"bad name".as_slice(), b"x".as_slice()),
+            (b"x", b"\x01"),
+            (b"x", b" x"),
+            (b"x", b"x\t"),
+            (b"host", b"other.test"),
+            (b"te", b"chunked"),
+            (b"connection", b"close"),
+        ] {
+            let mut fields = good.clone();
+            fields.push((name.to_vec(), value.to_vec()));
+            assert!(parse_request(&fields).is_err(), "{name:?} {value:?}");
+        }
+        let mut fields = good.clone();
+        fields.extend([
+            (b"origin".to_vec(), b"https://a.test".to_vec()),
+            (b"origin".to_vec(), b"https://b.test".to_vec()),
+        ]);
+        assert!(parse_request(&fields).is_err());
+        let classic = vec![
+            (b":method".to_vec(), b"CONNECT".to_vec()),
+            (b":authority".to_vec(), b"example.test:443".to_vec()),
+        ];
+        assert!(!parse_request(&classic).unwrap().webtransport());
+        let mut empty_path = classic;
+        empty_path.push((b":path".to_vec(), Vec::new()));
+        assert!(parse_request(&empty_path).is_err());
+        for path in [b"relative".as_slice(), b"/sb#fragment", b"/sb space"] {
+            let mut fields = good.clone();
+            fields[4].1 = path.to_vec();
+            assert!(parse_request(&fields).is_err());
+        }
+    }
+
+    #[test]
+    fn response_fields_and_duplicate_structured_items() {
+        let status = (b":status".to_vec(), b"200".to_vec());
+        for first in [b"\"switchboard\"".as_slice(), b""] {
+            let fields = vec![
+                status.clone(),
+                (b"wt-protocol".to_vec(), first.to_vec()),
+                (b"wt-protocol".to_vec(), b"\"other\"".to_vec()),
+            ];
+            assert!(parse_response(&fields).unwrap().protocol.is_none());
+        }
+        assert!(parse_response(&[]).is_err());
+        assert!(parse_response(&[status.clone(), status]).is_err());
+        for value in [b"101".as_slice(), b"600", b"020", b"2oo", b"20"] {
+            assert!(parse_response(&[(b":status".to_vec(), value.to_vec())]).is_err());
+        }
+    }
 }

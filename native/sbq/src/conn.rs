@@ -5,6 +5,7 @@ Copyright (C) 2018-2026  Jan BOON (Kaetemi)
 Authors:
   Jan Boon <jan.boon@kaetemi.be>
   Claude Opus 5.5 <noreply@anthropic.com>
+  GPT-6 Astra <noreply@openai.com>
 */
 
 //! Listeners and connections: the tasks that accept, connect, watch for peer streams and for
@@ -228,7 +229,8 @@ fn watch(obj: &Arc<ConnObj>, conn: Connection) {
     let c = conn.clone();
     let accept = rt().spawn(async move {
         while let Ok((s, r)) = c.accept_bi().await {
-            if stream::insert(&o, NewStream::raw(s, r), Some(SBQ_EV_STREAM)).is_err() {
+            if let Err(s) = stream::insert(&o, NewStream::raw(s, r), Some(SBQ_EV_STREAM)) {
+                s.abort();
                 break;
             }
         }
@@ -559,10 +561,11 @@ pub fn connect_wt(
             *slot = Some(h3.clone());
             h3
         };
-        let r = match deadline {
-            Some(d) => within(Some(d), h3conn::client_session(&o, &h3, req)).await,
-            None => Some(h3conn::client_session(&o, &h3, req).await),
-        };
+        let r = within(
+            Some(deadline.unwrap_or(h3conn::DEFAULT_REQUEST_TIMEOUT)),
+            h3conn::client_session(&o, &h3, req),
+        )
+        .await;
         match r {
             Some(Ok(())) => {}
             Some(Err(info)) => h3conn::connect_failed(&o, Some(&h3), info),

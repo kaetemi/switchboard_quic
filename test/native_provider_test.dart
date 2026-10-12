@@ -6,6 +6,7 @@ Authors:
   Jan Boon <jan.boon@kaetemi.be>
   Claude Opus 5.5 <noreply@anthropic.com>
   GLM 5.3 Flash <noreply@z.ai>
+  GPT-6 Astra <noreply@openai.com>
 */
 
 // The native provider end to end over loopback: both sides in this isolate,
@@ -201,6 +202,16 @@ Future<String> clientInIsolate(Uri endpoint) => Isolate.run(() async {
   final back = await readAll(s);
   await client.close(9, 'bye');
   return String.fromCharCodes(back);
+});
+
+Future<void> closeOnlyInIsolate(String endpoint) => Isolate.run(() async {
+  final session = await NativeQuicProvider().connect(
+    Uri.parse(endpoint),
+    const QuicClientConfig(alpn: ['switchboard'], verifyCertificate: false),
+  );
+  await session.close(9, 'x' * 1024);
+  // Give automatic context cleanup a turn before Isolate.run exits.
+  await Future<void>.delayed(const Duration(milliseconds: 100));
 });
 
 void main() {
@@ -451,6 +462,169 @@ void main() {
         await client.close(0, '');
       }
       expect(listener.answered[200], 2);
+    });
+
+    test(
+      'partial stream headers arm writable notifications for writes and FIN',
+      () async {
+        for (final window in [1, 2]) {
+          final server = await Server.start(
+            Mode.webTransport,
+            serverConfig(window: window),
+          );
+          final p = await Pair.connect(server, clientConfig(window: window));
+          final empty = await p.client.openStream();
+          await empty.finish().timeout(const Duration(seconds: 5));
+          expect(
+            await readAll(await p.serverStreams.next)
+                .timeout(const Duration(seconds: 5)),
+            isEmpty,
+          );
+          final received = p.serverStreams.next.then(readAll);
+          final stream = await p.client.openStream();
+          await stream.write(bytes('data')).timeout(const Duration(seconds: 5));
+          await stream.finish();
+          expect(await received, bytes('data'));
+        }
+      },
+    );
+
+    test('the last session close survives context shutdown with a small CONNECT window', () async {
+      final server = await provider.listenWebTransport(
+        '127.0.0.1',
+        0,
+        serverConfig(window: 768),
+        path: '/sb',
+        advertisedHost: '127.0.0.2',
+      );
+      addTearDown(server.close);
+      // Delay each UDP flight. The close exceeds one stream window and therefore cannot
+      // finish before the provider is allowed to tear down the client's context.
+      final proxy = await RawDatagramSocket.bind('127.0.0.2', server.port);
+      final timers = <Timer>[];
+      addTearDown(() {
+        for (final timer in timers) {
+          timer.cancel();
+        }
+        proxy.close();
+      });
+      InternetAddress? peerAddress;
+      int? peerPort;
+      proxy.listen((event) {
+        if (event != RawSocketEvent.read) return;
+        Datagram? packet;
+        while ((packet = proxy.receive()) != null) {
+          final data = packet!;
+          final fromServer = data.port == server.port;
+          if (!fromServer) {
+            peerAddress = data.address;
+            peerPort = data.port;
+          }
+          final target = fromServer
+              ? peerAddress!
+              : InternetAddress.loopbackIPv4;
+          final port = fromServer ? peerPort! : server.port;
+          timers.add(
+            Timer(const Duration(milliseconds: 100), () {
+              proxy.send(data.data, target, port);
+            }),
+          );
+        }
+      });
+      final incoming = server.sessions.first;
+      final endpoint = server.endpoint.toString();
+      final client = closeOnlyInIsolate(endpoint);
+      final session = await incoming;
+      await client.timeout(const Duration(seconds: 10));
+      final end = await session.done.timeout(const Duration(seconds: 5));
+      expect((end.lost, end.code, end.reason), (false, 9, 'x' * 1024));
+    });
+
+    test('binary protocol lengths 127, 128 and 255 survive the ABI', () async {
+      for (final length in [127, 128, 255]) {
+        final protocol = 'p' * length;
+        final server = await Server.start(Mode.webTransport, null, null, [
+          protocol,
+        ]);
+        final p = await Pair.connect(server, clientConfig(alpn: [protocol]));
+        expect(p.client.protocol, protocol);
+        expect((p.server as NativeQuicSession).requestProtocols, [protocol]);
+      }
+    });
+
+    test(
+      'userinfo and out-of-range ports are refused before dialing',
+      () async {
+        for (final url in [
+          'https://user@localhost/sb',
+          'https://localhost:65536/sb',
+          'https://localhost:0/sb',
+        ]) {
+          await expectLater(
+            provider.connect(Uri.parse(url), clientConfig()),
+            throwsArgumentError,
+          );
+        }
+      },
+    );
+
+    test('advertised authority is enforced', () async {
+      final listener = await provider.listenWebTransport(
+        '127.0.0.1',
+        0,
+        serverConfig(),
+        path: '/sb',
+        advertisedHost: 'localhost',
+      );
+      addTearDown(listener.close);
+      final incoming = StreamQueue(listener.sessions);
+      addTearDown(incoming.cancel);
+      await expectLater(
+        provider.connect(
+          listener.endpoint.replace(host: '127.0.0.1'),
+          clientConfig(),
+        ),
+        throwsA(
+          isA<QuicException>().having(
+            (e) => e.message,
+            'status',
+            contains('404'),
+          ),
+        ),
+      );
+      final client = await provider.connect(listener.endpoint, clientConfig());
+      final server = await incoming.next;
+      await client.close(0, '');
+      await server.done;
+      expect(listener.answered, {404: 1, 200: 1});
+    });
+
+    test('allowed origins match the exact string', () async {
+      final server = await Server.start(Mode.webTransport, null, [
+        'https://app.example',
+      ]);
+      for (final origin in [
+        'https://app.example/',
+        'https://APP.example',
+        'https://app.example:443',
+        'http://app.example',
+        'https://app.example:444',
+      ]) {
+        await expectLater(
+          provider.connectWebTransport(
+            server.endpoint,
+            clientConfig(),
+            origin: origin,
+          ),
+          throwsA(
+            isA<QuicException>().having(
+              (e) => e.message,
+              'status',
+              contains('403'),
+            ),
+          ),
+        );
+      }
     });
 
     test('no protocol offered: accepted without one', () async {
@@ -896,7 +1070,6 @@ void contract(Mode mode) {
       expect(await ss.read(1), bytes('x'));
       final read = ss.read(10);
       final stopped = ss.stopped;
-      await p.client.close(5, 'gone');
       final sessionEnded = isA<QuicException>().having(
         (e) => e.kind,
         'kind',
@@ -912,8 +1085,13 @@ void contract(Mode mode) {
               isA<QuicStreamStopped>().having((e) => e.code, 'code', isNull),
             )
           : sessionEnded;
-      await expectLater(read, throwsA(ended));
-      await expectLater(stopped, throwsA(ended));
+      // Install both error handlers before closing; the peer may finish before our
+      // WebTransport close has been acknowledged and close() completes.
+      final readCheck = expectLater(read, throwsA(ended));
+      final stoppedCheck = expectLater(stopped, throwsA(ended));
+      await p.client.close(5, 'gone');
+      await readCheck;
+      await stoppedCheck;
       // A reset without a code completes resetReceived with null.
       final reset = await ss.resetReceived.then<Object?>(
         (code) => code,

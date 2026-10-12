@@ -1,4 +1,18 @@
+<!--
+Polyverse Switchboard
+Microservice Network Architecture
+Copyright (C) 2018-2026  Jan BOON (Kaetemi)
+Authors:
+  Jan Boon <jan.boon@kaetemi.be>
+  Claude Opus 5.5 <noreply@anthropic.com>
+  GPT-6 Astra <noreply@openai.com>
+-->
+
 ## 0.1.0-dev.1
+
+* Harden HTTP/3 framing, SETTINGS, QPACK prefixes and Huffman errors, Structured Fields parameters, CONNECT trailers, and capsule validation. Bound outstanding request handles and failed/closing session tasks, and recognize retired session IDs without unbounded history; stop and reset abandoned streams explicitly, including cancelled writers that hold deferred session resets.
+* Keep the native context alive until a local WebTransport close is acknowledged or its bounded wait expires, including when the last session is closed from an isolate.
+* Fix partial WebTransport stream headers stalling with small flow-control windows, binary protocol lengths of 128–255 bytes, authority routing, URI userinfo/port validation, draft-02 server negotiation, and pending CONNECT handling on GOAWAY or listener close. Move listener DNS resolution out of the synchronous native ABI.
 
 * Package created: the provider interface the binding is written against.
 * The native stream provider (`switchboard_quic_native.dart`): raw QUIC over quinn through a Rust shim with a flat C ABI (`native/sbq`), loaded through a build hook (prebuilt library or `cargo build`). quinn's priorities are strict only, so the provider puts the priority classes 1 (ordinary) and 0 (bulk) on one quinn level, where their streams interleave, and class 2 (control) strictly above; error codes beyond QUIC's 2^62 - 1 are argument errors.

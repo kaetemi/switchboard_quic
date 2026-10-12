@@ -6,6 +6,7 @@ Authors:
   Jan Boon <jan.boon@kaetemi.be>
   Claude Opus 5.5 <noreply@anthropic.com>
   GLM 5.3 Flash <noreply@z.ai>
+  GPT-6 Astra <noreply@openai.com>
 */
 
 //! sbq: a flat extern "C" shim over quinn (QUIC with rustls and ring) for the native stream
@@ -46,7 +47,7 @@ mod tests;
 mod tests_wt;
 mod wt;
 
-use std::net::{SocketAddr, ToSocketAddrs};
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use config::{ClientParams, ConfigObj, Limits, ServerParams, Verify};
@@ -518,8 +519,9 @@ pub extern "C" fn sbq_config_free(config: u64) -> i32 {
     }
 }
 
-/// Listens on `host` (an address, UTF-8, or a name resolved now) and `port` (0 for any) with a
-/// server configuration. Returns the listener handle; INCOMING events follow.
+/// Listens on `host` (an IP address literal, UTF-8) and `port` (0 for any) with a
+/// server configuration. Resolve names asynchronously before calling. Returns the listener
+/// handle; INCOMING events follow (WT_REQUEST for HTTP/3).
 #[no_mangle]
 pub unsafe extern "C" fn sbq_listen(
     ctx_id: u64,
@@ -542,14 +544,7 @@ pub unsafe extern "C" fn sbq_listen(
     };
     let addr: SocketAddr = match host.parse::<std::net::IpAddr>() {
         Ok(ip) => SocketAddr::new(ip, port),
-        Err(_) => match (host.as_str(), port)
-            .to_socket_addrs()
-            .ok()
-            .and_then(|mut a| a.next())
-        {
-            Some(a) => a,
-            None => return fail(SBQ_ERR_IO, format!("cannot resolve {host}")),
-        },
+        Err(_) => return fail(SBQ_ERR_ARG, "listen requires an IP address literal"),
     };
     match conn::listen(&ctx, sp, addr) {
         Ok(h) => h as i64,
@@ -627,7 +622,8 @@ pub unsafe extern "C" fn sbq_connect(
 /// another response, `SBQ_CLOSE_OTHER` for a protocol that was not offered, `SBQ_CLOSE_H3_LOCAL`
 /// for a server without WebTransport, the kinds of `sbq_connect` for the QUIC handshake. The
 /// configuration's handshake deadline bounds the QUIC handshake and again the HTTP/3 exchange
-/// (`SBQ_CLOSE_TIMED_OUT`). The session uses its QUIC connection alone, which is closed when the
+/// (`SBQ_CLOSE_TIMED_OUT`); a zero handshake deadline uses 10 seconds for HTTP/3.
+/// The session uses its QUIC connection alone, which is closed when the
 /// session ends.
 #[no_mangle]
 pub unsafe extern "C" fn sbq_connect_wt(
@@ -753,9 +749,11 @@ pub extern "C" fn sbq_wt_drain(session: u64) -> i32 {
 /// close arrived first). Data in flight is discarded.
 ///
 /// A WebTransport session: `code` is a u32 (`SBQ_ERR_ARG` beyond) and the reason is cut to 1024
-/// bytes at a character boundary; a live session sends WT_CLOSE_SESSION with them and FIN on its
+/// bytes at a character boundary (invalid UTF-8 is `SBQ_ERR_ARG`); a live session sends
+/// WT_CLOSE_SESSION with them and FIN on its
 /// CONNECT stream, and its streams are reset and stopped with WT_SESSION_GONE; CLOSED
-/// (`SBQ_CLOSE_APP_LOCAL`) is posted at once. The QUIC connection is closed once its last
+/// (`SBQ_CLOSE_APP_LOCAL`) follows acknowledgement of the CONNECT close or the bounded wait.
+/// Application I/O fails immediately. The QUIC connection is closed once its last
 /// session has, and the peer has closed the CONNECT stream (or three round trips passed, within
 /// 0.2 to 2 s). A client's session still connecting is abandoned; a pending request is refused
 /// 503.

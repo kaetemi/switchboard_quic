@@ -5,6 +5,7 @@ Copyright (C) 2018-2026  Jan BOON (Kaetemi)
 Authors:
   Jan Boon <jan.boon@kaetemi.be>
   Claude Opus 5.5 <noreply@anthropic.com>
+  GPT-6 Astra <noreply@openai.com>
 */
 
 //! The HTTP/3 codecs the WebTransport layer needs (RFC 9114, RFC 9204), and nothing more: QUIC
@@ -15,7 +16,7 @@ Authors:
 //! 0 (QPACK_MAX_TABLE_CAPACITY 0, QPACK_BLOCKED_STREAMS 0). Everything here is a pure function of
 //! its input; the stream handling is in `h3conn`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 
 use crate::h3_tables::{HUFFMAN, STATIC_TABLE};
@@ -220,6 +221,7 @@ impl PeerSettings {
 pub fn parse_settings(mut b: &[u8]) -> Result<PeerSettings, u64> {
     let mut s = PeerSettings::default();
     let mut count = 0;
+    let mut seen = HashSet::new();
     while !b.is_empty() {
         let (id, n) = get_varint(b).ok_or(err::H3_FRAME_ERROR)?;
         b = &b[n..];
@@ -229,12 +231,15 @@ pub fn parse_settings(mut b: &[u8]) -> Result<PeerSettings, u64> {
         if count > MAX_SETTINGS {
             return Err(err::H3_EXCESSIVE_LOAD);
         }
-        if setting::is_reserved_h2(id) {
+        if setting::is_reserved_h2(id) || !seen.insert(id) {
             return Err(err::H3_SETTINGS_ERROR);
         }
         if matches!(
             id,
-            setting::ENABLE_CONNECT_PROTOCOL | setting::H3_DATAGRAM | setting::H3_DATAGRAM_DRAFT
+            setting::ENABLE_CONNECT_PROTOCOL
+                | setting::H3_DATAGRAM
+                | setting::H3_DATAGRAM_DRAFT
+                | setting::ENABLE_WEBTRANSPORT_DRAFT02
         ) && v > 1
         {
             return Err(err::H3_SETTINGS_ERROR);
@@ -333,7 +338,13 @@ fn huffman_tree() -> &'static [[u16; 2]] {
 
 /// Decodes a Huffman-coded string into `out`, failing for a code that is not one, the EOS
 /// symbol, padding longer than 7 bits or not made of 1 bits, or an output over `max` bytes.
-pub fn huffman_decode(b: &[u8], out: &mut Vec<u8>, max: usize) -> Result<(), ()> {
+#[derive(Debug, PartialEq, Eq)]
+pub enum HuffmanError {
+    Malformed,
+    TooLarge,
+}
+
+pub fn huffman_decode(b: &[u8], out: &mut Vec<u8>, max: usize) -> Result<(), HuffmanError> {
     let tree = huffman_tree();
     let mut node = 0usize;
     // Bits read since the last complete symbol, and whether they were all 1.
@@ -348,24 +359,24 @@ pub fn huffman_decode(b: &[u8], out: &mut Vec<u8>, max: usize) -> Result<(), ()>
             if next >= LEAF {
                 let sym = next - LEAF;
                 if sym == 256 {
-                    return Err(());
+                    return Err(HuffmanError::Malformed);
                 }
                 if out.len() >= max {
-                    return Err(());
+                    return Err(HuffmanError::TooLarge);
                 }
                 out.push(sym as u8);
                 node = 0;
                 pending = 0;
                 ones = true;
             } else if next == 0 {
-                return Err(());
+                return Err(HuffmanError::Malformed);
             } else {
                 node = next as usize;
             }
         }
     }
     if pending > 7 || !ones {
-        return Err(());
+        return Err(HuffmanError::Malformed);
     }
     Ok(())
 }
@@ -442,10 +453,8 @@ fn get_string(b: &[u8], pos: &mut usize, prefix: u8, budget: usize) -> Result<Ve
         let mut out = Vec::with_capacity(len.min(budget));
         match huffman_decode(raw, &mut out, budget) {
             Ok(()) => Ok(out),
-            // Decoding stopped at the budget: too large if the code was valid so far. A string
-            // whose decoding fails before the budget is a QPACK error.
-            Err(()) if out.len() >= budget => Err(FieldError::TooLarge),
-            Err(()) => Err(FieldError::Qpack),
+            Err(HuffmanError::TooLarge) => Err(FieldError::TooLarge),
+            Err(HuffmanError::Malformed) => Err(FieldError::Qpack),
         }
     } else if len > budget {
         Err(FieldError::TooLarge)
@@ -464,6 +473,10 @@ pub fn decode_field_section(b: &[u8], max: usize) -> Result<Vec<Field>, FieldErr
     // a table capacity of 0 the only valid encoded Required Insert Count is 0.
     let ric = get_qint(b, &mut pos, 8).ok_or(FieldError::Qpack)?;
     if ric != 0 {
+        return Err(FieldError::Qpack);
+    }
+    // A negative Base is forbidden even when no dynamic reference follows (RFC 9204 4.5.1.2).
+    if b.get(pos).ok_or(FieldError::Qpack)? & 0x80 != 0 {
         return Err(FieldError::Qpack);
     }
     get_qint(b, &mut pos, 7).ok_or(FieldError::Qpack)?;
@@ -528,25 +541,33 @@ pub fn check_encoder_stream(b: &[u8]) -> Result<(), u64> {
 #[derive(Default)]
 pub struct DecoderStreamCheck {
     /// Continuation bytes of a Stream Cancellation integer read so far, when inside one.
-    continuation: Option<u32>,
+    continuation: Option<(u64, u32)>,
 }
 
 impl DecoderStreamCheck {
     pub fn feed(&mut self, b: &[u8]) -> Result<(), u64> {
         for &x in b {
             match self.continuation {
-                Some(n) => {
-                    if n >= 9 {
+                Some((v, shift)) => {
+                    let next = v.checked_add(u64::from(x & 0x7f) << shift);
+                    let Some(next) = next.filter(|v| *v <= VARINT_MAX) else {
+                        return Err(err::QPACK_DECODER_STREAM_ERROR);
+                    };
+                    if x & 0x80 != 0 && shift >= 56 {
                         return Err(err::QPACK_DECODER_STREAM_ERROR);
                     }
-                    self.continuation = if x & 0x80 != 0 { Some(n + 1) } else { None };
+                    self.continuation = if x & 0x80 != 0 {
+                        Some((next, shift + 7))
+                    } else {
+                        None
+                    };
                 }
                 None => {
                     if x & 0xc0 != 0x40 {
                         return Err(err::QPACK_DECODER_STREAM_ERROR);
                     }
                     if x & 0x3f == 0x3f {
-                        self.continuation = Some(0);
+                        self.continuation = Some((63, 0));
                     }
                 }
             }
@@ -843,5 +864,72 @@ mod tests {
         assert_eq!(d.feed(&hex("ff")), Ok(()));
         assert_eq!(d.feed(&hex("01 48")), Ok(()));
         assert!(d.feed(&hex("7fffffffffffffffffffff")).is_err());
+    }
+    #[test]
+    fn malformed_settings_and_field_prefixes() {
+        for id in [0x21, 0x40, 0x12345] {
+            assert_eq!(
+                parse_settings(&encode_settings(&[(id, 1), (id, 2)])).unwrap_err(),
+                err::H3_SETTINGS_ERROR
+            );
+        }
+        assert_eq!(
+            parse_settings(&encode_settings(&[(
+                setting::ENABLE_WEBTRANSPORT_DRAFT02,
+                2
+            )]))
+            .unwrap_err(),
+            err::H3_SETTINGS_ERROR
+        );
+        for b in [&[0, 0x80][..], &[0, 0xff, 0x00]] {
+            assert_eq!(decode_field_section(b, 1024), Err(FieldError::Qpack));
+        }
+        // Positive Base is irrelevant when no dynamic entries are used, and is legal.
+        assert!(decode_field_section(&[0, 0x7f, 0x00], 1024).is_ok());
+        // Malformed Huffman padding at exactly the decoded budget is still a QPACK error.
+        let mut pos = 0;
+        assert_eq!(
+            get_string(&[0x82, 0x1f, 0xff], &mut pos, 7, 1),
+            Err(FieldError::Qpack)
+        );
+        // The last continuation byte overflows the 62-bit QPACK implementation limit.
+        let mut instruction = vec![0x7f];
+        instruction.extend([0x80; 8]);
+        instruction.push(0x40);
+        assert_eq!(
+            DecoderStreamCheck::default().feed(&instruction),
+            Err(err::QPACK_DECODER_STREAM_ERROR)
+        );
+    }
+
+    #[test]
+    fn adversarial_codec_inputs_are_bounded() {
+        let mut seed = 0x47a6_217bu32;
+        for len in 0..=256 {
+            for _ in 0..32 {
+                let b: Vec<u8> = (0..len)
+                    .map(|_| {
+                        seed ^= seed << 13;
+                        seed ^= seed >> 17;
+                        seed ^= seed << 5;
+                        seed as u8
+                    })
+                    .collect();
+                let _ = get_varint(&b);
+                let _ = parse_settings(&b);
+                let _ = decode_field_section(&b, 256);
+                let mut out = Vec::new();
+                let _ = huffman_decode(&b, &mut out, 64);
+                assert!(out.len() <= 64);
+                let _ = DecoderStreamCheck::default().feed(&b);
+                let _ = crate::wt::parse_string_list(&b);
+                let _ = crate::wt::parse_string_item(&b);
+                for prefix in 1..=8 {
+                    let mut pos = 0;
+                    let _ = get_qint(&b, &mut pos, prefix);
+                    assert!(pos <= b.len());
+                }
+            }
+        }
     }
 }

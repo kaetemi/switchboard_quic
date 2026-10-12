@@ -5,6 +5,7 @@ Copyright (C) 2018-2026  Jan BOON (Kaetemi)
 Authors:
   Jan Boon <jan.boon@kaetemi.be>
   Claude Opus 5.5 <noreply@anthropic.com>
+  GPT-6 Astra <noreply@openai.com>
 */
 
 //! Self test of WebTransport sessions through the ABI, this shim at both ends, and against a
@@ -363,6 +364,10 @@ fn close_with_code_and_reason_both_ways() {
     // The client closes: WT_CLOSE_SESSION, then the QUIC connection once the server closed the
     // CONNECT stream.
     let (c, s) = h.wt_pair(l, port);
+    assert_eq!(
+        unsafe { sbq_conn_close(c, 7, [0xff].as_ptr(), 1) },
+        SBQ_ERR_ARG as i32
+    );
     let cs = sbq_stream_open(c) as u64;
     h.write_all(cs, b"x");
     let ss = h.stream_of(s);
@@ -521,13 +526,20 @@ fn capsule_frame(capsule: &[u8]) -> Vec<u8> {
 impl Raw {
     /// Connects and sends SETTINGS (`settings`, then `extra` raw bytes on the control stream).
     fn connect(port: u16, settings: &[(u64, u64)], extra: &[u8]) -> Raw {
+        let mut b = vec![0u8];
+        h3::put_frame(&mut b, frame::SETTINGS, &h3::encode_settings(settings));
+        b.extend_from_slice(extra);
+        Self::start(port, &b, 1 << 20)
+    }
+
+    fn start(port: u16, control_bytes: &[u8], stream_window: u64) -> Raw {
         block(async {
             let params = config::ClientParams {
                 alpn: vec![b"h3".to_vec()],
                 verify: config::Verify::None,
                 limits: config::Limits {
                     max_bidi: 64,
-                    stream_window: 1 << 20,
+                    stream_window,
                     conn_window: 16 << 20,
                     idle_ms: 30_000,
                     keep_alive_ms: 0,
@@ -542,10 +554,7 @@ impl Raw {
                 .await
                 .unwrap();
             let mut control = conn.open_uni().await.unwrap();
-            let mut b = vec![0u8];
-            h3::put_frame(&mut b, frame::SETTINGS, &h3::encode_settings(settings));
-            b.extend_from_slice(extra);
-            control.write_all(&b).await.unwrap();
+            control.write_all(control_bytes).await.unwrap();
             Raw {
                 conn,
                 control: Some(control),
@@ -730,8 +739,11 @@ fn a_hand_written_client_on_raw_quinn_streams() {
         u
     });
     assert_eq!(stopped_code(&reserved), Some(err::H3_STREAM_CREATION_ERROR));
-    // A stream of a session that does not exist is held, then refused once the deadline passed.
-    let (_late, mut late_r) = raw.wt_stream(4, b"nobody");
+    // Stream 4 was a data stream, so it can never become a CONNECT session.
+    let (_late, mut late_r) = raw.wt_stream(4, b"not a CONNECT");
+    assert_eq!(reset_code(&mut late_r), Some(wt::err::WT_SESSION_GONE));
+    // A future session is held, then refused once the deadline passed.
+    let (_late, mut late_r) = raw.wt_stream(400, b"nobody");
     assert_eq!(
         reset_code(&mut late_r),
         Some(wt::err::WT_BUFFERED_STREAM_REJECTED)
@@ -1212,6 +1224,9 @@ fn a_self_signed_certificate_a_browser_accepts_for_its_hash() {
     // id-ecPublicKey and prime256v1
     assert!(find(&[0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01]).is_some());
     assert!(find(&[0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07]).is_some());
+    // subjectAltName with iPAddress 127.0.0.1.
+    assert!(find(&[0x06, 0x03, 0x55, 0x1d, 0x11]).is_some());
+    assert!(find(&[0x87, 0x04, 127, 0, 0, 1]).is_some());
     // The validity: two UTCTimes.
     let at = find(&[0x17, 0x0d]).expect("notBefore");
     let not_before = utc_time(&cert[at + 2..at + 15]);
@@ -1228,4 +1243,402 @@ fn a_self_signed_certificate_a_browser_accepts_for_its_hash() {
 
 fn find_from(b: &[u8], pattern: &[u8]) -> Option<usize> {
     b.windows(pattern.len()).position(|w| w == pattern)
+}
+
+#[test]
+fn truncated_frames_are_connection_errors_at_every_boundary() {
+    let mut h = Harness::new();
+    let (_, port) = h.wt_server(5_000);
+    // Unknown frame type and length use all eight bytes; partial varints and payloads must
+    // produce H3_FRAME_ERROR rather than a clean FIN, session reset, or critical-stream error.
+    let mut frame = Vec::new();
+    h3::put_varint(&mut frame, 1 << 40);
+    frame.extend_from_slice(&[0xc0, 0, 0, 0, 0, 0, 0, 4]);
+    frame.extend_from_slice(b"abcd");
+    for end in 1..frame.len() {
+        let raw = Raw::wt(port);
+        let (mut send, _recv, _) = raw.request(&frame[..end]);
+        block(async { send.finish().unwrap() });
+        assert_eq!(
+            closed_with(raw.closed()),
+            err::H3_FRAME_ERROR,
+            "request {end}"
+        );
+    }
+    let mut settings = vec![0];
+    h3::put_frame(
+        &mut settings,
+        frame::SETTINGS,
+        &h3::encode_settings(WT_SETTINGS),
+    );
+    for end in 2..settings.len() {
+        let mut raw = Raw::start(port, &settings[..end], 1 << 20);
+        block(async { raw.control.as_mut().unwrap().finish().unwrap() });
+        assert_eq!(
+            closed_with(raw.closed()),
+            err::H3_FRAME_ERROR,
+            "control {end}"
+        );
+    }
+}
+
+#[test]
+fn connect_capsules_and_trailers_are_validated() {
+    let mut h = Harness::new();
+    let (l, port) = h.wt_server(5_000);
+    // Capsule truncations at DATA boundaries are message errors; incomplete DATA itself is
+    // a frame error and affects the connection. GREASE capsules and empty DATA remain legal.
+    let capsule = wt::close_capsule(7, b"hello");
+    for end in 1..capsule.len() {
+        let raw = Raw::wt(port);
+        let (mut send, mut recv, _) = raw.request(&headers(&request_fields(b"/sb")));
+        let (session, _) = h.wt_request(l);
+        assert_eq!(unsafe { sbq_wt_accept(session, std::ptr::null(), 0) }, 0);
+        assert_eq!(Raw::status(&mut recv), Ok(200));
+        block(async {
+            send.write_all(&capsule_frame(&capsule[..end]))
+                .await
+                .unwrap();
+            send.finish().unwrap();
+        });
+        let e = h.closed(session);
+        assert_eq!(
+            (e.a, e.b),
+            (SBQ_CLOSE_H3_LOCAL, err::H3_MESSAGE_ERROR as i64),
+            "capsule {end}"
+        );
+    }
+    for (payload, expected, connection) in [
+        (
+            h3::frame(frame::HEADERS, &[0, 0x80]),
+            err::QPACK_DECOMPRESSION_FAILED,
+            true,
+        ),
+        (
+            h3::frame(
+                frame::HEADERS,
+                &h3::encode_field_section(&[(b":status", b"200")]),
+            ),
+            err::H3_MESSAGE_ERROR,
+            false,
+        ),
+        (
+            [
+                h3::frame(frame::HEADERS, &[0, 0]),
+                h3::frame(frame::DATA, &[]),
+            ]
+            .concat(),
+            err::H3_FRAME_UNEXPECTED,
+            true,
+        ),
+        (
+            [
+                h3::frame(frame::HEADERS, &[0, 0]),
+                h3::frame(frame::HEADERS, &[0, 0]),
+            ]
+            .concat(),
+            err::H3_FRAME_UNEXPECTED,
+            true,
+        ),
+        (vec![0, 4, 0x68], err::H3_FRAME_ERROR, true),
+        (
+            {
+                let mut c = Vec::new();
+                wt::put_capsule(&mut c, wt::capsule::WT_DRAIN_SESSION, b"x");
+                capsule_frame(&c)
+            },
+            err::H3_MESSAGE_ERROR,
+            false,
+        ),
+        (
+            {
+                let mut c = Vec::new();
+                wt::put_capsule(&mut c, wt::capsule::WT_CLOSE_SESSION, &[0, 0, 0, 0, 0xff]);
+                capsule_frame(&c)
+            },
+            err::H3_MESSAGE_ERROR,
+            false,
+        ),
+    ] {
+        let raw = Raw::wt(port);
+        let (mut send, mut recv, _) = raw.request(&headers(&request_fields(b"/sb")));
+        let (session, _) = h.wt_request(l);
+        assert_eq!(unsafe { sbq_wt_accept(session, std::ptr::null(), 0) }, 0);
+        assert_eq!(Raw::status(&mut recv), Ok(200));
+        block(async {
+            send.write_all(&payload).await.unwrap();
+            send.finish().unwrap();
+        });
+        let e = h.closed(session);
+        assert_eq!((e.a, e.b), (SBQ_CLOSE_H3_LOCAL, expected as i64));
+        if connection {
+            assert_eq!(closed_with(raw.closed()), expected);
+        }
+    }
+}
+
+#[test]
+fn data_after_a_close_capsule_resets_connect() {
+    let mut h = Harness::new();
+    let (l, port) = h.wt_server(5_000);
+    for tail in [
+        wt::close_capsule(9, b"second"),
+        wt::drain_capsule(),
+        vec![0x17, 0],
+    ] {
+        let raw = Raw::wt(port);
+        let (mut send, mut recv, _) = raw.request(&headers(&request_fields(b"/sb")));
+        let (session, _) = h.wt_request(l);
+        assert_eq!(unsafe { sbq_wt_accept(session, std::ptr::null(), 0) }, 0);
+        assert_eq!(Raw::status(&mut recv), Ok(200));
+        let mut c = wt::close_capsule(7, b"first");
+        c.extend(tail);
+        block(async {
+            send.write_all(&capsule_frame(&c)).await.unwrap();
+            send.finish().unwrap();
+        });
+        assert_eq!(h.closed(session).b, 7); // First close metadata wins.
+        assert_eq!(reset_code(&mut recv), Some(err::H3_MESSAGE_ERROR));
+    }
+}
+
+#[test]
+fn held_stream_timeout_and_missing_settings_are_bounded() {
+    let mut h = Harness::new();
+    let (l, port) = h.wt_server(250);
+    let raw = Raw::wt(port);
+    let (_send, mut recv, _) = raw.request(&headers(&request_fields(b"/sb")));
+    let (session, _) = h.wt_request(l);
+    assert_eq!(unsafe { sbq_wt_accept(session, std::ptr::null(), 0) }, 0);
+    assert_eq!(Raw::status(&mut recv), Ok(200));
+    let (_send, mut held) = raw.wt_stream(400, b"held");
+    assert_eq!(
+        reset_code(&mut held),
+        Some(wt::err::WT_BUFFERED_STREAM_REJECTED)
+    );
+    assert!(raw.conn.close_reason().is_none());
+    let silent = Raw::start(port, &[], 1 << 20);
+    let (_send, _recv, _) = silent.request(&headers(&request_fields(b"/sb")));
+    let start = Instant::now();
+    assert_eq!(closed_with(silent.closed()), err::H3_NO_ERROR);
+    assert!(start.elapsed() < Duration::from_secs(2));
+}
+
+#[test]
+fn closing_one_pooled_session_releases_its_streams_and_tasks_without_peer_fin() {
+    let mut h = Harness::new();
+    let (l, port) = h.wt_server(5_000);
+    for window in [64, 1 << 20] {
+        let mut settings = vec![0];
+        h3::put_frame(
+            &mut settings,
+            frame::SETTINGS,
+            &h3::encode_settings(WT_SETTINGS),
+        );
+        let raw = Raw::start(port, &settings, window);
+        let mut sessions = Vec::new();
+        for _ in 0..2 {
+            let (send, mut recv, sid) = raw.request(&headers(&request_fields(b"/sb")));
+            let (session, _) = h.wt_request(l);
+            assert_eq!(unsafe { sbq_wt_accept(session, std::ptr::null(), 0) }, 0);
+            assert_eq!(Raw::status(&mut recv), Ok(200));
+            sessions.push((send, recv, sid, session));
+        }
+        let (_send, mut recv) = raw.wt_stream(sessions[0].2, b"data");
+        let stream = h.stream_of(sessions[0].3);
+        let object = ctx::get(&ctx::STREAMS, stream).unwrap();
+        let weak = std::sync::Arc::downgrade(&object);
+        drop(object);
+        assert_eq!(close(sessions[0].3, 7, &"x".repeat(1024)), 0);
+        assert_eq!(
+            unsafe { sbq_stream_write(stream, b"x".as_ptr(), 1) },
+            SBQ_ERR_CONNECTION
+        );
+        assert_eq!(sbq_conn_release(sessions[0].3), 0);
+        assert_eq!(reset_code(&mut recv), Some(wt::err::WT_SESSION_GONE));
+        until("deferred streams released", || weak.upgrade().is_none());
+        // No FIN on the peer's first CONNECT. A surviving session keeps the connection up.
+        std::thread::sleep(Duration::from_millis(350));
+        assert!(raw.conn.close_reason().is_none());
+        let (_send, _recv) = raw.wt_stream(sessions[1].2, b"still live");
+        h.stream_of(sessions[1].3);
+    }
+}
+
+#[test]
+fn draft02_and_draft07_server_requirements_and_goaway() {
+    let mut h = Harness::new();
+    for mode in 0..8 {
+        let (cert, key) = self_signed("localhost");
+        let sc = config::server_config(
+            vec![b"h3".to_vec()],
+            &cert,
+            &key,
+            &config::Limits {
+                max_bidi: 4,
+                stream_window: 1 << 20,
+                conn_window: 1 << 20,
+                idle_ms: 30_000,
+                keep_alive_ms: 0,
+                handshake_ms: 0,
+            },
+        )
+        .unwrap();
+        let endpoint = {
+            let _g = ctx::rt().enter();
+            quinn::Endpoint::server(sc, "127.0.0.1:0".parse().unwrap()).unwrap()
+        };
+        let port = endpoint.local_addr().unwrap().port();
+        let server = ctx::rt().spawn(async move {
+            let conn = endpoint.accept().await.unwrap().await.unwrap();
+            let mut control = conn.open_uni().await.unwrap();
+            let mut settings = vec![(setting::H3_DATAGRAM, 1)];
+            if mode < 2 {
+                settings.push((setting::ENABLE_WEBTRANSPORT_DRAFT02, 1));
+            } else {
+                settings.push((setting::WEBTRANSPORT_MAX_SESSIONS_DRAFT07, 1));
+            }
+            if mode >= 3 {
+                settings.push((setting::ENABLE_CONNECT_PROTOCOL, 1));
+            }
+            let mut start = vec![0];
+            h3::put_frame(&mut start, frame::SETTINGS, &h3::encode_settings(&settings));
+            if mode == 4 {
+                h3::put_frame(&mut start, frame::GOAWAY, &[0]);
+            }
+            control.write_all(&start).await.unwrap();
+            let mut request = None;
+            if ![2, 4].contains(&mode) {
+                let (mut send, recv) = conn.accept_bi().await.unwrap();
+                if mode >= 6 {
+                    let b = if mode == 6 {
+                        vec![1, 3, 0]
+                    } else {
+                        vec![0x40, 0x21, 4, 0]
+                    };
+                    send.write_all(&b).await.unwrap();
+                    send.finish().unwrap();
+                } else if mode == 5 {
+                    control
+                        .write_all(&h3::frame(frame::GOAWAY, &[0]))
+                        .await
+                        .unwrap();
+                } else {
+                    let mut fields: Vec<(&[u8], &[u8])> = vec![(b":status", b"200")];
+                    if mode == 0 {
+                        fields.push((b"sec-webtransport-http3-draft", b"draft02"));
+                    }
+                    send.write_all(&h3::frame(
+                        frame::HEADERS,
+                        &h3::encode_field_section(&fields),
+                    ))
+                    .await
+                    .unwrap();
+                }
+                request = Some((send, recv));
+            }
+            let ended = conn.closed().await;
+            drop(request);
+            drop(control);
+            ended
+        });
+        let client = h.wt_dial(port, "/sb", "", &[]);
+        if [0, 3].contains(&mode) {
+            h.wait("connected to supported draft", |e| {
+                e.handle == client && e.kind == SBQ_EV_CONNECTED
+            });
+            assert_eq!(close(client, 0, ""), 0);
+        } else {
+            let e = h.closed(client);
+            let expected = if mode >= 6 {
+                (SBQ_CLOSE_H3_LOCAL, err::H3_FRAME_ERROR as i64)
+            } else if mode >= 4 {
+                (SBQ_CLOSE_H3_REMOTE, err::H3_REQUEST_REJECTED as i64)
+            } else {
+                (SBQ_CLOSE_H3_LOCAL, wt::err::WT_REQUIREMENTS_NOT_MET as i64)
+            };
+            assert_eq!((e.a, e.b), expected, "mode {mode}");
+        }
+        block(server).unwrap();
+        sbq_conn_release(client);
+    }
+}
+
+#[test]
+fn pending_handles_survive_listener_close_and_release() {
+    let mut h = Harness::new();
+    let (l, port) = h.wt_server(5_000);
+    let client = h.wt_dial(port, "/sb", "", &[]);
+    let (session, _) = h.wt_request(l);
+    assert_eq!(sbq_listener_close(l), 0);
+    assert_eq!(
+        unsafe { sbq_wt_accept(session, std::ptr::null(), 0) },
+        SBQ_ERR_STATE as i32
+    );
+    assert_eq!(h.closed(client).b, 503);
+    assert!(field(session, SBQ_WT_PATH).is_some());
+    assert_eq!(sbq_conn_release(session), 0);
+    assert_eq!(
+        unsafe { sbq_wt_request(session, SBQ_WT_PATH, std::ptr::null_mut(), 0) },
+        SBQ_ERR_HANDLE
+    );
+
+    let (l, port) = h.wt_server(5_000);
+    let client = h.wt_dial(port, "/sb", "", &[]);
+    let (session, _) = h.wt_request(l);
+    assert_eq!(sbq_conn_release(session), 0);
+    assert_eq!(h.closed(client).b, 503);
+}
+
+#[test]
+fn unreleased_expired_requests_remain_within_the_handle_bound() {
+    let mut h = Harness::new();
+    let (l, port) = h.wt_server_with(150, 64);
+    let raw = Raw::wt(port);
+    let (_send, mut recv, _) = raw.request(&headers(&request_fields(b"/sb")));
+    let (live, _) = h.wt_request(l);
+    assert_eq!(unsafe { sbq_wt_accept(live, std::ptr::null(), 0) }, 0);
+    assert_eq!(Raw::status(&mut recv), Ok(200));
+    let mut requests = Vec::new();
+    for _ in 1..h3conn::MAX_SESSIONS {
+        let (send, mut recv, _) = raw.request(&headers(&request_fields(b"/sb")));
+        let (session, _) = h.wt_request(l);
+        assert_eq!(h.closed(session).b, 503);
+        assert_eq!(Raw::status(&mut recv), Ok(503));
+        requests.push((send, recv, session));
+    }
+    let (_send, mut recv, _) = raw.request(&headers(&request_fields(b"/sb")));
+    assert_eq!(Raw::status(&mut recv), Err(err::H3_REQUEST_REJECTED));
+    for (_, _, session) in requests {
+        sbq_conn_release(session);
+    }
+    let (_send, _recv, _) = raw.request(&headers(&request_fields(b"/sb")));
+    h.wt_request(l); // Releasing the handles restores the resource grant.
+}
+
+#[test]
+fn old_closed_sessions_are_not_mistaken_for_future_sessions() {
+    let mut h = Harness::new();
+    let (l, port) = h.wt_server_with(5_000, 128);
+    let raw = Raw::wt(port);
+    let (_keep_send, mut keep_recv, _) = raw.request(&headers(&request_fields(b"/sb")));
+    let (keep, _) = h.wt_request(l);
+    assert_eq!(unsafe { sbq_wt_accept(keep, std::ptr::null(), 0) }, 0);
+    assert_eq!(Raw::status(&mut keep_recv), Ok(200));
+    let mut oldest = 0;
+    for i in 0..70 {
+        let (_send, mut recv, sid) = raw.request(&headers(&request_fields(b"/sb")));
+        let (session, _) = h.wt_request(l);
+        if i == 0 {
+            oldest = sid;
+        }
+        assert_eq!(sbq_wt_reject(session, 404), 0);
+        assert_eq!(Raw::status(&mut recv), Ok(404));
+        sbq_conn_release(session);
+    }
+    let (_send, mut recv) = raw.wt_stream(oldest, b"late");
+    assert_eq!(reset_code(&mut recv), Some(wt::err::WT_SESSION_GONE));
+    // A future CONNECT ID is still bufferable, even beyond every accepted peer stream.
+    let (_send, _recv) = raw.wt_stream(4_000, b"future");
+    assert!(raw.conn.close_reason().is_none());
 }

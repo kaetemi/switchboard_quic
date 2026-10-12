@@ -1,3 +1,13 @@
+<!--
+Polyverse Switchboard
+Microservice Network Architecture
+Copyright (C) 2018-2026  Jan BOON (Kaetemi)
+Authors:
+  Jan Boon <jan.boon@kaetemi.be>
+  Claude Opus 5.5 <noreply@anthropic.com>
+  GPT-6 Astra <noreply@openai.com>
+-->
+
 # Polyverse Switchboard QUIC and WebTransport binding
 
 The binding of [Polyverse Switchboard](https://github.com/kaetemi/switchboard) to transports with native streams, as specified by the wiki page "Polyverse Switchboard QUIC and WebTransport Binding": every channel is a bidirectional stream, records replace mux frames, a control stream carries the control messages, QUIC flow control replaces credit, and the `IDENT` proof binds the TLS exporter.
@@ -99,6 +109,8 @@ A listener answers each request itself: another path than its own 404, an `Origi
 Versions: Chrome 149 speaks WebTransport draft-02 (`SETTINGS_ENABLE_WEBTRANSPORT`, the `sec-webtransport-http3-draft02` request header), web-transport-quinn 0.13.2 the draft-07 signalling (`SETTINGS_WEBTRANSPORT_MAX_SESSIONS`); both send `WT-Available-Protocols`. The shim speaks both, as client and server, and answers in the version the client signalled; see `native/README.md`. Neither enables the session flow control of the later drafts, so a client uses one session per connection (the provider's client always does).
 
 ### Browsers and certificates
+
+`advertisedHost` also selects the authority served by a WebTransport listener, defaulting to the bind host. A wildcard bind without `advertisedHost` accepts any host on its port. Origins match the configured strings exactly, including scheme, host spelling and port; use the browser's serialized origin (no trailing slash). `allowedOrigins: null` explicitly permits any origin; an absent Origin is accepted for non-browser clients. Protocol names must be 1–255 bytes of printable ASCII, as in the native ABI. The `answered` counters cover decisions made by the Dart listener, excluding refusals made directly in the shim. URI userinfo is refused; queries are sent and fragments are dropped.
 
 A browser reaches a WebTransport listener with the W3C API: `new WebTransport('https://node.example:4433/sb', {protocols: ['switchboard']})`, `wt.protocol` then being `'switchboard'`. With a certificate from a public authority, nothing else is needed. With a self-signed one (development, a LAN, a device), the page passes its hash: `serverCertificateHashes: [{algorithm: 'sha-256', value: hash}]`, where the browser accepts only an X.509v3 certificate with an ECDSA P-256 key whose validity is current and at most 14 days long. `NativeQuicProvider.generateSelfSigned(subject)` makes exactly that (ECDSA P-256, valid from five minutes ago for 14 days; `validityDays` beyond 14 makes one browsers refuse for a hash), and `NativeCertificate.sha256` is the hash to give the page; rotate as the binding page's "Certificates" says. The listener's `allowedOrigins` names the pages allowed (the browser sends its page's origin). Chrome 149 has no `exportKeyingMaterial`, so its `IDENT` proofs are nonce-bound, which is safe for it since it verified the certificate; a listener that serves browsers therefore passes `QuicIdentityRules.none` to `QuicSwitchboardListener.start` (whose default refuses nonce-bound proofs, for nodes).
 

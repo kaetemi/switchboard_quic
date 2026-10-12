@@ -6,6 +6,7 @@ Authors:
   Jan Boon <jan.boon@kaetemi.be>
   Claude Opus 5.5 <noreply@anthropic.com>
   GLM 5.3 Flash <noreply@z.ai>
+  GPT-6 Astra <noreply@openai.com>
 */
 
 //! Streams: non-blocking reads and writes polled with wakers that post READABLE and WRITABLE, a
@@ -130,6 +131,10 @@ impl StreamObj {
 
     /// The session ended: reset the send direction and stop the receive direction with
     /// WT_SESSION_GONE, as the WebTransport draft requires of every stream of the session.
+    pub fn session_ended(&self) {
+        lock(&self.inner).gone = true;
+    }
+
     pub fn session_gone(&self) {
         let code = VarInt::from_u64(wt::err::WT_SESSION_GONE).expect("in range");
         let mut g = lock(&self.inner);
@@ -163,25 +168,23 @@ impl StreamObj {
 
     /// Writes what is left of the stream header.
     fn flush_prefix(&self, g: &mut Inner) -> Prefix {
-        if g.prefix.is_empty() {
-            return Prefix::Done;
-        }
-        let Some(send) = g.send.as_mut() else {
-            return Prefix::Failed(SBQ_ERR_STATE);
-        };
-        let mut cx = Context::from_waker(&self.write_waker);
-        match Pin::new(send).poll_write(&mut cx, &g.prefix) {
-            Poll::Ready(Ok(n)) => {
-                g.prefix.drain(..n);
-                if g.prefix.is_empty() {
-                    Prefix::Done
-                } else {
-                    Prefix::Blocked
+        while !g.prefix.is_empty() {
+            let Some(send) = g.send.as_mut() else {
+                return Prefix::Failed(SBQ_ERR_STATE);
+            };
+            let mut cx = Context::from_waker(&self.write_waker);
+            match Pin::new(send).poll_write(&mut cx, &g.prefix) {
+                Poll::Ready(Ok(0)) => return Prefix::Failed(SBQ_ERR_CLOSED),
+                Poll::Ready(Ok(n)) => {
+                    g.prefix.drain(..n);
+                    // A short successful write does not arm quinn's waker. Poll the remaining
+                    // prefix (at most 16 bytes in total) until it is done or actually Pending.
                 }
+                Poll::Pending => return Prefix::Blocked,
+                Poll::Ready(Err(e)) => return Prefix::Failed(self.write_failed(g, e)),
             }
-            Poll::Pending => Prefix::Blocked,
-            Poll::Ready(Err(e)) => Prefix::Failed(self.write_failed(g, e)),
         }
+        Prefix::Done
     }
 
     pub fn write(&self, data: &[u8]) -> i64 {
@@ -355,6 +358,22 @@ impl StreamObj {
     }
 }
 
+impl Drop for StreamObj {
+    fn drop(&mut self) {
+        let mut g = lock(&self.inner);
+        let code =
+            VarInt::from_u64(if self.wt { wt::err::WT_SESSION_GONE } else { 0 }).expect("in range");
+        if g.send_state == SendState::Open {
+            if let Some(send) = g.send.as_mut() {
+                let _ = send.reset(code);
+            }
+        }
+        if g.recv_state == RecvState::Open {
+            let _ = g.recv.stop(code);
+        }
+    }
+}
+
 /// A stream to register: its directions, whether it belongs to a WebTransport session, and the
 /// stream header still to write.
 pub struct NewStream {
@@ -365,6 +384,15 @@ pub struct NewStream {
 }
 
 impl NewStream {
+    pub fn abort(mut self) {
+        let code =
+            VarInt::from_u64(if self.wt { wt::err::WT_SESSION_GONE } else { 0 }).expect("in range");
+        if let Some(send) = self.send.as_mut() {
+            let _ = send.reset(code);
+        }
+        let _ = self.recv.stop(code);
+    }
+
     pub fn raw(send: SendStream, recv: RecvStream) -> Self {
         NewStream {
             send: Some(send),
@@ -380,6 +408,15 @@ impl NewStream {
 /// task, so that the embedder learns the handle before any event of the stream. Gives the
 /// stream back when the connection was released meanwhile.
 pub fn insert(conn: &Arc<ConnObj>, s: NewStream, announce: Option<i32>) -> Result<u64, NewStream> {
+    // Same lock order as session close: phase first, then the stream set. Once close takes
+    // its snapshot, no optimistic delivery or pending open can escape the deferred resets.
+    let phase = conn.wt.as_ref().map(|wt| lock(&wt.st));
+    if phase
+        .as_ref()
+        .is_some_and(|st| st.phase != crate::h3conn::Phase::Live)
+    {
+        return Err(s);
+    }
     let mut ids = lock(&conn.streams);
     let Some(set) = ids.as_mut() else {
         return Err(s);
@@ -415,6 +452,7 @@ pub fn insert(conn: &Arc<ConnObj>, s: NewStream, announce: Option<i32>) -> Resul
     lock(&STREAMS).insert(h, obj);
     set.insert(h);
     drop(ids);
+    drop(phase);
     if let Some(kind) = announce {
         ctx.post(kind, h, conn.handle as i64, 0);
     }
@@ -459,7 +497,13 @@ pub fn open(conn_h: u64) -> i64 {
         let mut fut = pin!(conn.open_bi());
         match fut.as_mut().poll(&mut Context::from_waker(Waker::noop())) {
             Poll::Ready(Ok((s, r))) => {
-                return insert(&obj, new(s, r), None).map_or(SBQ_ERR_CONNECTION, |h| h as i64)
+                return insert(&obj, new(s, r), None).map_or_else(
+                    |s| {
+                        s.abort();
+                        SBQ_ERR_CONNECTION
+                    },
+                    |h| h as i64,
+                )
             }
             Poll::Ready(Err(_)) => return SBQ_ERR_CONNECTION,
             Poll::Pending => {}
@@ -468,15 +512,18 @@ pub fn open(conn_h: u64) -> i64 {
     let o = obj.clone();
     let task = rt().spawn(async move {
         if let Ok((s, r)) = conn.open_bi().await {
-            let _ = insert(&o, new(s, r), Some(SBQ_EV_OPENED));
+            if let Err(s) = insert(&o, new(s, r), Some(SBQ_EV_OPENED)) {
+                s.abort();
+            }
         }
     });
     obj.add_task(task.abort_handle());
     SBQ_WOULD_BLOCK
 }
 
-/// Forgets a stream. Its directions should have ended (or been reset / stopped) first: as with
-/// quinn's own drop, an open send side is finished and an unread receive side stopped with 0.
+/// Forgets a stream. Its directions should have ended (or been reset / stopped) first.
+/// As a final safeguard, dropping an open direction explicitly aborts it (WT_SESSION_GONE
+/// for WebTransport, 0 for raw QUIC); a finished send direction keeps its FIN.
 pub fn release(h: u64) -> i32 {
     let Some(obj) = lock(&STREAMS).remove(&h) else {
         return SBQ_ERR_HANDLE as i32;
