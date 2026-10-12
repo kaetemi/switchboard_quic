@@ -16,6 +16,8 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
+
+use crate::h3conn::{H3_ALPN, H3_DATAGRAM_BUFFER, H3_UNI_STREAMS};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
 use rustls::{CertificateError, DigitallySignedStruct, SignatureScheme};
@@ -49,15 +51,22 @@ fn varint(v: u64, what: &str) -> Result<quinn::VarInt, String> {
     quinn::VarInt::from_u64(v).map_err(|_| format!("{what} out of range"))
 }
 
-/// The transport configuration: no unidirectional streams and no datagrams (the binding uses
-/// neither), the given limits.
-pub fn transport(l: &Limits) -> Result<quinn::TransportConfig, String> {
+/// The transport configuration. Raw QUIC: no unidirectional streams and no datagrams (the
+/// binding uses neither), the given limits. HTTP/3 (`h3`): the unidirectional streams HTTP/3 and
+/// WebTransport need, the datagram parameter H3_DATAGRAM requires, and on a server one more
+/// bidirectional stream for a session's CONNECT stream.
+pub fn transport(l: &Limits, h3: bool, server: bool) -> Result<quinn::TransportConfig, String> {
     let mut t = quinn::TransportConfig::default();
-    t.max_concurrent_bidi_streams(varint(l.max_bidi, "max_bidi")?)
-        .max_concurrent_uni_streams(0u32.into())
+    let bidi = if h3 && server {
+        l.max_bidi.saturating_add(1)
+    } else {
+        l.max_bidi
+    };
+    t.max_concurrent_bidi_streams(varint(bidi, "max_bidi")?)
+        .max_concurrent_uni_streams(if h3 { H3_UNI_STREAMS } else { 0 }.into())
         .stream_receive_window(varint(l.stream_window, "stream_window")?)
         .receive_window(varint(l.conn_window.max(l.stream_window), "conn_window")?)
-        .datagram_receive_buffer_size(None)
+        .datagram_receive_buffer_size(h3.then_some(H3_DATAGRAM_BUFFER))
         .keep_alive_interval(if l.keep_alive_ms == 0 {
             None
         } else {
@@ -105,10 +114,24 @@ pub struct ClientParams {
     pub limits: Limits,
 }
 
-/// A listener's configuration: quinn's, and the deadline of each handshake it accepts.
+impl ClientParams {
+    /// Whether the ALPN list offers HTTP/3 (and the transport parameters are HTTP/3's).
+    pub fn h3(&self) -> bool {
+        offers_h3(&self.alpn)
+    }
+}
+
+/// Whether an ALPN list includes `h3`.
+pub fn offers_h3(alpn: &[Vec<u8>]) -> bool {
+    alpn.iter().any(|a| a.as_slice() == H3_ALPN)
+}
+
+/// A listener's configuration: quinn's, the deadline of each handshake it accepts (which also
+/// bounds an HTTP/3 request's wait for its answer), and whether it serves `h3`.
 pub struct ServerParams {
     pub config: quinn::ServerConfig,
     pub handshake: Option<Duration>,
+    pub h3: bool,
 }
 
 pub enum ConfigObj {
@@ -314,7 +337,7 @@ pub fn client_config(
     tls.enable_early_data = false;
     let q = QuicClientConfig::try_from(tls).map_err(|e| e.to_string())?;
     let mut cc = quinn::ClientConfig::new(Arc::new(q));
-    cc.transport_config(Arc::new(transport(&p.limits)?));
+    cc.transport_config(Arc::new(transport(&p.limits, p.h3(), false)?));
     Ok(cc)
 }
 
@@ -370,13 +393,14 @@ pub fn server_config(
         .with_no_client_auth()
         .with_single_cert(chain, key)
         .map_err(|e| format!("certificate or key rejected: {e}"))?;
+    let h3 = offers_h3(&alpn);
     tls.alpn_protocols = alpn;
     // 0-RTT is on by default in rustls/quinn servers that set this; a replayed OPEN would be
     // served twice, so it stays off.
     tls.max_early_data_size = 0;
     let q = QuicServerConfig::try_from(tls).map_err(|e| e.to_string())?;
     let mut sc = quinn::ServerConfig::with_crypto(Arc::new(q));
-    sc.transport_config(Arc::new(transport(limits)?));
+    sc.transport_config(Arc::new(transport(limits, h3, true)?));
     Ok(sc)
 }
 

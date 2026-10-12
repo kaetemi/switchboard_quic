@@ -5,10 +5,12 @@ Copyright (C) 2018-2026  Jan BOON (Kaetemi)
 Authors:
   Jan Boon <jan.boon@kaetemi.be>
   Claude Opus 5.5 <noreply@anthropic.com>
+  GPT-6 Astra <noreply@openai.com>
 */
 
 //! Listeners and connections: the tasks that accept, connect, watch for peer streams and for
-//! the end of a connection, and post the matching events.
+//! the end of a connection, and post the matching events. A connection object is either a raw
+//! QUIC connection or a WebTransport session (`wt`), whose HTTP/3 connection `h3conn` runs.
 
 use std::collections::HashSet;
 use std::future::Future;
@@ -17,12 +19,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use quinn::{Connection, ConnectionError, Endpoint};
+use quinn::{Connection, ConnectionError, Endpoint, VarInt};
 use tokio::task::{AbortHandle, JoinSet};
 
-use crate::config::{client_config, ClientParams};
+use crate::config::{client_config, ClientParams, ServerParams};
 use crate::ctx::{lock, next_handle, rt, Ctx, CONNS, LISTENERS, STREAMS};
-use crate::stream;
+use crate::h3conn::{self, ClientRequest, H3Conn, WtSession, H3_ALPN};
+use crate::stream::{self, NewStream};
 use crate::*;
 
 /// How a connection ended, as its CLOSED event and `sbq_conn_close_reason` report it.
@@ -47,10 +50,18 @@ pub struct ConnObj {
     /// The connection's streams in the stream table; None once released, so that a stream an
     /// accept or open task completes afterwards is dropped instead of registered.
     pub streams: Mutex<Option<HashSet<u64>>>,
+    /// Some for a WebTransport session: `conn` is then its HTTP/3 connection once the session
+    /// exists, and the session's own state is here.
+    pub wt: Option<WtSession>,
 }
 
 impl ConnObj {
-    fn new(ctx: Arc<Ctx>, conn: Option<Connection>, rejected: Arc<AtomicBool>) -> Arc<Self> {
+    fn with(
+        ctx: Arc<Ctx>,
+        conn: Option<Connection>,
+        rejected: Arc<AtomicBool>,
+        wt: Option<WtSession>,
+    ) -> Arc<Self> {
         Arc::new(ConnObj {
             ctx,
             handle: next_handle(),
@@ -60,7 +71,41 @@ impl ConnObj {
             tasks: Mutex::new(Vec::new()),
             rejected,
             streams: Mutex::new(Some(HashSet::new())),
+            wt,
         })
+    }
+
+    fn new(ctx: Arc<Ctx>, conn: Option<Connection>, rejected: Arc<AtomicBool>) -> Arc<Self> {
+        Self::with(ctx, conn, rejected, None)
+    }
+
+    /// A WebTransport session, not yet in the table.
+    pub fn new_session(ctx: Arc<Ctx>, wt: WtSession, conn: Option<Connection>) -> Arc<Self> {
+        Self::with(ctx, conn, Arc::new(AtomicBool::new(false)), Some(wt))
+    }
+
+    /// Where a new stream goes: the QUIC connection, and the stream header of a WebTransport
+    /// session. `SBQ_ERR_STATE` before the connection or session is established,
+    /// `SBQ_ERR_CONNECTION` once it has ended.
+    pub fn stream_target(&self) -> Result<(Connection, Option<Vec<u8>>), i64> {
+        let ended = lock(&self.end).is_some();
+        if let Some(wt) = self.wt.as_ref() {
+            if ended {
+                return Err(SBQ_ERR_CONNECTION);
+            }
+            let header = wt.stream_header().ok_or(SBQ_ERR_STATE)?;
+            let h3 = wt.h3().ok_or(SBQ_ERR_STATE)?;
+            return Ok((h3.conn.clone(), Some(header)));
+        }
+        // Ended first: a connection whose handshake never completed has no `Connection` either,
+        // and after CLOSED it fails as an ended one does, not as one still in its handshake.
+        if ended {
+            return Err(SBQ_ERR_CONNECTION);
+        }
+        match self.connection() {
+            Some(c) => Ok((c, None)),
+            None => Err(SBQ_ERR_STATE),
+        }
     }
 
     pub fn connection(&self) -> Option<Connection> {
@@ -143,20 +188,26 @@ impl ConnObj {
     }
 
     /// Forgets the connection: closes it with code 0 if it is still open, stops its tasks and
-    /// drops its streams.
-    pub fn release(&self) {
-        // Recorded first, as `close` does: a dial task whose handshake completes concurrently
-        // (an abort only takes effect at its next await) then closes the connection itself
-        // instead of keeping it alive with no handle (see `connect`).
-        {
-            let mut lc = lock(&self.local_close);
-            if lc.is_none() {
-                *lc = Some((0, Vec::new()));
+    /// drops its streams. A WebTransport session is closed (WT_CLOSE_SESSION 0, quietly); its
+    /// QUIC connection is left to its HTTP/3 layer, which may carry other sessions.
+    pub fn release(self: &Arc<Self>) {
+        if self.wt.is_some() {
+            h3conn::release(self);
+            lock(&self.conn).take();
+        } else {
+            // Recorded first, as `close` does: a dial task whose handshake completes
+            // concurrently (an abort only takes effect at its next await) then closes the
+            // connection itself instead of keeping it alive with no handle (see `connect`).
+            {
+                let mut lc = lock(&self.local_close);
+                if lc.is_none() {
+                    *lc = Some((0, Vec::new()));
+                }
             }
-        }
-        if let Some(c) = lock(&self.conn).take() {
-            if c.close_reason().is_none() {
-                c.close(0u32.into(), b"");
+            if let Some(c) = lock(&self.conn).take() {
+                if c.close_reason().is_none() {
+                    c.close(0u32.into(), b"");
+                }
             }
         }
         for t in lock(&self.tasks).drain(..) {
@@ -178,7 +229,8 @@ fn watch(obj: &Arc<ConnObj>, conn: Connection) {
     let c = conn.clone();
     let accept = rt().spawn(async move {
         while let Ok((s, r)) = c.accept_bi().await {
-            if stream::insert(&o, s, r, Some(SBQ_EV_STREAM)).is_none() {
+            if let Err(s) = stream::insert(&o, NewStream::raw(s, r), Some(SBQ_EV_STREAM)) {
+                s.abort();
                 break;
             }
         }
@@ -196,16 +248,26 @@ pub struct ListenerObj {
     pub ctx: Arc<Ctx>,
     pub endpoint: Endpoint,
     pub task: Mutex<Option<AbortHandle>>,
+    /// Set by `close`: the HTTP/3 connections it accepted answer new WebTransport requests 503.
+    pub closed: Arc<AtomicBool>,
 }
 
 impl ListenerObj {
     /// Stops accepting. Connections already accepted keep the socket until they end.
     pub fn close(&self) {
+        self.closed.store(true, Ordering::Relaxed);
         self.endpoint.set_server_config(None);
         if let Some(t) = lock(&self.task).take() {
             t.abort();
         }
     }
+}
+
+/// The ALPN protocol a connection negotiated.
+pub fn negotiated_alpn(conn: &Connection) -> Option<Vec<u8>> {
+    conn.handshake_data()
+        .and_then(|h| h.downcast::<quinn::crypto::rustls::HandshakeData>().ok())
+        .and_then(|h| h.protocol)
 }
 
 /// The output of `f`, or None when `deadline` passed first (`f` is dropped then).
@@ -216,12 +278,26 @@ async fn within<F: Future>(deadline: Option<Duration>, f: F) -> Option<F::Output
     }
 }
 
-/// Completes the handshake of an incoming connection within `deadline` and announces it. A
-/// handshake that fails or runs out of time is dropped, which closes it in quinn (the endpoint
-/// forgets it once the close has drained); nothing of it reached a table.
-async fn handshake(inc: quinn::Incoming, ctx: Arc<Ctx>, listener: u64, deadline: Option<Duration>) {
+/// Completes the handshake of an incoming connection within `deadline` and announces it, or,
+/// for one that negotiated `h3` on a listener that serves it, starts its HTTP/3 layer, whose
+/// WebTransport requests are announced instead. A handshake that fails or runs out of time is
+/// dropped, which closes it in quinn (the endpoint forgets it once the close has drained);
+/// nothing of it reached a table.
+async fn handshake(
+    inc: quinn::Incoming,
+    ctx: Arc<Ctx>,
+    listener: u64,
+    deadline: Option<Duration>,
+    h3: Option<Arc<AtomicBool>>,
+) {
     let Ok(connecting) = inc.accept() else { return };
     if let Some(Ok(conn)) = within(deadline, connecting).await {
+        if let Some(closed) = h3 {
+            if negotiated_alpn(&conn).as_deref() == Some(H3_ALPN) {
+                H3Conn::start(ctx, conn, false, listener, Some(closed), deadline);
+                return;
+            }
+        }
         let obj = ConnObj::new(ctx, Some(conn.clone()), Arc::new(AtomicBool::new(false)));
         lock(&CONNS).insert(obj.handle, obj.clone());
         // `sbq_shutdown` closes the context before it sweeps the table: a handshake that completes
@@ -238,28 +314,29 @@ async fn handshake(inc: quinn::Incoming, ctx: Arc<Ctx>, listener: u64, deadline:
     }
 }
 
-pub fn listen(
-    ctx: &Arc<Ctx>,
-    cfg: quinn::ServerConfig,
-    deadline: Option<Duration>,
-    addr: SocketAddr,
-) -> Result<u64, String> {
+pub fn listen(ctx: &Arc<Ctx>, sp: &ServerParams, addr: SocketAddr) -> Result<u64, String> {
     let _g = rt().enter();
-    let endpoint =
-        Endpoint::server(cfg, addr).map_err(|e| format!("cannot listen on {addr}: {e}"))?;
+    let endpoint = Endpoint::server(sp.config.clone(), addr)
+        .map_err(|e| format!("cannot listen on {addr}: {e}"))?;
     let h = next_handle();
+    let closed = Arc::new(AtomicBool::new(false));
     let obj = Arc::new(ListenerObj {
         ctx: ctx.clone(),
         endpoint: endpoint.clone(),
         task: Mutex::new(None),
+        closed: closed.clone(),
     });
     let ctx = ctx.clone();
+    let deadline = sp.handshake;
+    let h3 = sp.h3.then_some(closed);
     let task = rt().spawn(async move {
         let mut handshakes = JoinSet::new();
         loop {
             tokio::select! {
                 inc = endpoint.accept() => match inc {
-                    Some(inc) => { handshakes.spawn(handshake(inc, ctx.clone(), h, deadline)); }
+                    Some(inc) => {
+                        handshakes.spawn(handshake(inc, ctx.clone(), h, deadline, h3.clone()));
+                    }
                     None => break,
                 },
                 Some(_) = handshakes.join_next(), if !handshakes.is_empty() => {}
@@ -438,6 +515,69 @@ pub fn connect(
                 watch(&o, conn);
             }
             Err(f) => o.finish(f.info(&o)),
+        }
+    });
+    obj.add_task(task.abort_handle());
+    Ok(h)
+}
+
+/// Starts a WebTransport session: dials `host:port`, runs HTTP/3 over the connection and sends
+/// the extended CONNECT of `req`. CONNECTED follows the server's 2xx, CLOSED anything else. The
+/// configuration's handshake deadline bounds the QUIC handshake (each attempt), and again the
+/// HTTP/3 exchange (the server's SETTINGS and its response).
+pub fn connect_wt(
+    ctx: &Arc<Ctx>,
+    params: &ClientParams,
+    host: String,
+    port: u16,
+    server_name: String,
+    req: ClientRequest,
+) -> Result<u64, String> {
+    let rejected = Arc::new(AtomicBool::new(false));
+    let cc = client_config(params, rejected.clone())?;
+    let deadline = params.limits.handshake();
+    let obj = ConnObj::with(ctx.clone(), None, rejected, Some(WtSession::client()));
+    let h = obj.handle;
+    lock(&CONNS).insert(h, obj.clone());
+    let o = obj.clone();
+    let task = rt().spawn(async move {
+        let conn = match dial(cc, &host, port, &server_name, deadline).await {
+            Ok(conn) => conn,
+            Err(f) => {
+                let info = f.info(&o);
+                return h3conn::connect_failed(&o, None, info);
+            }
+        };
+        let wt = o.wt.as_ref().expect("a session");
+        let h3 = {
+            let mut slot = lock(&wt.h3);
+            // A close or a release during the handshake recorded `local_close` before it looked
+            // at the slot.
+            if lock(&o.local_close).is_some() {
+                conn.close(VarInt::from_u32(0x10c), b"");
+                return;
+            }
+            let h3 = H3Conn::start(o.ctx.clone(), conn, true, 0, None, deadline);
+            *slot = Some(h3.clone());
+            h3
+        };
+        let r = within(
+            Some(deadline.unwrap_or(h3conn::DEFAULT_REQUEST_TIMEOUT)),
+            h3conn::client_session(&o, &h3, req),
+        )
+        .await;
+        match r {
+            Some(Ok(())) => {}
+            Some(Err(info)) => h3conn::connect_failed(&o, Some(&h3), info),
+            None => h3conn::connect_failed(
+                &o,
+                Some(&h3),
+                CloseInfo {
+                    kind: SBQ_CLOSE_TIMED_OUT,
+                    code: 0,
+                    reason: b"timed out".to_vec(),
+                },
+            ),
         }
     });
     obj.add_task(task.abort_handle());

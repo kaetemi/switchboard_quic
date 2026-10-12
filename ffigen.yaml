@@ -17,13 +17,15 @@ functions:
     - 'sbq_.*'
   # Leaf calls: short, never waiting on anything the notifier thread holds while it rings the
   # doorbell. sbq_init, sbq_shutdown (waits for a doorbell in progress), the configuration
-  # builders, sbq_listen (may resolve a name), sbq_connect and the certificate generator are not.
+  # builders, sbq_listen (creates an endpoint), sbq_connect, sbq_connect_wt and the certificate
+  # generator are not.
   leaf:
     include:
       - 'sbq_(abi_version|poll|last_error|sha256|config_free)'
       - 'sbq_listener_.*'
       - 'sbq_conn_.*'
       - 'sbq_stream_.*'
+      - 'sbq_wt_.*'
 macros:
   include:
     - 'SBQ_.*'
@@ -45,6 +47,7 @@ preamble: |
   Authors:
     Jan Boon <jan.boon@kaetemi.be>
     Claude Opus 5.5 <noreply@anthropic.com>
+    GPT-6 Astra <noreply@openai.com>
   */
 
   // ignore_for_file: type=lint, unused_import

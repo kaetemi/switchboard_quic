@@ -234,6 +234,7 @@ class QuicBindingConnection extends BindingConnection {
   bool _controlWriting = false;
   Completer<void>? _controlDrained;
   Timer? _controlTimer;
+  Timer? _sessionGoneTimer;
   QuicHello? _peerHello;
 
   // The connection.
@@ -507,9 +508,10 @@ class QuicBindingConnection extends BindingConnection {
     _controlReader = reader;
     stream.resetReceived
         .then(
-          (_) {
-            if (!_closing) _protocolError('the control stream was reset');
-          },
+          (code) => _controlAborted(
+            'the control stream was reset',
+            hasCode: code != null,
+          ),
           onError: (Object e) {
             if (!isSessionEnd(e) && !_closing) {
               _lost('control reset notification failed');
@@ -526,8 +528,11 @@ class QuicBindingConnection extends BindingConnection {
             }
           },
           onError: (Object e) {
-            if (e is QuicStreamStopped && !_closing) {
-              _protocolError('STOP_SENDING on the control stream');
+            if (e is QuicStreamStopped) {
+              _controlAborted(
+                'STOP_SENDING on the control stream',
+                hasCode: e.code != null,
+              );
             } else if (!isSessionEnd(e) && !_closing) {
               _lost('control stream acknowledgement failed');
             }
@@ -593,7 +598,10 @@ class QuicBindingConnection extends BindingConnection {
           onError: (Object e) {
             _controlWriting = false;
             if (e is QuicStreamStopped) {
-              _protocolError('STOP_SENDING on the control stream');
+              _controlAborted(
+                'STOP_SENDING on the control stream',
+                hasCode: e.code != null,
+              );
             } else if (!isSessionEnd(e)) {
               _log.warning('$this: control stream write failed: $e');
               _lost('control stream write failed');
@@ -623,8 +631,11 @@ class QuicBindingConnection extends BindingConnection {
       } on ProtocolException catch (e) {
         _fail(e.status);
         return;
-      } on QuicStreamReset {
-        _protocolError('the control stream was reset');
+      } on QuicStreamReset catch (e) {
+        _controlAborted(
+          'the control stream was reset',
+          hasCode: e.code != null,
+        );
         return;
       } on QuicException catch (e) {
         if (!isSessionEnd(e)) {
@@ -1248,6 +1259,32 @@ class QuicBindingConnection extends BindingConnection {
   void _protocolError(String reason) =>
       _fail(Status.of(StatusCode.protocolError, reason));
 
+  /// How long a reset or `STOP_SENDING` without an application code on the
+  /// control stream of a WebTransport session waits for the session's end
+  /// before it counts as a protocol error.
+  static const Duration webTransportSessionGoneGrace = Duration(seconds: 2);
+
+  /// The peer reset or stopped the control stream, which is a protocol
+  /// error, except where it is the end of a WebTransport session: the side
+  /// that terminates a session resets and stops its streams with
+  /// `WT_SESSION_GONE`, which carries no application code and can overtake
+  /// the close itself (`WT_CLOSE_SESSION`, or the end of the CONNECT
+  /// stream). Without a code over WebTransport, the session's end is waited
+  /// for (it ends this connection as the session ends) for
+  /// [webTransportSessionGoneGrace], and only then is it a protocol error.
+  void _controlAborted(String reason, {required bool hasCode}) {
+    if (_closing) {
+      return;
+    }
+    if (!isWebTransport || hasCode) {
+      _protocolError(reason);
+      return;
+    }
+    _sessionGoneTimer ??= Timer(webTransportSessionGoneGrace, () {
+      if (!_closing) _protocolError(reason);
+    });
+  }
+
   /// Ends the connection because the peer broke the protocol (or the
   /// identification rules): an application close carrying [status] at
   /// once, without a GOAWAY first, which could be lost with its stream.
@@ -1335,6 +1372,8 @@ class QuicBindingConnection extends BindingConnection {
     _keepAliveTimer = null;
     _controlTimer?.cancel();
     _controlTimer = null;
+    _sessionGoneTimer?.cancel();
+    _sessionGoneTimer = null;
     _controlQueue.clear();
     for (final stream in _pendingStreams) {
       _release(stream, StatusCode.goingAway.code);

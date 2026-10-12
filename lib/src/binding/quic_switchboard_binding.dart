@@ -33,8 +33,9 @@ const String switchboardAlpn = 'switchboard';
 /// A connector that cannot dial a scheme fails with
 /// [QuicExceptionKind.unsupportedScheme], which the node reads as
 /// `UNIMPLEMENTED` and moves to a record's next endpoint: the native
-/// provider dials `quic` only until its WebTransport layer exists, the web
-/// provider `https` only.
+/// provider dials both, the web provider `https` only. A WebTransport
+/// server that answers with a status other than 2xx (another path, an
+/// origin it refuses) fails the dial with `UNAVAILABLE`.
 ///
 /// Between nodes the acceptor's certificate is self-signed and not
 /// verified ([verifyCertificate] false, no [certificateHashes]), and the
@@ -128,7 +129,10 @@ class QuicSwitchboardBinding extends SwitchboardBinding {
 
   /// Whether the server certificate of an `https` endpoint is verified
   /// (the platform roots, or [certificateHashes] as
-  /// `serverCertificateHashes`). True by default, as a browser does.
+  /// `serverCertificateHashes`). True by default, as a browser does. A node
+  /// dialling another node's WebTransport listener, whose certificate is
+  /// self-signed, passes false (or a pin): the identification rules then
+  /// apply as they do over raw QUIC.
   final bool webTransportCertificateVerified;
 
   /// The most recent 64 connections dialled, for diagnostics and tests.

@@ -8,11 +8,13 @@ Authors:
 */
 
 // The binding over the real native provider: Switchboard nodes in this
-// isolate talking raw QUIC over UDP on the loopback, through quinn. A
-// listener node with a self-signed certificate behind
-// QuicSwitchboardListener; dialling nodes with QuicSwitchboardBinding,
-// which do not verify the certificate, so the identification rules of the
-// binding page apply (QuicIdentityRules.initiator and .listener).
+// isolate talking over UDP on the loopback, through quinn, every case twice:
+// raw QUIC (quic://127.0.0.1:port) and WebTransport sessions
+// (https://127.0.0.1:port/sb, HTTP/3 in the shim). A listener node with a
+// self-signed certificate behind QuicSwitchboardListener; dialling nodes
+// with QuicSwitchboardBinding, which do not verify the certificate, so the
+// identification rules of the binding page apply
+// (QuicIdentityRules.initiator and .listener).
 
 @TestOn('vm')
 library;
@@ -33,6 +35,19 @@ final npc = Name('npc');
 final sink = Name('sink');
 
 late NativeQuicProvider provider;
+
+/// The two kinds of session, and the one the running group uses (set by the
+/// group's setUpAll; the groups run one after the other).
+enum Mode {
+  raw('raw QUIC'),
+  webTransport('WebTransport');
+
+  const Mode(this.label);
+  final String label;
+  bool get wt => this == Mode.webTransport;
+}
+
+Mode current = Mode.raw;
 late NativeCertificate cert;
 late CredentialIssuer authority;
 late HolderKey clientKey;
@@ -88,21 +103,20 @@ Future<QuicSwitchboardListener> listen(
   Duration idle = const Duration(seconds: 30),
   Duration keepAlive = const Duration(seconds: 10),
 }) async {
-  final quic = await provider.listen(
-    '127.0.0.1',
-    0,
-    QuicServerConfig(
-      alpn: const [switchboardAlpn],
-      certificateDer: cert.certificateDer,
-      privateKeyDer: cert.privateKeyDer,
-      // The channels a peer may have open, plus its control stream.
-      maxStreamsBidi: 129,
-      streamReceiveWindow: server.muxOptions.initialWindow,
-      connectionReceiveWindow: server.muxOptions.receiveHighWaterMarkBytes,
-      idleTimeout: idle,
-      keepAlive: keepAlive,
-    ),
+  final config = QuicServerConfig(
+    alpn: const [switchboardAlpn],
+    certificateDer: cert.certificateDer,
+    privateKeyDer: cert.privateKeyDer,
+    // The channels a peer may have open, plus its control stream.
+    maxStreamsBidi: 129,
+    streamReceiveWindow: server.muxOptions.initialWindow,
+    connectionReceiveWindow: server.muxOptions.receiveHighWaterMarkBytes,
+    idleTimeout: idle,
+    keepAlive: keepAlive,
   );
+  final QuicListener quic = current.wt
+      ? await provider.listenWebTransport('127.0.0.1', 0, config, path: '/sb')
+      : await provider.listen('127.0.0.1', 0, config);
   final listener = await QuicSwitchboardListener.start(
     server,
     quic,
@@ -112,6 +126,20 @@ Future<QuicSwitchboardListener> listen(
   addTearDown(listener.close);
   return listener;
 }
+
+/// A dialling binding over the provider: the certificate is not verified
+/// (identity comes from IDENT), unless pinned.
+QuicSwitchboardBinding dialler({
+  List<Uint8List> certificateHashes = const [],
+  Duration idleTimeout = const Duration(seconds: 30),
+  Duration? keepAlive,
+}) => QuicSwitchboardBinding(
+  provider,
+  certificateHashes: certificateHashes,
+  idleTimeout: idleTimeout,
+  keepAlive: keepAlive,
+  webTransportCertificateVerified: false,
+);
 
 /// A Talk service answering every request with its payload.
 void echoService(IncomingChannel incoming) {
@@ -166,6 +194,21 @@ void main() {
 
   tearDownAll(NativeQuicProvider.shutdown);
 
+  for (final mode in Mode.values) {
+    group(mode.label, () {
+      setUpAll(() => current = mode);
+      cases();
+    });
+  }
+
+  group('WebTransport only', () {
+    setUpAll(() => current = Mode.webTransport);
+    webTransportCases();
+  });
+}
+
+/// The cases of the binding over the provider, over the [current] mode.
+void cases() {
   group('identity', () {
     test('nodes identify both ways with exporter-bound proofs over the TLS '
         'exporter both ends derived', () async {
@@ -176,7 +219,7 @@ void main() {
       );
       server.registerService(npc, answer);
       final listener = await listen(server, policy: ChannelPolicies.scoped());
-      final binding = QuicSwitchboardBinding(provider);
+      final binding = dialler();
       final client = node(
         bindings: [binding],
         verifier: await verifier(),
@@ -197,6 +240,9 @@ void main() {
       final accepted = listener.accepted.single;
       expect(initiated.session, isA<NativeQuicSession>());
       expect(initiated.session.protocol, 'switchboard');
+      expect(listener.endpoint.scheme, current.wt ? 'https' : 'quic');
+      expect(initiated.isWebTransport, current.wt);
+      expect(accepted.isWebTransport, current.wt);
       expect(initiated.session.peerCertificateHash, cert.sha256);
       expect(initiated.quicOptions.identity.awaitPeerIdentity, isTrue);
       expect(initiated.exporterBound, isTrue);
@@ -215,7 +261,7 @@ void main() {
       expect(accepted.exporterForTesting, exporter);
       // Another session derives another.
       final other = node(
-        bindings: [QuicSwitchboardBinding(provider)],
+        bindings: [dialler()],
         verifier: await verifier(),
         credential: await credential('npc-8', clientKey),
         holderKey: clientKey,
@@ -243,7 +289,7 @@ void main() {
       );
       server.registerService(npc, answer);
       final listener = await listen(server, policy: ChannelPolicies.scoped());
-      final binding = QuicSwitchboardBinding(provider);
+      final binding = dialler();
       final client = node(bindings: [binding]);
       final channel = await client.openChannelAt(
         listener.endpoint,
@@ -270,10 +316,7 @@ void main() {
       final server = node();
       server.registerService(npc, answer);
       final listener = await listen(server);
-      final pinned = QuicSwitchboardBinding(
-        provider,
-        certificateHashes: [cert.sha256],
-      );
+      final pinned = dialler(certificateHashes: [cert.sha256]);
       final client = node(bindings: [pinned]);
       expect(
         await answerOf(
@@ -290,10 +333,7 @@ void main() {
       expect(connection.session.peerCertificateHash, cert.sha256);
       final wrong = node(
         bindings: [
-          QuicSwitchboardBinding(
-            provider,
-            certificateHashes: [Uint8List(32)..fillRange(0, 32, 0xA5)],
-          ),
+          dialler(certificateHashes: [Uint8List(32)..fillRange(0, 32, 0xA5)]),
         ],
       );
       await expectLater(
@@ -308,7 +348,7 @@ void main() {
       final server = node();
       server.registerService(echo, echoService);
       final listener = await listen(server);
-      final binding = QuicSwitchboardBinding(provider);
+      final binding = dialler();
       final client = node(bindings: [binding]);
       final talk = await client.openTalkAt(
         listener.endpoint,
@@ -327,7 +367,7 @@ void main() {
       final server = node();
       server.registerService(echo, echoService);
       final listener = await listen(server);
-      final client = node(bindings: [QuicSwitchboardBinding(provider)]);
+      final client = node(bindings: [dialler()]);
       final talk = await client.openTalkAt(
         listener.endpoint,
         ChannelAddress(type: echo),
@@ -363,7 +403,7 @@ void main() {
         );
       });
       final listener = await listen(server);
-      final client = node(bindings: [QuicSwitchboardBinding(provider)]);
+      final client = node(bindings: [dialler()]);
       final talk = await client.openTalkAt(
         listener.endpoint,
         ChannelAddress(type: echo),
@@ -421,7 +461,7 @@ void main() {
           keepAliveInterval: null,
           closeConfirmTimeout: Duration(milliseconds: 300),
         ),
-        bindings: [QuicSwitchboardBinding(provider)],
+        bindings: [dialler()],
       );
       final channel = await client.openChannelAt(
         listener.endpoint,
@@ -451,7 +491,7 @@ void main() {
       server.registerService(echo, echoService);
       // 129 streams: 128 channels and the control stream.
       final listener = await listen(server);
-      final binding = QuicSwitchboardBinding(provider);
+      final binding = dialler();
       final client = node(bindings: [binding]);
       for (var round = 0; round < 3; round++) {
         final results = await Future.wait([
@@ -494,10 +534,7 @@ void main() {
           });
         });
         final listener = await listen(server);
-        final client = node(
-          options: options,
-          bindings: [QuicSwitchboardBinding(provider)],
-        );
+        final client = node(options: options, bindings: [dialler()]);
         final channel = await client.openChannelAt(
           listener.endpoint,
           ChannelAddress(type: sink),
@@ -546,7 +583,7 @@ void main() {
       final server = node();
       server.registerService(echo, echoService);
       final listener = await listen(server);
-      final binding = QuicSwitchboardBinding(provider);
+      final binding = dialler();
       final client = node(bindings: [binding]);
       // An open channel: the receiver of the GOAWAY keeps the connection
       // while it lasts, so the close is the GOAWAY sender's, after its
@@ -582,7 +619,7 @@ void main() {
       final server = node();
       server.registerService(echo, echoService);
       final listener = await listen(server);
-      final binding = QuicSwitchboardBinding(provider);
+      final binding = dialler();
       final client = node(bindings: [binding]);
       final talk = await client.openTalkAt(
         listener.endpoint,
@@ -622,11 +659,7 @@ void main() {
         idle: idle,
         keepAlive: Duration.zero,
       );
-      final binding = QuicSwitchboardBinding(
-        provider,
-        idleTimeout: idle,
-        keepAlive: Duration.zero,
-      );
+      final binding = dialler(idleTimeout: idle, keepAlive: Duration.zero);
       // No keep-alive, neither the stack's nor the control PING ([fast]):
       // nothing is sent once the request is answered.
       final client = node(bindings: [binding]);
@@ -663,7 +696,7 @@ void main() {
       );
       // The control PING is off ([fast]); the binding's stack keep-alive is
       // not.
-      final binding = QuicSwitchboardBinding(provider, idleTimeout: idle);
+      final binding = dialler(idleTimeout: idle);
       final client = node(bindings: [binding]);
       final talk = await client.openTalkAt(
         listener.endpoint,
@@ -700,7 +733,7 @@ void main() {
     final proxy = node(resolver: resolver);
     proxy.catchAll = proxyHandler(proxy);
     final front = await listen(proxy, rules: QuicIdentityRules.none);
-    final client = node(bindings: [QuicSwitchboardBinding(provider)]);
+    final client = node(bindings: [dialler()]);
     final talk = await client.openTalkAt(
       front.endpoint,
       ChannelAddress(type: echo),
@@ -717,6 +750,88 @@ void main() {
     expect(replies[0].payload, first);
     expect(replies[1].payload, second);
     expect(received, [bytes('through'), first, second]);
+  });
+}
+
+/// The cases particular to WebTransport.
+void webTransportCases() {
+  test('the exporter the proofs signed is the session\'s, with the label '
+      'switchboard-ident', () async {
+    final server = node(
+      verifier: await verifier(),
+      credential: await credential('server-1', serverKey),
+      holderKey: serverKey,
+    );
+    server.registerService(npc, answer);
+    final listener = await listen(server, policy: ChannelPolicies.scoped());
+    final binding = dialler();
+    final client = node(
+      bindings: [binding],
+      verifier: await verifier(),
+      credential: await credential('npc-7', clientKey),
+      holderKey: clientKey,
+    );
+    expect(
+      await answerOf(
+        await client.openChannelAt(
+          listener.endpoint,
+          ChannelAddress(type: npc),
+        ),
+      ),
+      'npc for npc-7',
+    );
+    final initiated = binding.dialled.single;
+    final exported = await initiated.session.exportKeyingMaterial(
+      'switchboard-ident',
+      Uint8List(0),
+      32,
+    );
+    expect(initiated.exporterForTesting, exported);
+    expect(listener.accepted.single.exporterForTesting, exported);
+    expect(initiated.peerIdentityBound, isTrue);
+    expect(listener.accepted.single.peerIdentityBound, isTrue);
+  });
+
+  test('a dial to another path is refused, and fails UNAVAILABLE', () async {
+    final server = node();
+    server.registerService(npc, answer);
+    final listener = await listen(server);
+    final client = node(bindings: [dialler()]);
+    final elsewhere = listener.endpoint.replace(path: '/elsewhere');
+    await expectLater(
+      client.connect(elsewhere),
+      throwsCode(StatusCode.unavailable),
+    );
+    expect((listener.listener as NativeWebTransportListener).answered[404], 1);
+  });
+
+  test('a WT_DRAIN_SESSION reads as a GOAWAY with GOING_AWAY, and the '
+      'dialler closes once its channels are done', () async {
+    final server = node();
+    server.registerService(echo, echoService);
+    final listener = await listen(server);
+    final binding = dialler();
+    final client = node(bindings: [binding]);
+    final talk = await client.openTalkAt(
+      listener.endpoint,
+      ChannelAddress(type: echo),
+    );
+    await talk.request('ECHO', bytes('x')).timeout(limit);
+    final connection = binding.dialled.single;
+    final accepted = listener.accepted.single;
+    (accepted.session as NativeQuicSession).drain();
+    expect(
+      await connection.peerGoAwayStatus.timeout(limit),
+      hasCode(StatusCode.goingAway),
+    );
+    // The channel open at the drain still works; the dialler closes once it
+    // is done.
+    expect(text((await talk.request('ECHO', bytes('still'))).payload), 'still');
+    await talk.close().timeout(limit);
+    expect(await connection.done.timeout(limit), hasCode(StatusCode.goingAway));
+    final end = await accepted.session.done.timeout(limit);
+    expect(end.lost, isFalse);
+    expect(end.byPeer, isTrue);
   });
 }
 

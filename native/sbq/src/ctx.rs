@@ -27,6 +27,7 @@ use std::task::Wake;
 
 use crate::config::ConfigObj;
 use crate::conn::{ConnObj, ListenerObj};
+use crate::h3conn::H3Conn;
 use crate::stream::StreamObj;
 
 /// The doorbell: called from the notifier thread, with the context id, when the context's event
@@ -216,6 +217,9 @@ pub(crate) static CONFIGS: Table<ConfigObj> = LazyLock::new(Default::default);
 pub(crate) static LISTENERS: Table<ListenerObj> = LazyLock::new(Default::default);
 pub(crate) static CONNS: Table<ConnObj> = LazyLock::new(Default::default);
 pub(crate) static STREAMS: Table<StreamObj> = LazyLock::new(Default::default);
+/// The HTTP/3 connections, by an id of their own (not a handle of the ABI): what
+/// `sbq_shutdown` closes besides the handles.
+pub(crate) static H3S: Table<H3Conn> = LazyLock::new(Default::default);
 
 pub fn get<T>(table: &Table<T>, h: u64) -> Option<Arc<T>> {
     lock(table).get(&h).cloned()

@@ -90,3 +90,67 @@
   negative `idleTimeout` or `keepAlive` when constructed. The provider
   contract says so of its configurations, and the fake provider checks
   it too.
+* WebTransport over HTTP/3 in the native provider. The shim (ABI 4) has
+  an HTTP/3 layer of its own (no HTTP/3 or WebTransport crate): SETTINGS,
+  the control and QPACK streams, a QPACK of static references and
+  literals with Huffman decoding that refuses the dynamic table, extended
+  CONNECT, the WebTransport stream headers, capsules, the mapping of
+  application codes into the HTTP/3 space and the per-session exporter.
+  It speaks the draft-02 signalling of Chrome 149 and the draft-07
+  signalling of web-transport-quinn 0.13.2, both with the
+  `WT-Available-Protocols` / `WT-Protocol` negotiation, as client and
+  server, and bounds everything a peer sends. A session is a handle the
+  stream and connection calls take; `sbq_connect_wt` dials one, a
+  listener whose ALPN offers `h3` posts `WT_REQUEST` for the embedder to
+  accept or reject (503 when not answered in time), and `sbq_wt_drain`
+  sends `WT_DRAIN_SESSION`.
+* `NativeQuicProvider` dials `https://host:port/path` as a WebTransport
+  session (`connectWebTransport` with an `Origin`), offering
+  `QuicClientConfig.alpn` as the protocols, and `listenWebTransport`
+  serves one path: 404 for another, 403 for an origin not allowed, 400
+  for protocols of which none is served, 503 after `close`; its sessions
+  carry their request (`requestPath`, `requestOrigin`,
+  `requestProtocols`, `requestDraft`). Over WebTransport, stream and
+  close codes are WebTransport codes (up to 2^32 - 1), a reset or
+  `STOP_SENDING` outside that range has no code, `draining` completes on
+  `WT_DRAIN_SESSION` or `GOAWAY` (`NativeQuicSession.drain` sends one),
+  and the peer's unidirectional streams are delivered for refusal.
+* Provider contract: `QuicExceptionKind.refused` (a WebTransport
+  response other than 2xx); the connector, protocol, reset and
+  configuration documentation say what WebTransport changes; a
+  `STOP_SENDING` without a code fails `stopped` in the native provider
+  (it completed it with null, which the contract reserves for an
+  acknowledgement).
+* The binding, over WebTransport: a reset or `STOP_SENDING` without a
+  code on the control stream (the peer's `WT_SESSION_GONE`, which may
+  overtake its close) waits up to two seconds for the session's end
+  before it counts as a protocol error.
+* Tests: the native provider and integration suites run their cases over
+  raw QUIC and over WebTransport, with cases of their own for each (a
+  node-to-node connection over `https://127.0.0.1:port/sb` with
+  exporter-bound identification both ways among them); the shim's tests
+  cover the codecs against the RFC examples and the binding page's
+  vectors, sessions through the ABI, and a misbehaving client on raw
+  quinn streams. `tool/native_smoke.dart` (JIT and AOT) runs a
+  WebTransport session and the binding over it; `tool/browser_smoke.sh`
+  runs headless Chromium against a listener of the native provider.
+* The HTTP/3 layer after review: stricter validation of framing,
+  SETTINGS, QPACK prefixes, Huffman padding, Structured Fields
+  parameters, field names and values, CONNECT trailers and capsules;
+  outstanding request handles bounded with the sessions of a
+  connection; the streams of sessions that are gone told from those of
+  sessions still to come without a history; every stream the layer gives
+  up stopped or reset explicitly, a cancelled task's included, and a FIN
+  once sent never reset. Fixed: a stream header cut short by a small
+  window stalled the stream; protocol names of 128 to 255 bytes; a
+  draft-02 server without `ENABLE_CONNECT_PROTOCOL`; a CONNECT after an
+  HTTP/3 `GOAWAY`. `sbq_listen` takes an address literal (the provider
+  resolves a listen name asynchronously).
+* A local WebTransport close completes (`CLOSED` in the shim, `close()`
+  and `done` in the provider) once the peer's stack acknowledged it, or
+  after a bounded wait (three round trips, 0.2 to 2 s), so that a
+  provider disposed of right after does not cut the close short; the
+  provider contract says so. A WebTransport listener routes by path
+  only: the `:authority` a client used is not checked (it is
+  `requestAuthority`). The HTTP/3 exchanges keep a 10 s deadline when
+  the handshake deadline is zero, as the contract now says.

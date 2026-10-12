@@ -856,6 +856,57 @@ void main() {
       expect((await raw.end).code, StatusCode.protocolError.code);
     });
 
+    test('over WebTransport, a control stream reset without a code (the '
+        'peer\'s WT_SESSION_GONE) waits for the session\'s end, which ends '
+        'the connection as the close says', () async {
+      final (connection, raw) = await bindingAndRaw(isWebTransport: true);
+      await until(() => connection.peerHello != null);
+      (raw.control! as FakeQuicStream).resetWithoutCode();
+      await settle(100);
+      expect(connection.isOpen, isTrue);
+      await raw.session.close(StatusCode.unavailable.code, 'upgrade');
+      // A received close: a GOAWAY with its status, then the end.
+      expect(
+        await connection.peerGoAwayStatus.timeout(limit),
+        Status.of(StatusCode.unavailable, 'upgrade'),
+      );
+      expect(
+        await connection.done.timeout(limit),
+        hasCode(StatusCode.goingAway),
+      );
+    });
+
+    test('over WebTransport, STOP_SENDING without a code on the control '
+        'stream that no session end follows is a protocol error after the '
+        'grace', () async {
+      final (connection, raw) = await bindingAndRaw(isWebTransport: true);
+      await until(() => connection.peerHello != null);
+      final watch = Stopwatch()..start();
+      (raw.control! as FakeQuicStream).stopWithoutCode();
+      expect(
+        await connection.done.timeout(const Duration(seconds: 10)),
+        hasCode(StatusCode.protocolError),
+      );
+      expect(
+        watch.elapsed,
+        greaterThanOrEqualTo(
+          QuicBindingConnection.webTransportSessionGoneGrace -
+              const Duration(milliseconds: 50),
+        ),
+      );
+    });
+
+    test('over WebTransport, a control stream reset with a code is a '
+        'protocol error at once', () async {
+      final (connection, raw) = await bindingAndRaw(isWebTransport: true);
+      await until(() => connection.peerHello != null);
+      raw.control!.reset(StatusCode.cancelled.code);
+      expect(
+        await connection.done.timeout(limit),
+        hasCode(StatusCode.protocolError),
+      );
+    });
+
     test('the control stream is not read while this side\'s control output '
         'backs up', () async {
       final (connection, raw) = await bindingAndRaw(

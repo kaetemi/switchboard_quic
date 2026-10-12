@@ -5,6 +5,7 @@ Copyright (C) 2018-2026  Jan BOON (Kaetemi)
 Authors:
   Jan Boon <jan.boon@kaetemi.be>
   Claude Opus 5.5 <noreply@anthropic.com>
+  GPT-6 Astra <noreply@openai.com>
 */
 
 // ignore_for_file: type=lint, unused_import
@@ -27,9 +28,10 @@ external int sbq_abi_version();
 @ffi.Native<ffi.Uint64 Function(SbqDoorbell, ffi.Uint32)>()
 external int sbq_init(SbqDoorbell doorbell, int worker_threads);
 
-/// Ends a context: closes its connections (code 0) and listeners, drops its streams and queued
-/// events. When it returns, the doorbell will not be called again for this context. Not a leaf
-/// call: it waits for a doorbell call in progress.
+/// Ends a context: closes its connections (code 0), WebTransport sessions and their HTTP/3
+/// connections, and listeners, drops its streams and queued events. When it returns, the
+/// doorbell will not be called again for this context. Not a leaf call: it waits for a doorbell
+/// call in progress.
 @ffi.Native<ffi.Int32 Function(ffi.Uint64)>()
 external int sbq_shutdown(int ctx_id);
 
@@ -85,13 +87,14 @@ external int sbq_generate_self_signed(
 );
 
 /// Creates a client configuration. `alpn` is the ALPN list in wire form (each token preceded by
-/// its length byte); `verify` one of `SBQ_VERIFY_*`; `pins` `pin_count` SHA-256 hashes of 32
-/// bytes each (`SBQ_VERIFY_PINNED`); `max_bidi` the bidirectional streams the server may open at
-/// once; windows in bytes; times in milliseconds, 0 for none. `handshake_ms` bounds each
-/// handshake attempt of a connect (one per address tried): CLOSED with `SBQ_CLOSE_TIMED_OUT`
-/// follows when none completed in time; with 0 the idle timeout alone bounds the handshake, and
-/// with both 0 nothing does. 0-RTT is never used. Returns the configuration handle (free it with
-/// `sbq_config_free`) or an error.
+/// its length byte; a list that offers `h3` gives the connection HTTP/3's transport parameters:
+/// 16 unidirectional streams and the datagram parameter); `verify` one of `SBQ_VERIFY_*`;
+/// `pins` `pin_count` SHA-256 hashes of 32 bytes each (`SBQ_VERIFY_PINNED`); `max_bidi` the
+/// bidirectional streams the server may open at once; windows in bytes; times in milliseconds,
+/// 0 for none. `handshake_ms` bounds each handshake attempt of a connect (one per address
+/// tried): CLOSED with `SBQ_CLOSE_TIMED_OUT` follows when none completed in time; with 0 the
+/// idle timeout alone bounds the handshake, and with both 0 nothing does. 0-RTT is never used.
+/// Returns the configuration handle (free it with `sbq_config_free`) or an error.
 @ffi.Native<
   ffi.Int64 Function(
     ffi.Pointer<ffi.Uint8>,
@@ -127,7 +130,11 @@ external int sbq_client_config(
 /// once). `handshake_ms` bounds the handshake of each connection the listener accepts: one not
 /// complete by then is abandoned (closed) and never announced; 0 leaves it to the idle timeout,
 /// and with both 0 a client that goes silent mid-handshake is kept until the listener closes.
-/// TLS 1.3 only, no client authentication, no 0-RTT.
+/// TLS 1.3 only, no client authentication, no 0-RTT. A list that offers `h3` makes a listener of
+/// WebTransport: its connections that negotiate `h3` run HTTP/3 (WT_REQUEST events instead of
+/// INCOMING), with HTTP/3's transport parameters (16 unidirectional streams, the datagram
+/// parameter, `max_bidi` + 1 bidirectional streams for the CONNECT stream), which then apply to
+/// every connection of the listener; `handshake_ms` also bounds a request's wait for its answer.
 @ffi.Native<
   ffi.Int64 Function(
     ffi.Pointer<ffi.Uint8>,
@@ -163,8 +170,9 @@ external int sbq_server_config(
 @ffi.Native<ffi.Int32 Function(ffi.Uint64)>(isLeaf: true)
 external int sbq_config_free(int config);
 
-/// Listens on `host` (an address, UTF-8, or a name resolved now) and `port` (0 for any) with a
-/// server configuration. Returns the listener handle; INCOMING events follow.
+/// Listens on `host` (an IP address literal, UTF-8; a name is `SBQ_ERR_ARG`, since resolving
+/// it here could block: resolve it before) and `port` (0 for any) with a server configuration.
+/// Returns the listener handle; INCOMING events follow (WT_REQUEST for HTTP/3).
 @ffi.Native<
   ffi.Int64 Function(
     ffi.Uint64,
@@ -217,9 +225,109 @@ external int sbq_connect(
   int server_name_len,
 );
 
+/// Starts a WebTransport session: connects to `host` and `port` as `sbq_connect` does (the
+/// configuration's ALPN list must offer `h3`), then sends the extended CONNECT for
+/// `https://authority/path` (`authority` is the `:authority`, `host:port` without the default
+/// port 443; `path` the `:path`), with `origin` as its `Origin` when not empty (browsers send
+/// one, nodes need not), and offering `protocols` (wire form of an ALPN list, printable ASCII
+/// each; empty for none) in `WT-Available-Protocols`. The request carries the draft-02 header
+/// too, and SETTINGS advertise draft-02 and draft-07. Returns the session handle at once;
+/// CONNECTED follows the server's 2xx (the selected protocol from `sbq_conn_protocol`, the
+/// exporter from `sbq_conn_exporter`), or CLOSED: `SBQ_CLOSE_REFUSED` with the HTTP status for
+/// another response, `SBQ_CLOSE_OTHER` for a protocol that was not offered, `SBQ_CLOSE_H3_LOCAL`
+/// for a server without WebTransport, the kinds of `sbq_connect` for the QUIC handshake. The
+/// configuration's handshake deadline bounds the QUIC handshake and again the HTTP/3 exchange
+/// (`SBQ_CLOSE_TIMED_OUT`); a zero handshake deadline uses 10 seconds for HTTP/3.
+/// The session uses its QUIC connection alone, which is closed when the
+/// session ends.
+@ffi.Native<
+  ffi.Int64 Function(
+    ffi.Uint64,
+    ffi.Uint64,
+    ffi.Pointer<ffi.Uint8>,
+    ffi.Size,
+    ffi.Uint16,
+    ffi.Pointer<ffi.Uint8>,
+    ffi.Size,
+    ffi.Pointer<ffi.Uint8>,
+    ffi.Size,
+    ffi.Pointer<ffi.Uint8>,
+    ffi.Size,
+    ffi.Pointer<ffi.Uint8>,
+    ffi.Size,
+    ffi.Pointer<ffi.Uint8>,
+    ffi.Size,
+  )
+>()
+external int sbq_connect_wt(
+  int ctx_id,
+  int config,
+  ffi.Pointer<ffi.Uint8> host,
+  int host_len,
+  int port,
+  ffi.Pointer<ffi.Uint8> server_name,
+  int server_name_len,
+  ffi.Pointer<ffi.Uint8> authority,
+  int authority_len,
+  ffi.Pointer<ffi.Uint8> path,
+  int path_len,
+  ffi.Pointer<ffi.Uint8> origin,
+  int origin_len,
+  ffi.Pointer<ffi.Uint8> protocols,
+  int protocols_len,
+);
+
+/// Copies a field of a WebTransport request (`SBQ_WT_*`) into `out` (up to `cap` bytes); returns
+/// its full length, `SBQ_ERR_STATE` when the request has no such field (no `Origin`) or the
+/// session is not a server's, `SBQ_ERR_ARG` for an unknown field.
+@ffi.Native<
+  ffi.Int64 Function(ffi.Uint64, ffi.Int32, ffi.Pointer<ffi.Uint8>, ffi.Size)
+>(isLeaf: true)
+external int sbq_wt_request(
+  int session,
+  int field,
+  ffi.Pointer<ffi.Uint8> out,
+  int cap,
+);
+
+/// Accepts a pending WebTransport request with the protocol `protocol` (one the client offered;
+/// empty for none): the 2xx response goes out (with `WT-Protocol`, and the draft-02 header to a
+/// draft-02 client), and the session is live when this returns `SBQ_OK`: streams the client
+/// opened meanwhile follow as STREAM events. `SBQ_ERR_STATE` when it is not pending (answered,
+/// or refused for lack of an answer), `SBQ_ERR_ARG` for a protocol not offered.
+@ffi.Native<ffi.Int32 Function(ffi.Uint64, ffi.Pointer<ffi.Uint8>, ffi.Size)>(
+  isLeaf: true,
+)
+external int sbq_wt_accept(
+  int session,
+  ffi.Pointer<ffi.Uint8> protocol,
+  int protocol_len,
+);
+
+/// Refuses a pending WebTransport request with an HTTP status (300 to 599: 403 for an origin
+/// not allowed, 404 for another path, 503 while shutting down, ...); then release the handle (no
+/// CLOSED follows). The streams the client opened for it are refused with WT_SESSION_GONE.
+@ffi.Native<ffi.Int32 Function(ffi.Uint64, ffi.Uint32)>(isLeaf: true)
+external int sbq_wt_reject(int session, int status);
+
+/// Sends WT_DRAIN_SESSION on a live WebTransport session (at most once; later calls do
+/// nothing): the peer's DRAINING.
+@ffi.Native<ffi.Int32 Function(ffi.Uint64)>(isLeaf: true)
+external int sbq_wt_drain(int session);
+
 /// Closes a connection with an application error code (CONNECTION_CLOSE 0x1d) and a reason;
 /// during the handshake, abandons it. CLOSED follows (`SBQ_CLOSE_APP_LOCAL`, unless the peer's
 /// close arrived first). Data in flight is discarded.
+///
+/// A WebTransport session: `code` is a u32 (`SBQ_ERR_ARG` beyond) and the reason is cut to 1024
+/// bytes at a character boundary (invalid UTF-8 is `SBQ_ERR_ARG`); a live session sends
+/// WT_CLOSE_SESSION with them and FIN on its CONNECT stream, and its streams fail at once.
+/// Once the peer's stack acknowledged the capsule and FIN, or three round trips passed without
+/// that (within 0.2 to 2 s), the session's streams are reset and stopped with WT_SESSION_GONE
+/// and CLOSED (`SBQ_CLOSE_APP_LOCAL`) is posted: an embedder may tear down its context then
+/// without cutting the close short. The QUIC connection is closed once its last session has,
+/// and the peer has closed the CONNECT stream (or the same wait passed). A client's session
+/// still connecting is abandoned; a pending request is refused 503.
 @ffi.Native<
   ffi.Int32 Function(ffi.Uint64, ffi.Uint64, ffi.Pointer<ffi.Uint8>, ffi.Size)
 >(isLeaf: true)
@@ -230,7 +338,8 @@ external int sbq_conn_close(
   int reason_len,
 );
 
-/// Forgets a connection and its streams; one still open is closed with code 0 first.
+/// Forgets a connection and its streams; one still open is closed with code 0 first (a session:
+/// WT_CLOSE_SESSION 0, no CLOSED event).
 @ffi.Native<ffi.Int32 Function(ffi.Uint64)>(isLeaf: true)
 external int sbq_conn_release(int conn);
 
@@ -250,6 +359,11 @@ external int sbq_conn_close_reason(
 /// bytes for `label` and `context` (an empty context equals no context in TLS 1.3).
 /// `SBQ_ERR_STATE` before the handshake completed; `SBQ_ERR_ARG` for a length the exporter
 /// cannot produce (more than 255 times the hash length of the cipher suite).
+///
+/// A WebTransport session: the draft's per-session exporter, the TLS exporter with the label
+/// `EXPORTER-WebTransport` and the context `session ID (u64, big endian) || len8 label || label
+/// || len8 context || context`; `label` and `context` at most 255 bytes each. Available from
+/// CONNECTED on a client, from WT_REQUEST on a server.
 @ffi.Native<
   ffi.Int32 Function(
     ffi.Uint64,
@@ -279,7 +393,8 @@ external int sbq_conn_exporter(
 external int sbq_conn_peer_cert_sha256(int conn, ffi.Pointer<ffi.Uint8> out);
 
 /// Copies the negotiated ALPN protocol into `out` (up to `cap` bytes); returns its full length,
-/// or `SBQ_ERR_STATE` when none was negotiated.
+/// or `SBQ_ERR_STATE` when none was negotiated. A WebTransport session: the protocol selected
+/// with `WT-Protocol` (length 0 when none), `SBQ_ERR_STATE` before the session is established.
 @ffi.Native<ffi.Int64 Function(ffi.Uint64, ffi.Pointer<ffi.Uint8>, ffi.Size)>(
   isLeaf: true,
 )
@@ -291,7 +406,9 @@ external int sbq_conn_protocol(int conn, ffi.Pointer<ffi.Uint8> out, int cap);
 )
 external int sbq_conn_remote(int conn, ffi.Pointer<ffi.Uint8> out, int cap);
 
-/// Changes how many bidirectional streams the peer may have open at once (MAX_STREAMS).
+/// Changes how many bidirectional streams the peer may have open at once (MAX_STREAMS). On a
+/// WebTransport session, the limit of its QUIC connection: `count` plus the CONNECT stream (the
+/// sessions pooled on a connection share it).
 @ffi.Native<ffi.Int32 Function(ffi.Uint64, ffi.Uint64)>(isLeaf: true)
 external int sbq_conn_set_max_bidi(int conn, int count);
 
@@ -303,20 +420,26 @@ external int sbq_conn_stats(int conn, ffi.Pointer<SbqStats> out);
 /// otherwise `SBQ_WOULD_BLOCK` and an OPENED event carries the stream once it does (one event
 /// per blocked call). Nothing reaches the peer before the first write. `SBQ_ERR_STATE` during
 /// the handshake; `SBQ_ERR_CONNECTION` once the connection has ended, also when its handshake
-/// never completed.
+/// never completed. On a WebTransport session the stream carries the session's header;
+/// `SBQ_ERR_STATE` before the session is live, `SBQ_ERR_CONNECTION` once the session or its
+/// connection has ended.
 @ffi.Native<ffi.Int64 Function(ffi.Uint64)>(isLeaf: true)
 external int sbq_stream_open(int conn);
 
 /// Writes up to `len` (> 0) bytes; returns how many were accepted (the peer's flow control
 /// credit bounds it), `SBQ_WOULD_BLOCK` (WRITABLE follows), the peer's STOP_SENDING code at or
-/// below `-SBQ_CODE_BASE` (the direction has been reset with it), or an error.
+/// below `-SBQ_CODE_BASE` (the direction has been reset with it; `SBQ_NO_CODE` on a WebTransport
+/// stream for a code outside the application range), or an error (`SBQ_ERR_STATE` on a stream
+/// without a send direction). On a stream of a WebTransport session this side opened, the stream
+/// header goes first, ahead of the data and the FIN.
 @ffi.Native<ffi.Int64 Function(ffi.Uint64, ffi.Pointer<ffi.Uint8>, ffi.Size)>(
   isLeaf: true,
 )
 external int sbq_stream_write(int stream, ffi.Pointer<ffi.Uint8> data, int len);
 
 /// Reads up to `cap` (> 0) bytes into `buf`; returns how many, `SBQ_WOULD_BLOCK` (READABLE
-/// follows), `SBQ_FIN`, the peer's reset code at or below `-SBQ_CODE_BASE`, or an error.
+/// follows), `SBQ_FIN`, the peer's reset code at or below `-SBQ_CODE_BASE` (`SBQ_NO_CODE` as for
+/// writes), or an error.
 /// Data not read stays in quinn and holds back the peer's flow control credit.
 @ffi.Native<ffi.Int64 Function(ffi.Uint64, ffi.Pointer<ffi.Uint8>, ffi.Size)>(
   isLeaf: true,
@@ -335,17 +458,22 @@ external int sbq_stream_poll_reset(int stream);
 
 /// Finishes the send direction (FIN after everything written). FINISHED_ACKED follows once the
 /// peer acknowledged every byte. Returns `SBQ_OK`, the code of a STOP_SENDING received, or an
-/// error.
+/// error; on a WebTransport stream whose header could not be written yet, `SBQ_RETRY`
+/// (WRITABLE follows; call again).
 @ffi.Native<ffi.Int64 Function(ffi.Uint64)>(isLeaf: true)
 external int sbq_stream_finish(int stream);
 
 /// Resets the send direction with `code` (RESET_STREAM); also after a finish, to abandon what is
-/// not acknowledged yet. A no-op on a direction reset already.
+/// not acknowledged yet. A no-op on a direction reset already. On a WebTransport stream `code` is
+/// an application code (u32, mapped into the HTTP/3 space); `SBQ_ERR_ARG` beyond. Without
+/// RESET_STREAM_AT (quinn has none) a reset may lose the stream header with the data, and the
+/// peer then cannot tell which session the reset stream belonged to.
 @ffi.Native<ffi.Int64 Function(ffi.Uint64, ffi.Uint64)>(isLeaf: true)
 external int sbq_stream_reset(int stream, int code);
 
 /// Asks the peer to stop sending with `code` (STOP_SENDING); the receive direction ends here at
-/// once, and data still arriving is discarded. A no-op once the direction has ended.
+/// once, and data still arriving is discarded. A no-op once the direction has ended. Codes as for
+/// `sbq_stream_reset`.
 @ffi.Native<ffi.Int64 Function(ffi.Uint64, ffi.Uint64)>(isLeaf: true)
 external int sbq_stream_stop(int stream, int code);
 
@@ -415,7 +543,7 @@ final class SbqStats extends ffi.Struct {
   external int udp_rx_datagrams;
 }
 
-const int SBQ_ABI_VERSION = 3;
+const int SBQ_ABI_VERSION = 4;
 
 const int SBQ_OK = 0;
 
@@ -439,6 +567,10 @@ const int SBQ_ERR_STATE = -8;
 
 const int SBQ_ERR_INIT = -9;
 
+const int SBQ_NO_CODE = -10;
+
+const int SBQ_RETRY = -11;
+
 const int SBQ_CODE_BASE = 16;
 
 const int SBQ_EV_INCOMING = 1;
@@ -459,6 +591,12 @@ const int SBQ_EV_STOPPED = 8;
 
 const int SBQ_EV_FINISHED_ACKED = 9;
 
+const int SBQ_EV_WT_REQUEST = 10;
+
+const int SBQ_EV_DRAINING = 11;
+
+const int SBQ_EV_UNI_STREAM = 12;
+
 const int SBQ_CLOSE_APP_REMOTE = 1;
 
 const int SBQ_CLOSE_APP_LOCAL = 2;
@@ -476,6 +614,22 @@ const int SBQ_CLOSE_CERT_REJECTED = 7;
 const int SBQ_CLOSE_UNREACHABLE = 8;
 
 const int SBQ_CLOSE_OTHER = 9;
+
+const int SBQ_CLOSE_REFUSED = 10;
+
+const int SBQ_CLOSE_SESSION_RESET = 11;
+
+const int SBQ_CLOSE_H3_LOCAL = 12;
+
+const int SBQ_CLOSE_H3_REMOTE = 13;
+
+const int SBQ_WT_AUTHORITY = 1;
+
+const int SBQ_WT_PATH = 2;
+
+const int SBQ_WT_ORIGIN = 3;
+
+const int SBQ_WT_PROTOCOLS = 4;
 
 const int SBQ_VERIFY_PLATFORM = 0;
 
