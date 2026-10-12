@@ -267,8 +267,10 @@ Authors:
   `<os>_<arch>/<file>` layout the hook reads, to a draft that is
   published once exactly those six assets are there; runs for one tag
   wait for each other, and a rerun leaves a published release as it is,
-  after checking it against its own `SHA256SUMS`. Neither workflow has
-  run on GitHub yet. `tool/fetch_prebuilt.sh` downloads a release's
+  after checking it against its own `SHA256SUMS`. Both workflows pin
+  the Rust toolchain (1.99.0): the first CI run failed at clippy on
+  every platform with a lint of the runners' newer stable, in a test.
+  The release workflow has not run on GitHub yet. `tool/fetch_prebuilt.sh` downloads a release's
   libraries, checks its `SHA256SUMS` (known paths, hashes, no
   duplicates) and the libraries against it, and replaces each under
   `native/sbq/prebuilt/` atomically; `native/sbq/.pubignore` lets them

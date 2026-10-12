@@ -5,6 +5,7 @@
 #   Jan Boon <jan.boon@kaetemi.be>
 #   Claude Opus 5.5 <noreply@anthropic.com>
 #   GPT-6 Astra <noreply@openai.com>
+#   Claude Fable 5.1 <noreply@anthropic.com>
 #
 # CI of switchboard_quic, one job per platform: the shim (cargo fmt, clippy,
 # test), then the Dart package (analyze, format, the VM suite, whose build
@@ -69,9 +70,12 @@ jobs:
           ref: ${{ steps.core.outputs.commit }}
           path: switchboard
 
-      # The action's ref selects the toolchain (it has no version tags).
+      # The action's ref would select the toolchain (it has no version tags);
+      # the input pins it, so that a new stable's lints do not turn CI red
+      # without a change here. Bump it together with the code.
       - uses: dtolnay/rust-toolchain@stable
         with:
+          toolchain: 1.99.0
           components: clippy, rustfmt
 
       - uses: Swatinem/rust-cache@v2

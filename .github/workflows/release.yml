@@ -5,6 +5,7 @@
 #   Jan Boon <jan.boon@kaetemi.be>
 #   Claude Opus 5.5 <noreply@anthropic.com>
 #   GPT-6 Astra <noreply@openai.com>
+#   Claude Fable 5.1 <noreply@anthropic.com>
 #
 # The prebuilt shim of a release: on a tag v* (or by hand for an existing
 # tag), `cargo build --release` of native/sbq on each of the five platforms,
@@ -91,8 +92,12 @@ jobs:
           ref: ${{ needs.tag.outputs.commit }}
           persist-credentials: false
 
-      # The action's ref selects the toolchain (it has no version tags).
+      # The action's ref would select the toolchain (it has no version tags);
+      # the input pins it, so that a new stable's lints do not turn CI red
+      # without a change here. Bump it together with the code.
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.99.0
 
       - name: cargo test and build
         working-directory: native/sbq

@@ -6,6 +6,7 @@ Authors:
   Jan Boon <jan.boon@kaetemi.be>
   Claude Opus 5.5 <noreply@anthropic.com>
   GPT-6 Astra <noreply@openai.com>
+  Claude Fable 5.1 <noreply@anthropic.com>
 */
 
 //! WebTransport over HTTP/3 (draft-ietf-webtrans-http3), the pure parts: error codes and the
@@ -401,7 +402,7 @@ mod tests {
         assert_eq!(h3_to_app(0x100), None);
         assert_eq!(h3_to_app(err::WT_SESSION_GONE), None);
         // Both ways, across a stretch of codes, the ends and reserved points included.
-        for n in (0..100_000u32).chain([u32::MAX - 100..=u32::MAX].into_iter().flatten()) {
+        for n in (0..100_000u32).chain(u32::MAX - 100..=u32::MAX) {
             let h = app_to_h3(n);
             assert!(!crate::h3::is_grease(h), "{n}");
             assert_eq!(h3_to_app(h), Some(n));
