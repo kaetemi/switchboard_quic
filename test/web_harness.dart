@@ -152,6 +152,27 @@ Future<WebServer?> server() async {
   return s;
 }
 
+/// The promise rejections nobody handled in this page, by their reason.
+final List<String> unhandledRejections = [];
+
+/// Records the page's unhandled promise rejections, and fails the suite in
+/// its last teardown if there were any: the provider must handle every
+/// promise of the API.
+void watchUnhandledRejections() {
+  web.window.addEventListener(
+    'unhandledrejection',
+    ((web.Event event) {
+      final reason = (event as web.PromiseRejectionEvent).reason;
+      unhandledRejections.add(reason == null ? 'undefined' : reason.toString());
+    }).toJS,
+  );
+  tearDownAll(() async {
+    // Unhandled rejections are reported after a task or two.
+    await Future<void>.delayed(const Duration(milliseconds: 500));
+    expect(unhandledRejections, isEmpty);
+  });
+}
+
 final Random _random = Random();
 
 /// An id for the records of one test.

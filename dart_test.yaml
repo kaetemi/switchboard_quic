@@ -15,7 +15,8 @@
 #
 # `dart test -P web` runs the browser tests of the web provider
 # (`package:switchboard_quic/switchboard_quic_web.dart`) in headless Chrome,
-# compiled with dart2js: the provider against the provider contract
+# compiled with dart2js (`-c dart2wasm` for dart2wasm): the provider against
+# the provider contract
 # (web_provider_test) and the binding over it with ReconnectingClient
 # (web_binding_test), against the server of tool/web_server.dart, which
 # tool/web_smoke.sh starts first and describes in test/web_server.json; the

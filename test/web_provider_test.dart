@@ -30,6 +30,7 @@ Matcher isQuic(QuicExceptionKind kind) =>
     isA<QuicException>().having((e) => e.kind, 'kind', kind);
 
 void main() {
+  watchUnhandledRejections();
   test('the browser has WebTransport, and the server selects '
       'switchboard', () async {
     final s = await server();
@@ -45,6 +46,17 @@ void main() {
       'web provider: ${session.capabilities}, stream error codes up to '
       '${WebQuicProvider.maxStreamErrorCode}',
     );
+  });
+
+  test('a session that offers no protocol: none selected', () async {
+    final s = await server();
+    if (s == null) return;
+    final session = await const WebQuicProvider().connect(
+      s.provider.replace(queryParameters: {'case': 'echo', 'id': newId()}),
+      QuicClientConfig(alpn: const [], serverCertificateHashes: [s.hash]),
+    );
+    expect(session.protocol, isNull);
+    await session.close(0, '');
   });
 
   test('a stream echoed, FIN both ways, acknowledgement', () async {

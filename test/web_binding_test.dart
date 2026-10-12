@@ -54,6 +54,7 @@ TalkChannel talkTo(MuxConnection connection, Name service) =>
     TalkChannel(connection.open(ChannelAddress(type: service).encode()));
 
 void main() {
+  watchUnhandledRejections();
   test('the connection: HELLO both ways, the session WebTransport, the '
       'certificate authenticating the node', () async {
     final s = await server();
