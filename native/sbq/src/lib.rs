@@ -30,9 +30,12 @@ Authors:
 mod config;
 mod conn;
 mod ctx;
+mod h3;
+mod h3_tables;
 mod stream;
 #[cfg(test)]
 mod tests;
+mod wt;
 
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::sync::Arc;
