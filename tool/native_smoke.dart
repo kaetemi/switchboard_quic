@@ -13,7 +13,10 @@ Authors:
 // FIN, the exporter on both ends, an application close seen by the peer, and
 // 64 MiB through one stream; then the binding over the provider: two
 // connections with exporter-bound HELLOs, a channel echoing a subframe, the
-// close of the connection seen as a GOAWAY. Exits non-zero on any failure.
+// close of the connection seen as a GOAWAY; then the same over a WebTransport
+// session (HTTP/3 in the shim): the protocol selected, an echo, the
+// session's exporter equal at both ends, a reset code, the close code and
+// reason, and the binding over the session. Exits non-zero on any failure.
 
 import 'dart:async';
 import 'dart:io';
@@ -139,9 +142,118 @@ Future<void> main() async {
   await acceptor.done;
   await sessions.cancel();
   await listener.close();
-  watchdog.cancel();
   print('native smoke: binding OK');
+
+  await _webTransport(provider, cert);
+  watchdog.cancel();
   print('native smoke: OK');
+}
+
+/// The provider and the binding over a WebTransport session.
+Future<void> _webTransport(
+  NativeQuicProvider provider,
+  NativeCertificate cert,
+) async {
+  final listener = await provider.listenWebTransport(
+    '127.0.0.1',
+    0,
+    QuicServerConfig(
+      alpn: const [quicAlpn],
+      certificateDer: cert.certificateDer,
+      privateKeyDer: cert.privateKeyDer,
+    ),
+    path: '/sb',
+  );
+  final sessions = StreamIterator(listener.sessions);
+  final client = await provider.connect(
+    listener.endpoint,
+    QuicClientConfig(
+      alpn: const [quicAlpn],
+      serverCertificateHashes: [cert.sha256],
+    ),
+  );
+  check(await sessions.moveNext(), 'accepted WebTransport session');
+  final server = sessions.current;
+  check(
+    client.protocol == 'switchboard' && server.protocol == 'switchboard',
+    'WebTransport protocol',
+  );
+  const label = 'switchboard-ident';
+  final a = await client.exportKeyingMaterial(label, Uint8List(0), 32);
+  final b = await server.exportKeyingMaterial(label, Uint8List(0), 32);
+  check(a != null && b != null && _eq(a, b), 'WebTransport exporter');
+
+  final serverStreams = StreamIterator(server.incomingStreams);
+  final cs = await client.openStream();
+  await cs.write(Uint8List.fromList('over h3'.codeUnits));
+  await cs.finish();
+  check(await serverStreams.moveNext(), 'WebTransport stream');
+  final ss = serverStreams.current;
+  final got = await _readAll(ss);
+  await ss.write(got);
+  await ss.finish();
+  check(String.fromCharCodes(await _readAll(cs)) == 'over h3', 'WT echo');
+  final rs = await client.openStream();
+  await rs.write(Uint8List(1));
+  check(await serverStreams.moveNext(), 'WebTransport stream to reset');
+  rs.reset(42);
+  int? code;
+  try {
+    await _readAll(serverStreams.current);
+  } on QuicStreamReset catch (e) {
+    code = e.code;
+  }
+  check(code == 42, 'WebTransport reset code');
+  await client.close(7, 'done');
+  final end = await server.done;
+  check(
+    end.code == 7 && end.reason == 'done' && end.byPeer,
+    'WebTransport close seen by the peer',
+  );
+
+  final dialled = await provider.connect(
+    listener.endpoint,
+    const QuicClientConfig(alpn: [quicAlpn], verifyCertificate: false),
+  );
+  check(await sessions.moveNext(), 'second WebTransport session');
+  final accepting = QuicBindingConnection.start(
+    sessions.current,
+    isWebTransport: true,
+  );
+  final initiator = await QuicBindingConnection.start(
+    dialled,
+    isWebTransport: true,
+  );
+  final acceptor = await accepting;
+  final incoming = StreamIterator(acceptor.incoming);
+  final channel = initiator.open(Uint8List.fromList([0]));
+  await channel.send(Uint8List.fromList('ping'.codeUnits));
+  check(await incoming.moveNext(), 'WebTransport binding channel');
+  final served = incoming.current;
+  final request = StreamIterator(served.stream);
+  check(await request.moveNext(), 'WebTransport binding subframe');
+  await served.send(request.current);
+  final closing = served.close();
+  final reply = await channel.stream.toList();
+  check(
+    reply.length == 1 && String.fromCharCodes(reply.single) == 'ping',
+    'WebTransport binding echo',
+  );
+  await closing;
+  await request.cancel();
+  check(
+    initiator.exporterBound && acceptor.exporterBound,
+    'WebTransport HELLO EXPORTER',
+  );
+  await initiator.close();
+  check(
+    (await acceptor.peerGoAwayStatus).code == 33,
+    'WebTransport binding close',
+  );
+  await acceptor.done;
+  await sessions.cancel();
+  await listener.close();
+  print('native smoke: WebTransport OK');
 }
 
 Future<Uint8List> _readAll(QuicStream s) async {

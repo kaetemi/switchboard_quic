@@ -51,7 +51,7 @@ use tokio::task::AbortHandle;
 use crate::conn::{CloseInfo, ConnObj};
 use crate::ctx::{get, lock, rt, Ctx, CONNS, H3S, STREAMS};
 use crate::h3::{self, err, frame, setting, stream_type, FieldError, PeerSettings};
-use crate::stream::{self, NewStream};
+use crate::stream::{self, NewStream, StreamObj};
 use crate::wt;
 use crate::*;
 
@@ -577,8 +577,11 @@ pub enum Phase {
 /// What a session's writer task does with its CONNECT stream, in order.
 enum Write {
     Bytes(Vec<u8>),
-    /// FIN, then wait for its acknowledgement.
-    Finish,
+    /// FIN, then wait for its acknowledgement (within the close wait), then reset and stop
+    /// these streams of the session with WT_SESSION_GONE: when this side closes a session, its
+    /// peer learns of the close before it sees the resets, which would otherwise race the close
+    /// capsule and look like aborts of the streams.
+    Finish(Vec<Arc<StreamObj>>),
     Reset(u64),
 }
 
@@ -1508,16 +1511,19 @@ fn post_draining(o: &Arc<ConnObj>) {
     o.ctx.post(SBQ_EV_DRAINING, o.handle, 0, 0);
 }
 
-/// Resets and stops every stream of the session with WT_SESSION_GONE.
-fn streams_gone(o: &ConnObj) {
+/// The session's streams.
+fn session_streams(o: &ConnObj) -> Vec<Arc<StreamObj>> {
     let ids: Vec<u64> = lock(&o.streams)
         .as_ref()
         .map(|s| s.iter().copied().collect())
         .unwrap_or_default();
-    for id in ids {
-        if let Some(s) = get(&STREAMS, id) {
-            s.session_gone();
-        }
+    ids.into_iter().filter_map(|id| get(&STREAMS, id)).collect()
+}
+
+/// Resets and stops every stream of the session with WT_SESSION_GONE.
+fn streams_gone(o: &ConnObj) {
+    for s in session_streams(o) {
+        s.session_gone();
     }
 }
 
@@ -1536,9 +1542,12 @@ async fn writer(
                     break;
                 }
             }
-            Write::Finish => {
+            Write::Finish(streams) => {
                 let _ = send.finish();
-                let _ = send.stopped().await;
+                let _ = within(h3.close_wait(), send.stopped()).await;
+                for s in streams {
+                    s.session_gone();
+                }
                 break;
             }
             Write::Reset(code) => {
@@ -1655,7 +1664,7 @@ fn remote_close(o: &Arc<ConnObj>, code: u32, message: &[u8]) {
             code: u64::from(code),
             reason: message.to_vec(),
         },
-        Some(Write::Finish),
+        Some(Write::Finish(Vec::new())),
     );
 }
 
@@ -1857,7 +1866,7 @@ pub async fn client_session(
         }
     };
     if !(200..300).contains(&response.status) {
-        let _ = tx.send(Write::Finish);
+        let _ = tx.send(Write::Finish(Vec::new()));
         let _ = r.recv.stop(varint(err::H3_NO_ERROR));
         return Err(refused(
             h3,
@@ -2020,7 +2029,7 @@ fn refuse(o: &Arc<ConnObj>, status: u16) -> bool {
         st.phase = Phase::Ended;
         if let Some(tx) = st.writer.as_ref() {
             let _ = tx.send(Write::Bytes(response_frame(status, st.version, None)));
-            let _ = tx.send(Write::Finish);
+            let _ = tx.send(Write::Finish(Vec::new()));
         }
         if let Some(mut r) = st.reader.take() {
             let _ = r.recv.stop(varint(err::H3_NO_ERROR));
@@ -2142,7 +2151,8 @@ pub fn close(o: &Arc<ConnObj>, code: u64, message: &[u8], report: bool) -> i32 {
                 if let Some(tx) = st.writer.as_ref() {
                     let capsule = wt::close_capsule(code32, &message);
                     let _ = tx.send(Write::Bytes(h3::frame(frame::DATA, &capsule)));
-                    let _ = tx.send(Write::Finish);
+                    // The streams are held until then, also once released.
+                    let _ = tx.send(Write::Finish(session_streams(o)));
                 }
             }
             if report {
@@ -2150,7 +2160,6 @@ pub fn close(o: &Arc<ConnObj>, code: u64, message: &[u8], report: bool) -> i32 {
             } else {
                 end_quietly(o, info);
             }
-            streams_gone(o);
             if let (Some(h3), Some(sid)) = (wt.h3(), wt.sid()) {
                 h3.closing(sid);
             }

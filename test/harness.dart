@@ -226,6 +226,7 @@ Future<(QuicBindingConnection, RawPeer)> bindingAndRaw({
   FakeEndConfig rawEnd = const FakeEndConfig(),
   bool rawControl = true,
   QuicHello? rawHello,
+  bool isWebTransport = false,
 }) async {
   final (a, b) = FakeQuicSession.pair(
     initiator: bindingIsInitiator ? bindingEnd : rawEnd,
@@ -237,6 +238,7 @@ Future<(QuicBindingConnection, RawPeer)> bindingAndRaw({
       a,
       options: options,
       quicOptions: quicOptions,
+      isWebTransport: isWebTransport,
     );
     final connection = await connecting;
     addTearDown(connection.close);
@@ -247,6 +249,7 @@ Future<(QuicBindingConnection, RawPeer)> bindingAndRaw({
     b,
     options: options,
     quicOptions: quicOptions,
+    isWebTransport: isWebTransport,
   );
   addTearDown(connection.close);
   if (rawControl) {
