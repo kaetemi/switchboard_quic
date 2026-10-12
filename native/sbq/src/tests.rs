@@ -594,6 +594,59 @@ fn streams_fin_reset_stop() {
 }
 
 #[test]
+fn a_reset_is_observed_without_a_read() {
+    let mut h = Harness::new();
+    let (l, port, _) = h.server(16, 1 << 20, 30_000);
+    let (c, s) = h.pair(l, port);
+
+    // Unread data stays; no reset yet, and the check reads nothing.
+    let cs = sbq_stream_open(c) as u64;
+    h.write_all(cs, b"abc");
+    let ss = h
+        .wait("stream", |e| e.kind == SBQ_EV_STREAM && e.a == s as i64)
+        .handle;
+    assert_eq!(sbq_stream_poll_reset(ss), SBQ_WOULD_BLOCK);
+    let mut b = [0u8; 1];
+    assert_eq!(unsafe { sbq_stream_read(ss, b.as_mut_ptr(), 1) }, 1);
+    assert_eq!(b[0], b'a');
+    assert_eq!(sbq_stream_poll_reset(ss), SBQ_WOULD_BLOCK);
+    // The reset rings the read waker the check registered, with no read pending.
+    assert_eq!(sbq_stream_reset(cs, 11), 0);
+    h.wait("readable", |e| e.kind == SBQ_EV_READABLE && e.handle == ss);
+    let mut code = sbq_stream_poll_reset(ss);
+    while code == SBQ_WOULD_BLOCK {
+        // A spurious READABLE (the data that arrived meanwhile); the reset follows.
+        h.wait("readable", |e| e.kind == SBQ_EV_READABLE && e.handle == ss);
+        code = sbq_stream_poll_reset(ss);
+    }
+    assert_eq!(code, -(SBQ_CODE_BASE + 11));
+    assert_eq!(sbq_stream_poll_reset(ss), -(SBQ_CODE_BASE + 11));
+    // Reads report the same reset; the unread bytes are gone.
+    assert_eq!(h.read_all(ss), Err(11));
+
+    // FIN read: no reset can come.
+    let cs = sbq_stream_open(c) as u64;
+    h.write_all(cs, b"x");
+    assert_eq!(sbq_stream_finish(cs), 0);
+    let ss = h
+        .wait("stream", |e| e.kind == SBQ_EV_STREAM && e.a == s as i64)
+        .handle;
+    assert_eq!(h.read_all(ss), Ok(b"x".to_vec()));
+    assert_eq!(sbq_stream_poll_reset(ss), SBQ_FIN);
+
+    // Stopped by this side: nothing more to observe.
+    let cs = sbq_stream_open(c) as u64;
+    h.write_all(cs, b"y");
+    let ss = h
+        .wait("stream", |e| e.kind == SBQ_EV_STREAM && e.a == s as i64)
+        .handle;
+    assert_eq!(sbq_stream_stop(ss, 3), 0);
+    assert_eq!(sbq_stream_poll_reset(ss), SBQ_ERR_CLOSED);
+    assert_eq!(sbq_stream_release(ss), 0);
+    assert_eq!(sbq_stream_poll_reset(ss), SBQ_ERR_HANDLE);
+}
+
+#[test]
 fn a_stream_is_announced_before_its_events() {
     // The opener writes and stops the other direction at once, so that STREAM and STOP_SENDING
     // reach the acceptor together: STOPPED must not overtake the STREAM that announces the

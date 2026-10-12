@@ -309,6 +309,16 @@ external int sbq_stream_write(int stream, ffi.Pointer<ffi.Uint8> data, int len);
 )
 external int sbq_stream_read(int stream, ffi.Pointer<ffi.Uint8> buf, int cap);
 
+/// Whether the peer reset the receive direction, without reading from it: the peer's reset code
+/// at or below `-SBQ_CODE_BASE` (the direction has ended; reads return the same code),
+/// `SBQ_WOULD_BLOCK` (a READABLE follows the next change of the direction: data, FIN or a reset;
+/// call again then if no read is pending), `SBQ_FIN` when no reset can come any more (FIN was
+/// read, or every byte was), `SBQ_ERR_CLOSED` after `sbq_stream_stop`, or an error. Lets an
+/// embedder whose reader is paused observe an abort; quinn discards a reset direction's
+/// unread data anyway.
+@ffi.Native<ffi.Int64 Function(ffi.Uint64)>(isLeaf: true)
+external int sbq_stream_poll_reset(int stream);
+
 /// Finishes the send direction (FIN after everything written). FINISHED_ACKED follows once the
 /// peer acknowledged every byte. Returns `SBQ_OK`, the code of a STOP_SENDING received, or an
 /// error.
@@ -391,7 +401,7 @@ final class SbqStats extends ffi.Struct {
   external int udp_rx_datagrams;
 }
 
-const int SBQ_ABI_VERSION = 1;
+const int SBQ_ABI_VERSION = 2;
 
 const int SBQ_OK = 0;
 

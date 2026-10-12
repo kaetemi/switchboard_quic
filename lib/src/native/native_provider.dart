@@ -19,7 +19,15 @@ Authors:
 ///
 /// Reads are pull-based: data stays in quinn, holding back the peer's flow
 /// control credit, until [QuicStream.read] takes it. Writes complete once
-/// quinn accepted every byte, which the peer's credit bounds.
+/// quinn accepted every byte, which the peer's credit bounds. While no read
+/// is pending, the stream asks the shim whether the peer reset its
+/// direction (`sbq_stream_poll_reset`, which arms the same READABLE event),
+/// so that [QuicStream.resetReceived] completes for a paused reader too.
+///
+/// Raw QUIC has no session layer: [QuicSession.draining] never completes, and
+/// [QuicSession.incomingUnidirectionalStreams] never delivers a stream (the
+/// shim grants the peer none, `initial_max_streams_uni` 0, so a peer that
+/// opens one commits a transport error).
 library;
 
 import 'dart:async';
@@ -368,6 +376,7 @@ final class NativeQuicSession implements QuicSession {
   Uint8List? _peerHash;
   int _maxIncoming;
   final _incoming = StreamController<QuicStream>();
+  final _unidirectional = StreamController<QuicReceiveStream>();
   final _done = Completer<QuicSessionEnd>();
   final _opens = Queue<Completer<QuicStream>>();
   final _spare = Queue<NativeQuicStream>();
@@ -424,6 +433,23 @@ final class NativeQuicSession implements QuicSession {
 
   @override
   Stream<QuicStream> get incomingStreams => _incoming.stream;
+
+  /// Never delivers a stream: raw QUIC as the binding page configures it
+  /// grants the peer no unidirectional streams (`initial_max_streams_uni`
+  /// 0), so quinn has none to accept; a peer that opens one anyway commits
+  /// a transport error (`STREAM_LIMIT_ERROR`), which ends the session. Done
+  /// when the session ends.
+  @override
+  Stream<QuicReceiveStream> get incomingUnidirectionalStreams =>
+      _unidirectional.stream;
+
+  /// Never completes: raw QUIC has no draining signal (no HTTP/3 `GOAWAY`,
+  /// no `WT_DRAIN_SESSION`); the binding's `GOAWAY` travels on its control
+  /// stream.
+  @override
+  Future<void> get draining => _neverDraining;
+
+  static final Future<void> _neverDraining = Completer<void>().future;
 
   @override
   Future<QuicSessionEnd> get done => _done.future;
@@ -570,6 +596,7 @@ final class NativeQuicSession implements QuicSession {
     }
     _spare.clear();
     unawaited(_incoming.close());
+    unawaited(_unidirectional.close());
     sbq_conn_release(_handle);
     _rt.sessions.remove(_handle);
     _done.complete(end);
@@ -618,6 +645,8 @@ final class NativeQuicStream implements QuicStream {
   NativeQuicStream._(this._session, this._handle) {
     _session._rt.streams[_handle] = this;
     _session._streams.add(this);
+    _reset.future.ignore();
+    _scheduleResetCheck();
   }
 
   final NativeQuicSession _session;
@@ -630,6 +659,10 @@ final class NativeQuicStream implements QuicStream {
   bool _fin = false;
   Object? _recvFailure;
   bool _recvEnded = false;
+  final _reset = Completer<int?>();
+  // No reset can be observed any more (FIN, a local stop, the end).
+  bool _resetSettled = false;
+  bool _resetCheckScheduled = false;
 
   // Send direction.
   final _writes = Queue<_Write>();
@@ -646,6 +679,12 @@ final class NativeQuicStream implements QuicStream {
 
   @override
   Future<int?> get stopped => _stopped.future;
+
+  /// Completes with the peer's reset code, whether a read is pending or not
+  /// (a native reset always carries one); fails with `sessionEnded` when
+  /// the session ends first; stays pending after FIN or a local [stop].
+  @override
+  Future<int?> get resetReceived => _reset.future;
 
   @override
   set priority(int value) {
@@ -675,6 +714,7 @@ final class NativeQuicStream implements QuicStream {
       _readMax = max;
       return (_read = Completer<Uint8List?>()).future;
     }
+    if (o is Uint8List) _scheduleResetCheck();
     if (o == null || o is Uint8List) return Future.value(o as Uint8List?);
     return Future.error(o);
   }
@@ -695,11 +735,14 @@ final class NativeQuicStream implements QuicStream {
     if (n == SBQ_WOULD_BLOCK) return _blocked;
     if (n == SBQ_FIN) {
       _fin = true;
+      _resetSettled = true;
       _endRecv();
       return null;
     }
     if (n <= -SBQ_CODE_BASE) {
-      _recvFailure = QuicStreamReset(-n - SBQ_CODE_BASE);
+      final code = -n - SBQ_CODE_BASE;
+      _recvFailure = QuicStreamReset(code);
+      _resetSeen(code);
       _endRecv();
       return _recvFailure;
     }
@@ -709,15 +752,60 @@ final class NativeQuicStream implements QuicStream {
 
   void _readable() {
     final c = _read;
-    if (c == null) return;
+    if (c == null) {
+      // Data, FIN or a reset arrived while nobody reads.
+      _checkReset();
+      return;
+    }
     final o = _pollRead(_readMax);
     if (identical(o, _blocked)) return;
     _read = null;
+    if (o is Uint8List) _scheduleResetCheck();
     if (o == null || o is Uint8List) {
       c.complete(o as Uint8List?);
     } else {
       c.completeError(o);
     }
+  }
+
+  /// Checks for a reset once the reader has had its turn: a reader that
+  /// reads on at once observes the reset with its read instead.
+  void _scheduleResetCheck() {
+    if (_resetCheckScheduled || _resetSettled || _reset.isCompleted) return;
+    _resetCheckScheduled = true;
+    scheduleMicrotask(() {
+      _resetCheckScheduled = false;
+      _checkReset();
+    });
+  }
+
+  /// While no read is pending: asks the shim whether the peer reset its
+  /// direction, which arms READABLE for the next change when it did not.
+  void _checkReset() {
+    if (_read != null ||
+        _released ||
+        _recvEnded ||
+        _resetSettled ||
+        _reset.isCompleted) {
+      return;
+    }
+    final r = sbq_stream_poll_reset(_handle);
+    if (r == SBQ_WOULD_BLOCK) return;
+    if (r <= -SBQ_CODE_BASE) {
+      final code = -r - SBQ_CODE_BASE;
+      _recvFailure = QuicStreamReset(code);
+      _resetSeen(code);
+      _endRecv();
+      return;
+    }
+    // FIN behind the unread data, stopped here, or the session is ending
+    // (its CLOSED event fails what waits).
+    _resetSettled = true;
+  }
+
+  void _resetSeen(int code) {
+    _resetSettled = true;
+    if (!_reset.isCompleted) _reset.complete(code);
   }
 
   @override
@@ -818,6 +906,7 @@ final class NativeQuicStream implements QuicStream {
   void stop(int code) {
     _checkCode(code);
     if (_released || _recvEnded) return;
+    _resetSettled = true;
     sbq_stream_stop(_handle, code);
     final failure = _recvFailure = QuicStreamReset(code);
     final c = _read;
@@ -856,6 +945,8 @@ final class NativeQuicStream implements QuicStream {
         ..future.ignore()
         ..completeError(error);
     }
+    _resetSettled = true;
+    if (!_reset.isCompleted) _reset.completeError(error);
     _recvEnded = true;
     _sendEnded = true;
     _release();

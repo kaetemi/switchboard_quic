@@ -16,7 +16,7 @@ Authors:
 #include <stdint.h>
 
 // Version of this ABI; the Dart layer refuses a library with another.
-#define SBQ_ABI_VERSION 1
+#define SBQ_ABI_VERSION 2
 
 // Success.
 #define SBQ_OK 0
@@ -310,6 +310,15 @@ int64_t sbq_stream_write(uint64_t stream, const uint8_t *data, size_t len);
 // follows), `SBQ_FIN`, the peer's reset code at or below `-SBQ_CODE_BASE`, or an error.
 // Data not read stays in quinn and holds back the peer's flow control credit.
 int64_t sbq_stream_read(uint64_t stream, uint8_t *buf, size_t cap);
+
+// Whether the peer reset the receive direction, without reading from it: the peer's reset code
+// at or below `-SBQ_CODE_BASE` (the direction has ended; reads return the same code),
+// `SBQ_WOULD_BLOCK` (a READABLE follows the next change of the direction: data, FIN or a reset;
+// call again then if no read is pending), `SBQ_FIN` when no reset can come any more (FIN was
+// read, or every byte was), `SBQ_ERR_CLOSED` after `sbq_stream_stop`, or an error. Lets an
+// embedder whose reader is paused observe an abort; quinn discards a reset direction's
+// unread data anyway.
+int64_t sbq_stream_poll_reset(uint64_t stream);
 
 // Finishes the send direction (FIN after everything written). FINISHED_ACKED follows once the
 // peer acknowledged every byte. Returns `SBQ_OK`, the code of a STOP_SENDING received, or an

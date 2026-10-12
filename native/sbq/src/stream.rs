@@ -9,7 +9,8 @@ Authors:
 */
 
 //! Bidirectional streams: non-blocking reads and writes polled with wakers that post READABLE and
-//! WRITABLE, and a task per stream that reports STOP_SENDING or the acknowledged end.
+//! WRITABLE, a non-consuming check for the peer's reset (whose waker is the read's), and a task
+//! per stream that reports STOP_SENDING or the acknowledged end.
 
 use std::future::Future;
 use std::pin::{pin, Pin};
@@ -119,6 +120,38 @@ impl StreamObj {
                 code_result(c.into_inner())
             }
             Poll::Ready(Err(ReadError::ConnectionLost(_))) => SBQ_ERR_CONNECTION,
+            Poll::Ready(Err(_)) => SBQ_ERR_CLOSED,
+        }
+    }
+
+    /// Whether the peer reset the receive direction, without reading: the code (and the direction
+    /// ends with it, as a read would have reported it), `SBQ_WOULD_BLOCK` with the read waker
+    /// registered (quinn wakes it for a reset as for data and FIN, so a READABLE follows the next
+    /// change, possibly a spurious one), or `SBQ_FIN` when no reset can come any more (FIN read,
+    /// or quinn has forgotten the direction after its last byte was read).
+    pub fn poll_reset(&self) -> i64 {
+        let mut g = lock(&self.inner);
+        match g.recv_state {
+            RecvState::Open => {}
+            RecvState::Fin => return SBQ_FIN,
+            RecvState::Reset(c) => return code_result(c),
+            RecvState::Stopped => return SBQ_ERR_CLOSED,
+        }
+        let polled = {
+            let mut cx = Context::from_waker(&self.read_waker);
+            let mut fut = pin!(g.recv.received_reset());
+            fut.as_mut().poll(&mut cx)
+        };
+        match polled {
+            Poll::Ready(Ok(Some(c))) => {
+                // quinn discards the direction once the reset is observed; reads report it from
+                // here on.
+                g.recv_state = RecvState::Reset(c.into_inner());
+                code_result(c.into_inner())
+            }
+            Poll::Ready(Ok(None)) => SBQ_FIN,
+            Poll::Pending => SBQ_WOULD_BLOCK,
+            Poll::Ready(Err(quinn::ResetError::ConnectionLost(_))) => SBQ_ERR_CONNECTION,
             Poll::Ready(Err(_)) => SBQ_ERR_CLOSED,
         }
     }

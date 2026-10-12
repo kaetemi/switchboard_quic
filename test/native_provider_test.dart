@@ -414,6 +414,52 @@ void main() {
       expect(() => cs.write(bytes('x')), throwsStateError);
     });
 
+    test('a reset is observed by resetReceived while no read is pending, its '
+        'unread data discarded', () async {
+      final cs = await p.client.openStream();
+      await cs.write(pattern(5000));
+      final ss = await p.serverStreams.next;
+      // The reader takes one byte and pauses; the rest stays in the stack.
+      expect(await ss.read(1), pattern(1));
+      var reset = false;
+      unawaited(ss.resetReceived.then((_) => reset = true));
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+      expect(reset, isFalse);
+      cs.reset(12);
+      expect(await ss.resetReceived.timeout(const Duration(seconds: 5)), 12);
+      await expectLater(
+        ss.read(10),
+        throwsA(isA<QuicStreamReset>().having((e) => e.code, 'code', 12)),
+      );
+    });
+
+    test('a reset seen by a pending read completes resetReceived too; FIN '
+        'never does', () async {
+      final cs = await p.client.openStream();
+      await cs.write(bytes('a'));
+      final ss = await p.serverStreams.next;
+      expect(await ss.read(10), bytes('a'));
+      final read = ss.read(10);
+      cs.reset(4);
+      await expectLater(
+        read,
+        throwsA(isA<QuicStreamReset>().having((e) => e.code, 'code', 4)),
+      );
+      expect(await ss.resetReceived, 4);
+      final fin = await p.client.openStream();
+      await fin.write(bytes('done'));
+      await fin.finish();
+      final finished = await p.serverStreams.next;
+      expect(await readAll(finished), bytes('done'));
+      expect(
+        await completesWithin(
+          finished.resetReceived,
+          const Duration(milliseconds: 200),
+        ),
+        isFalse,
+      );
+    });
+
     test('stop is observed as QuicStreamStopped, stopped completes with the '
         'code', () async {
       final cs = await p.client.openStream();
@@ -544,6 +590,8 @@ void main() {
       );
       await expectLater(read, throwsA(sessionEnded));
       await expectLater(stopped, throwsA(sessionEnded));
+      await expectLater(ss.resetReceived, throwsA(sessionEnded));
+      await expectLater(cs.resetReceived, throwsA(sessionEnded));
       await expectLater(p.server.openStream(), throwsA(sessionEnded));
       await expectLater(ss.write(bytes('x')), throwsA(sessionEnded));
       await expectLater(p.client.openStream(), throwsA(sessionEnded));
@@ -662,6 +710,28 @@ void main() {
     (p.server as NativeQuicSession).setMaxIncomingStreams(3);
     expect(p.server.maxIncomingStreams, 3);
     await fourth.timeout(const Duration(seconds: 5));
+  });
+
+  test('raw QUIC: no unidirectional streams and no draining signal', () async {
+    final server = await Server.start();
+    final p = await Pair.connect(server);
+    final serverUni = p.server.incomingUnidirectionalStreams.toList();
+    final clientUni = p.client.incomingUnidirectionalStreams.toList();
+    var draining = false;
+    unawaited(p.server.draining.then((_) => draining = true));
+    unawaited(p.client.draining.then((_) => draining = true));
+    // The binding's traffic goes on as usual meanwhile.
+    final cs = await p.client.openStream();
+    await cs.write(bytes('x'));
+    await cs.finish();
+    expect(await readAll(await p.serverStreams.next), bytes('x'));
+    await p.client.close(0, '');
+    await p.server.done;
+    // Both are done with the session, having delivered nothing.
+    expect(await clientUni.timeout(const Duration(seconds: 5)), isEmpty);
+    expect(await serverUni.timeout(const Duration(seconds: 5)), isEmpty);
+    await Future<void>.delayed(Duration.zero);
+    expect(draining, isFalse);
   });
 
   group('session end', () {

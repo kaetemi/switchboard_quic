@@ -43,7 +43,7 @@ use ctx::{get, lock, set_error, CONFIGS, CONNS, CTXS, LISTENERS, STREAMS};
 pub use ctx::{SbqDoorbell, SbqEvent};
 
 /// Version of this ABI; the Dart layer refuses a library with another.
-pub const SBQ_ABI_VERSION: u32 = 1;
+pub const SBQ_ABI_VERSION: u32 = 2;
 
 /// Success.
 pub const SBQ_OK: i64 = 0;
@@ -715,6 +715,21 @@ pub unsafe extern "C" fn sbq_stream_read(stream: u64, buf: *mut u8, cap: usize) 
     match get(&STREAMS, stream) {
         Some(s) if !buf.is_null() => s.read(std::slice::from_raw_parts_mut(buf, cap)),
         Some(_) => SBQ_ERR_ARG,
+        None => SBQ_ERR_HANDLE,
+    }
+}
+
+/// Whether the peer reset the receive direction, without reading from it: the peer's reset code
+/// at or below `-SBQ_CODE_BASE` (the direction has ended; reads return the same code),
+/// `SBQ_WOULD_BLOCK` (a READABLE follows the next change of the direction: data, FIN or a reset;
+/// call again then if no read is pending), `SBQ_FIN` when no reset can come any more (FIN was
+/// read, or every byte was), `SBQ_ERR_CLOSED` after `sbq_stream_stop`, or an error. Lets an
+/// embedder whose reader is paused observe an abort; quinn discards a reset direction's
+/// unread data anyway.
+#[no_mangle]
+pub extern "C" fn sbq_stream_poll_reset(stream: u64) -> i64 {
+    match get(&STREAMS, stream) {
+        Some(s) => s.poll_reset(),
         None => SBQ_ERR_HANDLE,
     }
 }
