@@ -258,6 +258,7 @@ final class NativeQuicProvider implements QuicConnector {
         c.connectionReceiveWindow,
         c.idleTimeout.inMilliseconds,
         c.keepAlive.inMilliseconds,
+        _deadline(c.handshakeTimeout),
       ),
     );
     if (r <= 0) throw _Sbq.failure(r, 'client configuration');
@@ -279,11 +280,17 @@ final class NativeQuicProvider implements QuicConnector {
         c.connectionReceiveWindow,
         c.idleTimeout.inMilliseconds,
         c.keepAlive.inMilliseconds,
+        _deadline(c.handshakeTimeout),
       ),
     );
     if (r <= 0) throw _Sbq.failure(r, 'server configuration');
     return r;
   }
+
+  /// A handshake deadline in whole milliseconds for the shim, 0 (none) for
+  /// zero or less; a positive deadline stays positive.
+  static int _deadline(Duration d) =>
+      d > Duration.zero ? (d.inMicroseconds + 999) ~/ 1000 : 0;
 
   static Uint8List _alpnWire(List<String> tokens) {
     final b = BytesBuilder();

@@ -11,6 +11,7 @@ Authors:
 //! the end of a connection, and post the matching events.
 
 use std::collections::HashSet;
+use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -207,9 +208,20 @@ impl ListenerObj {
     }
 }
 
-async fn handshake(inc: quinn::Incoming, ctx: Arc<Ctx>, listener: u64) {
+/// The output of `f`, or None when `deadline` passed first (`f` is dropped then).
+async fn within<F: Future>(deadline: Option<Duration>, f: F) -> Option<F::Output> {
+    match deadline {
+        Some(d) => tokio::time::timeout(d, f).await.ok(),
+        None => Some(f.await),
+    }
+}
+
+/// Completes the handshake of an incoming connection within `deadline` and announces it. A
+/// handshake that fails or runs out of time is dropped, which closes it in quinn (the endpoint
+/// forgets it once the close has drained); nothing of it reached a table.
+async fn handshake(inc: quinn::Incoming, ctx: Arc<Ctx>, listener: u64, deadline: Option<Duration>) {
     let Ok(connecting) = inc.accept() else { return };
-    if let Ok(conn) = connecting.await {
+    if let Some(Ok(conn)) = within(deadline, connecting).await {
         let obj = ConnObj::new(ctx, Some(conn.clone()), Arc::new(AtomicBool::new(false)));
         lock(&CONNS).insert(obj.handle, obj.clone());
         // `sbq_shutdown` closes the context before it sweeps the table: a handshake that completes
@@ -226,7 +238,12 @@ async fn handshake(inc: quinn::Incoming, ctx: Arc<Ctx>, listener: u64) {
     }
 }
 
-pub fn listen(ctx: &Arc<Ctx>, cfg: quinn::ServerConfig, addr: SocketAddr) -> Result<u64, String> {
+pub fn listen(
+    ctx: &Arc<Ctx>,
+    cfg: quinn::ServerConfig,
+    deadline: Option<Duration>,
+    addr: SocketAddr,
+) -> Result<u64, String> {
     let _g = rt().enter();
     let endpoint =
         Endpoint::server(cfg, addr).map_err(|e| format!("cannot listen on {addr}: {e}"))?;
@@ -242,7 +259,7 @@ pub fn listen(ctx: &Arc<Ctx>, cfg: quinn::ServerConfig, addr: SocketAddr) -> Res
         loop {
             tokio::select! {
                 inc = endpoint.accept() => match inc {
-                    Some(inc) => { handshakes.spawn(handshake(inc, ctx.clone(), h)); }
+                    Some(inc) => { handshakes.spawn(handshake(inc, ctx.clone(), h, deadline)); }
                     None => break,
                 },
                 Some(_) = handshakes.join_next(), if !handshakes.is_empty() => {}
@@ -302,10 +319,14 @@ fn unreachable(msg: String) -> Failure {
     })
 }
 
+/// One handshake with `addr`, within `deadline` if given. Running out of time is a timeout, as
+/// quinn reports a handshake its idle timeout ended, so that `Failure::pick` prefers any other
+/// failure; the `Connecting` dropped with the timeout closes the attempt in quinn.
 async fn attempt(
     cc: quinn::ClientConfig,
     addr: SocketAddr,
     server_name: &str,
+    deadline: Option<Duration>,
 ) -> Result<Connection, Failure> {
     let endpoint = client_endpoint(addr.is_ipv6())
         .map_err(|e| unreachable(format!("cannot open a socket: {e}")))?;
@@ -316,7 +337,10 @@ async fn attempt(
             reason: e.to_string().into_bytes(),
         })
     })?;
-    connecting.await.map_err(Failure::Conn)
+    within(deadline, connecting)
+        .await
+        .unwrap_or(Err(ConnectionError::TimedOut))
+        .map_err(Failure::Conn)
 }
 
 /// How long the first address has to itself before the first address of the other family is
@@ -324,12 +348,14 @@ async fn attempt(
 /// preferred address has no listener does not cost a whole handshake timeout).
 const SECOND_FAMILY_DELAY: Duration = Duration::from_millis(250);
 
-/// Resolves `host` and completes a handshake with the first of its addresses that answers.
+/// Resolves `host` and completes a handshake with the first of its addresses that answers, each
+/// attempt within `deadline`.
 async fn dial(
     cc: quinn::ClientConfig,
     host: &str,
     port: u16,
     server_name: &str,
+    deadline: Option<Duration>,
 ) -> Result<Connection, Failure> {
     let addrs: Vec<SocketAddr> = match tokio::net::lookup_host((host, port)).await {
         Ok(a) => a.collect(),
@@ -338,29 +364,34 @@ async fn dial(
     if addrs.is_empty() {
         return Err(unreachable(format!("no address for {host}")));
     }
-    dial_addrs(cc, &addrs, server_name).await
+    dial_addrs(cc, &addrs, server_name, deadline).await
 }
 
 /// Tries the first address, and after `SECOND_FAMILY_DELAY` also the first address of the other
-/// family; the first handshake to complete wins and the other attempt is dropped (closed).
+/// family; the first handshake to complete wins and the other attempt is dropped (closed). Each
+/// attempt has `deadline` to itself, so a dual-stack dial ends within about the deadline plus
+/// `SECOND_FAMILY_DELAY`.
 pub(crate) async fn dial_addrs(
     cc: quinn::ClientConfig,
     addrs: &[SocketAddr],
     server_name: &str,
+    deadline: Option<Duration>,
 ) -> Result<Connection, Failure> {
     let first = addrs[0];
     let Some(&second) = addrs.iter().find(|a| a.is_ipv6() != first.is_ipv6()) else {
-        return attempt(cc, first, server_name).await;
+        return attempt(cc, first, server_name, deadline).await;
     };
-    let a = attempt(cc.clone(), first, server_name);
+    let a = attempt(cc.clone(), first, server_name, deadline);
     tokio::pin!(a);
     tokio::select! {
         r = &mut a => match r {
             Ok(c) => Ok(c),
-            Err(e1) => attempt(cc, second, server_name).await.map_err(|e2| Failure::pick(e1, e2)),
+            Err(e1) => attempt(cc, second, server_name, deadline)
+                .await
+                .map_err(|e2| Failure::pick(e1, e2)),
         },
         _ = tokio::time::sleep(SECOND_FAMILY_DELAY) => {
-            let b = attempt(cc, second, server_name);
+            let b = attempt(cc, second, server_name, deadline);
             tokio::pin!(b);
             tokio::select! {
                 r = &mut a => match r {
@@ -385,12 +416,13 @@ pub fn connect(
 ) -> Result<u64, String> {
     let rejected = Arc::new(AtomicBool::new(false));
     let cc = client_config(params, rejected.clone())?;
+    let deadline = params.limits.handshake();
     let obj = ConnObj::new(ctx.clone(), None, rejected);
     let h = obj.handle;
     lock(&CONNS).insert(h, obj.clone());
     let o = obj.clone();
     let task = rt().spawn(async move {
-        match dial(cc, &host, port, &server_name).await {
+        match dial(cc, &host, port, &server_name, deadline).await {
             Ok(conn) => {
                 {
                     let mut slot = lock(&o.conn);

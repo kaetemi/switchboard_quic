@@ -20,7 +20,7 @@ use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, Server
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
 use rustls::{CertificateError, DigitallySignedStruct, SignatureScheme};
 
-/// Transport limits, the same for both sides.
+/// Transport limits and the handshake deadline, the same for both sides.
 #[derive(Clone, Copy, Debug)]
 pub struct Limits {
     /// Bidirectional streams the peer may have open at once (`initial_max_streams_bidi`).
@@ -33,6 +33,16 @@ pub struct Limits {
     pub idle_ms: u64,
     /// Keep-alive interval in milliseconds, 0 for none.
     pub keep_alive_ms: u64,
+    /// How long a handshake may take, in milliseconds, 0 for no deadline of its own (quinn then
+    /// bounds it by the idle timeout alone). Not a transport parameter: the shim enforces it.
+    pub handshake_ms: u64,
+}
+
+impl Limits {
+    /// The handshake deadline, None for none.
+    pub fn handshake(&self) -> Option<Duration> {
+        (self.handshake_ms > 0).then(|| Duration::from_millis(self.handshake_ms))
+    }
 }
 
 fn varint(v: u64, what: &str) -> Result<quinn::VarInt, String> {
@@ -95,9 +105,15 @@ pub struct ClientParams {
     pub limits: Limits,
 }
 
+/// A listener's configuration: quinn's, and the deadline of each handshake it accepts.
+pub struct ServerParams {
+    pub config: quinn::ServerConfig,
+    pub handshake: Option<Duration>,
+}
+
 pub enum ConfigObj {
     Client(ClientParams),
-    Server(quinn::ServerConfig),
+    Server(ServerParams),
 }
 
 /// Parses an ALPN list in its wire form (each token prefixed by its length byte).
