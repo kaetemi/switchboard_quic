@@ -28,8 +28,9 @@ external int sbq_abi_version();
 external int sbq_init(SbqDoorbell doorbell, int worker_threads);
 
 /// Ends a context: closes its connections (code 0), WebTransport sessions and their HTTP/3
-/// connections, and listeners, drops its streams and queued events. When it returns, the doorbell will not be called again for this context. Not a leaf
-/// call: it waits for a doorbell call in progress.
+/// connections, and listeners, drops its streams and queued events. When it returns, the
+/// doorbell will not be called again for this context. Not a leaf call: it waits for a doorbell
+/// call in progress.
 @ffi.Native<ffi.Int32 Function(ffi.Uint64)>()
 external int sbq_shutdown(int ctx_id);
 
@@ -86,13 +87,13 @@ external int sbq_generate_self_signed(
 
 /// Creates a client configuration. `alpn` is the ALPN list in wire form (each token preceded by
 /// its length byte; a list that offers `h3` gives the connection HTTP/3's transport parameters:
-/// 16 unidirectional streams and the datagram parameter); `verify` one of `SBQ_VERIFY_*`; `pins` `pin_count` SHA-256 hashes of 32
-/// bytes each (`SBQ_VERIFY_PINNED`); `max_bidi` the bidirectional streams the server may open at
-/// once; windows in bytes; times in milliseconds, 0 for none. `handshake_ms` bounds each
-/// handshake attempt of a connect (one per address tried): CLOSED with `SBQ_CLOSE_TIMED_OUT`
-/// follows when none completed in time; with 0 the idle timeout alone bounds the handshake, and
-/// with both 0 nothing does. 0-RTT is never used. Returns the configuration handle (free it with
-/// `sbq_config_free`) or an error.
+/// 16 unidirectional streams and the datagram parameter); `verify` one of `SBQ_VERIFY_*`;
+/// `pins` `pin_count` SHA-256 hashes of 32 bytes each (`SBQ_VERIFY_PINNED`); `max_bidi` the
+/// bidirectional streams the server may open at once; windows in bytes; times in milliseconds,
+/// 0 for none. `handshake_ms` bounds each handshake attempt of a connect (one per address
+/// tried): CLOSED with `SBQ_CLOSE_TIMED_OUT` follows when none completed in time; with 0 the
+/// idle timeout alone bounds the handshake, and with both 0 nothing does. 0-RTT is never used.
+/// Returns the configuration handle (free it with `sbq_config_free`) or an error.
 @ffi.Native<
   ffi.Int64 Function(
     ffi.Pointer<ffi.Uint8>,

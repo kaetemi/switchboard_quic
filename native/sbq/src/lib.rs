@@ -21,10 +21,10 @@ Authors:
 //! copied before the call returns; buffers passed out are filled before it returns.
 //!
 //! Results: `i64` results are a count or handle when >= 0 (0 also meaning `SBQ_WOULD_BLOCK` or
-//! `SBQ_OK` where documented), one of the `SBQ_ERR_*` codes, `SBQ_FIN`, `SBQ_NO_CODE`, or, at or
-//! below `-SBQ_CODE_BASE`, an application error code `code = -result - SBQ_CODE_BASE` (a reset or
-//! a STOP_SENDING from the peer). `sbq_last_error` describes the last failure on the calling
-//! thread.
+//! `SBQ_OK` where documented), one of the `SBQ_ERR_*` codes, `SBQ_FIN`, `SBQ_NO_CODE`,
+//! `SBQ_RETRY`, or, at or below `-SBQ_CODE_BASE`, an application error code `code = -result -
+//! SBQ_CODE_BASE` (a reset or a STOP_SENDING from the peer). `sbq_last_error` describes the last
+//! failure on the calling thread.
 //!
 //! WebTransport: a connection whose ALPN is `h3` runs HTTP/3 (`h3`, `h3conn`) and carries
 //! WebTransport sessions (`wt`). A session is a handle in the same table as connections: the
@@ -240,8 +240,9 @@ pub extern "C" fn sbq_init(doorbell: SbqDoorbell, worker_threads: u32) -> u64 {
 }
 
 /// Ends a context: closes its connections (code 0), WebTransport sessions and their HTTP/3
-/// connections, and listeners, drops its streams and queued events. When it returns, the doorbell will not be called again for this context. Not a leaf
-/// call: it waits for a doorbell call in progress.
+/// connections, and listeners, drops its streams and queued events. When it returns, the
+/// doorbell will not be called again for this context. Not a leaf call: it waits for a doorbell
+/// call in progress.
 #[no_mangle]
 pub extern "C" fn sbq_shutdown(ctx_id: u64) -> i32 {
     let Some(ctx) = lock(&CTXS).remove(&ctx_id) else {
@@ -383,13 +384,13 @@ fn limits(
 
 /// Creates a client configuration. `alpn` is the ALPN list in wire form (each token preceded by
 /// its length byte; a list that offers `h3` gives the connection HTTP/3's transport parameters:
-/// 16 unidirectional streams and the datagram parameter); `verify` one of `SBQ_VERIFY_*`; `pins` `pin_count` SHA-256 hashes of 32
-/// bytes each (`SBQ_VERIFY_PINNED`); `max_bidi` the bidirectional streams the server may open at
-/// once; windows in bytes; times in milliseconds, 0 for none. `handshake_ms` bounds each
-/// handshake attempt of a connect (one per address tried): CLOSED with `SBQ_CLOSE_TIMED_OUT`
-/// follows when none completed in time; with 0 the idle timeout alone bounds the handshake, and
-/// with both 0 nothing does. 0-RTT is never used. Returns the configuration handle (free it with
-/// `sbq_config_free`) or an error.
+/// 16 unidirectional streams and the datagram parameter); `verify` one of `SBQ_VERIFY_*`;
+/// `pins` `pin_count` SHA-256 hashes of 32 bytes each (`SBQ_VERIFY_PINNED`); `max_bidi` the
+/// bidirectional streams the server may open at once; windows in bytes; times in milliseconds,
+/// 0 for none. `handshake_ms` bounds each handshake attempt of a connect (one per address
+/// tried): CLOSED with `SBQ_CLOSE_TIMED_OUT` follows when none completed in time; with 0 the
+/// idle timeout alone bounds the handshake, and with both 0 nothing does. 0-RTT is never used.
+/// Returns the configuration handle (free it with `sbq_config_free`) or an error.
 #[no_mangle]
 pub unsafe extern "C" fn sbq_client_config(
     alpn: *const u8,

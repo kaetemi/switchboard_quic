@@ -1186,3 +1186,46 @@ fn the_stream_limit_of_a_session() {
     let r3 = h.stream_of(s);
     assert_eq!(h.read_all(r3), Ok(b"3".to_vec()));
 }
+
+/// Seconds since 1970 of a UTCTime `YYMMDDHHMMSSZ` (years 2000 to 2049).
+fn utc_time(t: &[u8]) -> i64 {
+    let n = |i: usize| i64::from(t[i] - b'0') * 10 + i64::from(t[i + 1] - b'0');
+    let (y, m, d) = (2000 + n(0), n(2), n(4));
+    // Days from the civil date (H. Hinnant's algorithm).
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y / 400;
+    let yoe = y - era * 400;
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146097 + doe - 719468;
+    days * 86400 + n(6) * 3600 + n(8) * 60 + n(10)
+}
+
+#[test]
+fn a_self_signed_certificate_a_browser_accepts_for_its_hash() {
+    // The W3C API's serverCertificateHashes: X.509v3, an ECDSA P-256 key, a validity period
+    // that is current and at most 14 days long.
+    let (cert, _key) = self_signed("127.0.0.1");
+    let find = |pattern: &[u8]| cert.windows(pattern.len()).position(|w| w == pattern);
+    // version [0] INTEGER 2 (v3)
+    assert!(find(&[0xa0, 0x03, 0x02, 0x01, 0x02]).is_some());
+    // id-ecPublicKey and prime256v1
+    assert!(find(&[0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01]).is_some());
+    assert!(find(&[0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07]).is_some());
+    // The validity: two UTCTimes.
+    let at = find(&[0x17, 0x0d]).expect("notBefore");
+    let not_before = utc_time(&cert[at + 2..at + 15]);
+    let at2 = at + 15 + find_from(&cert[at + 15..], &[0x17, 0x0d]).expect("notAfter");
+    let not_after = utc_time(&cert[at2 + 2..at2 + 15]);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    assert_eq!(not_after - not_before, 14 * 86400);
+    assert!(not_before <= now && now < not_after);
+    assert!(now - not_before <= 6 * 60, "{}", now - not_before);
+}
+
+fn find_from(b: &[u8], pattern: &[u8]) -> Option<usize> {
+    b.windows(pattern.len()).position(|w| w == pattern)
+}

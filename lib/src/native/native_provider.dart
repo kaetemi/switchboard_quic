@@ -122,10 +122,12 @@ final class NativeQuicProvider implements QuicConnector {
   /// process, by the first isolate that uses the provider.
   static int workerThreads = 2;
 
-  /// Generates a self-signed ECDSA P-256 certificate for [subject] (its
-  /// common name and subject alternative name; an IP address when it parses
-  /// as one), valid from five minutes ago for [validityDays] days. With the
-  /// default 14 days it also suits WebTransport's `serverCertificateHashes`.
+  /// Generates a self-signed ECDSA P-256 certificate (X.509v3) for
+  /// [subject] (its common name and subject alternative name; an IP address
+  /// when it parses as one), valid from five minutes ago for [validityDays]
+  /// days. With the default 14 days it also suits the W3C WebTransport API's
+  /// `serverCertificateHashes`, which accepts no longer validity: a browser
+  /// pins [NativeCertificate.sha256].
   static NativeCertificate generateSelfSigned(
     String subject, {
     int validityDays = 14,

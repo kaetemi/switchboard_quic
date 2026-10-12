@@ -30,7 +30,7 @@ Authors:
 // The stream direction was finished, reset or stopped by this side already.
 #define SBQ_ERR_CLOSED -2
 
-// The connection has ended.
+// The connection has ended (for a stream of a WebTransport session: or the session).
 #define SBQ_ERR_CONNECTION -3
 
 // Unknown (or released) handle.
@@ -221,8 +221,9 @@ uint32_t sbq_abi_version(void);
 uint64_t sbq_init(SbqDoorbell doorbell, uint32_t worker_threads);
 
 // Ends a context: closes its connections (code 0), WebTransport sessions and their HTTP/3
-// connections, and listeners, drops its streams and queued events. When it returns, the doorbell will not be called again for this context. Not a leaf
-// call: it waits for a doorbell call in progress.
+// connections, and listeners, drops its streams and queued events. When it returns, the
+// doorbell will not be called again for this context. Not a leaf call: it waits for a doorbell
+// call in progress.
 int32_t sbq_shutdown(uint64_t ctx_id);
 
 // Moves up to `cap` queued events of the context into `out`; returns how many. Call until it
@@ -252,13 +253,13 @@ int32_t sbq_generate_self_signed(const uint8_t *subject,
 
 // Creates a client configuration. `alpn` is the ALPN list in wire form (each token preceded by
 // its length byte; a list that offers `h3` gives the connection HTTP/3's transport parameters:
-// 16 unidirectional streams and the datagram parameter); `verify` one of `SBQ_VERIFY_*`; `pins` `pin_count` SHA-256 hashes of 32
-// bytes each (`SBQ_VERIFY_PINNED`); `max_bidi` the bidirectional streams the server may open at
-// once; windows in bytes; times in milliseconds, 0 for none. `handshake_ms` bounds each
-// handshake attempt of a connect (one per address tried): CLOSED with `SBQ_CLOSE_TIMED_OUT`
-// follows when none completed in time; with 0 the idle timeout alone bounds the handshake, and
-// with both 0 nothing does. 0-RTT is never used. Returns the configuration handle (free it with
-// `sbq_config_free`) or an error.
+// 16 unidirectional streams and the datagram parameter); `verify` one of `SBQ_VERIFY_*`;
+// `pins` `pin_count` SHA-256 hashes of 32 bytes each (`SBQ_VERIFY_PINNED`); `max_bidi` the
+// bidirectional streams the server may open at once; windows in bytes; times in milliseconds,
+// 0 for none. `handshake_ms` bounds each handshake attempt of a connect (one per address
+// tried): CLOSED with `SBQ_CLOSE_TIMED_OUT` follows when none completed in time; with 0 the
+// idle timeout alone bounds the handshake, and with both 0 nothing does. 0-RTT is never used.
+// Returns the configuration handle (free it with `sbq_config_free`) or an error.
 int64_t sbq_client_config(const uint8_t *alpn,
                           size_t alpn_len,
                           int32_t verify,
