@@ -779,12 +779,24 @@ class QuicChannel extends MuxChannel {
   /// stops sending at once, resetting its direction with the same code,
   /// and keeps reading until the peer's direction ends.
   void _onStopSending(int? code) {
-    if (_peerEnded || connection._closing) return;
+    if (connection._closing) return;
     final status = statusOfQuicErrorCode(code);
     if (_ended) {
       // Ended for this side already; what it still had to send goes no
       // further.
       _resetDirection(code ?? quicErrorCode(status));
+      return;
+    }
+    if (_peerEnded) {
+      // The peer's direction ended first (its CLOSE record, say), and its
+      // STOP_SENDING now ends this side's close in turn, which the peer
+      // gave up waiting for (its confirmation timeout): this side's
+      // direction ends here (the stack reset it with the code), and with
+      // it the channel, instead of waiting for its own timeout.
+      _noteStatus(status);
+      _resetDirection(code ?? quicErrorCode(status));
+      _wakeWritable();
+      _checkEnd();
       return;
     }
     _noteStatus(status, fromCode: true);

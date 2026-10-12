@@ -25,3 +25,30 @@
 * Tests: an in-memory provider with independent stream delivery, the test
   vectors of the page, the connection and channel contracts, and two nodes
   end to end.
+* Provider contract (review of the binding): `QuicSession.draining` (read
+  as a `GOAWAY` with `GOING_AWAY`), `incomingUnidirectionalStreams` of
+  `QuicReceiveStream`s (the binding stops them with `UNSUPPORTED`),
+  `QuicStream.resetReceived` (a reset observed while no read is pending,
+  so that a reader the application paused still sees an abort), and a
+  `STOP_SENDING` without a code distinguished from acknowledgement.
+* The native provider implements them: the shim's
+  `sbq_stream_poll_reset` (ABI 2) tells a reset without reading and arms
+  the READABLE event otherwise, which the provider calls whenever no read
+  is pending; raw QUIC has no draining signal (`draining` never
+  completes), and the shim grants no unidirectional streams, so none is
+  ever delivered.
+* The binding over the native provider, end to end
+  (`test/native_integration_test.dart`): Switchboard nodes over UDP on
+  the loopback with exporter-bound mutual identification (the exporter
+  equal at both ends, 32 bytes, `QuicBindingConnection.exporterForTesting`),
+  an unidentified dialler refused, a pin right and wrong, Talk, 8 MiB bulk
+  payloads, `whenWritable` pacing, 64 parallel channels recycling stream
+  credit, GOAWAY with code and reason both ways, a paused reader seeing a
+  reset, the idle timeout as `CONNECTION_LOST`, the proxy toward a frame
+  mux backend, and throughput lines. `tool/native_smoke.dart` runs the
+  binding over the provider too, in JIT and AOT.
+* Fix: a `STOP_SENDING` arriving after the peer's CLOSE record (the peer
+  gave up waiting for this side's close in turn) ends the channel at once
+  instead of at this side's own confirmation timeout. The fake provider
+  gives a stopped direction no more stream credit, as a QUIC stack.
+* The node-level tests are marked `@TestOn('vm')`.

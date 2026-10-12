@@ -1,11 +1,16 @@
-# `dart test` runs everything on the VM, against the in-memory provider of
-# test/fake_provider.dart.
+# `dart test` runs everything on the VM: the binding against the in-memory
+# provider of test/fake_provider.dart (vectors_test, binding_test,
+# switchboard_test, review_switchboard_test), the native provider over the
+# loopback (native_provider_test), and the binding over the native provider
+# between Switchboard nodes (native_integration_test). The native tests need
+# the shim, which the build hook provides (a prebuilt library or a cargo
+# build; see native/README.md).
 #
 # `dart test -P node` runs the tests of `package:switchboard_quic/core.dart`
 # (which compiles for the web) compiled to JavaScript on Node.js: the wire
 # codecs and their 32 and 48-bit arithmetic, and the connection and channel
 # of the binding, as a browser frontend runs them over the web provider.
-# The node-level tests (switchboard_test.dart) need dart:io.
+# Everything else needs dart:io or dart:ffi and is marked @TestOn('vm').
 presets:
   node:
     platforms: [node]

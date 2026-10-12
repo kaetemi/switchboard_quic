@@ -201,6 +201,16 @@ class QuicBindingConnection extends BindingConnection {
   /// `EXPORTER` flag of its `HELLO`.
   bool get hasExporter => _exporter != null;
 
+  /// A copy of the exporter this side derived for the connection (32
+  /// bytes), null when its stack has none. Keying material: for tests and
+  /// diagnostics that check both ends of a session derive the same value
+  /// and two sessions different ones, never for logs.
+  @visibleForTesting
+  Uint8List? get exporterForTesting {
+    final exporter = _exporter;
+    return exporter == null ? null : Uint8List.fromList(exporter);
+  }
+
   // Channels.
   late final StreamController<MuxChannel> _incoming;
   final Map<int, QuicChannel> _channels = {};

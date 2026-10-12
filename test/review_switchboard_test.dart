@@ -5,7 +5,14 @@ Copyright (C) 2018-2026  Jan BOON (Kaetemi)
 Authors:
   Jan Boon <jan.boon@kaetemi.be>
   GPT-6 Astra <noreply@openai.com>
+  Claude Opus 5.5 <noreply@anthropic.com>
 */
+
+// Review cases of the binding with Switchboard nodes (the node API needs
+// dart:io).
+
+@TestOn('vm')
+library;
 
 import 'dart:async';
 import 'dart:typed_data';

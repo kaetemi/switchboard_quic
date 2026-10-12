@@ -420,6 +420,31 @@ void main() {
       expect(connection.openChannelCount, 0);
     });
 
+    test('STOP_SENDING after the peer\'s CLOSE record ends a close in turn '
+        'stalled at the peer\'s window at once', () async {
+      // The peer closed, then gave up waiting for the confirmation, which
+      // waits behind a window the peer does not read: its STOP_SENDING
+      // ends the channel here too, not this side's own timeout (5 s).
+      final (connection, raw) = await bindingAndRaw(
+        bindingIsInitiator: true,
+        rawEnd: const FakeEndConfig(streamWindow: 1000),
+      );
+      final channel = connection.open(Uint8List(0));
+      channel.stream.listen((_) {});
+      // The OPEN record (10 bytes) and this DATA record fill the window.
+      await channel.send(pattern(1000 - 10 - 4)).timeout(limit);
+      final stream = await raw.nextStream();
+      await stream.write(encodeCloseRecord(Status.ok));
+      await stream.finish();
+      await until(() => channel.state == MuxChannelState.closed);
+      stream.stop(StatusCode.deadlineExceeded.code);
+      expect(
+        await channel.done.timeout(const Duration(seconds: 2)),
+        hasCode(StatusCode.deadlineExceeded),
+      );
+      expect(connection.openChannelCount, 0);
+    });
+
     test('the confirmation timeout resets a direction whose CLOSE is stuck '
         'behind data the peer does not read: DEADLINE_EXCEEDED', () async {
       final (connection, raw) = await bindingAndRaw(

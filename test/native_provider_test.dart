@@ -772,8 +772,11 @@ void main() {
         server,
         clientConfig(idle: idle, keepAlive: Duration.zero),
       );
-      final client = await p.client.done.timeout(const Duration(seconds: 5));
-      final peer = await p.server.done.timeout(const Duration(seconds: 5));
+      // quinn waits at least three probe timeouts, which a handshake on a
+      // loaded runner (another suite moving data meanwhile) can stretch to
+      // seconds: the bound is generous.
+      final client = await p.client.done.timeout(const Duration(seconds: 20));
+      final peer = await p.server.done.timeout(const Duration(seconds: 20));
       expect(client.lost, isTrue);
       expect(client.code, isNull);
       expect(peer.lost, isTrue);

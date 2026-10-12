@@ -11,12 +11,15 @@ Authors:
 // and AOT (tool/aot_smoke.sh builds it with `dart build cli`): a listener with
 // a self-signed certificate, a pinned client, an echo in both directions with
 // FIN, the exporter on both ends, an application close seen by the peer, and
-// 64 MiB through one stream. Exits non-zero on any failure.
+// 64 MiB through one stream; then the binding over the provider: two
+// connections with exporter-bound HELLOs, a channel echoing a subframe, the
+// close of the connection seen as a GOAWAY. Exits non-zero on any failure.
 
 import 'dart:async';
 import 'dart:io';
 import 'dart:typed_data';
 
+import 'package:switchboard_quic/core.dart' show QuicBindingConnection;
 import 'package:switchboard_quic/switchboard_quic_native.dart';
 
 Future<void> main() async {
@@ -35,7 +38,7 @@ Future<void> main() async {
       privateKeyDer: cert.privateKeyDer,
     ),
   );
-  final accepted = listener.sessions.first;
+  final sessions = StreamIterator(listener.sessions);
   final client = await provider.connect(
     listener.endpoint,
     QuicClientConfig(
@@ -43,7 +46,8 @@ Future<void> main() async {
       serverCertificateHashes: [cert.sha256],
     ),
   );
-  final server = await accepted;
+  check(await sessions.moveNext(), 'accepted session');
+  final server = sessions.current;
   check(client.protocol == quicAlpn && server.protocol == quicAlpn, 'ALPN');
   check(_eq(client.peerCertificateHash!, cert.sha256), 'peer certificate hash');
 
@@ -99,8 +103,44 @@ Future<void> main() async {
     end.code == 7 && end.reason == 'done' && end.byPeer,
     'close seen by the peer',
   );
+
+  // The binding over the provider.
+  final dialled = await provider.connect(
+    listener.endpoint,
+    const QuicClientConfig(alpn: [quicAlpn], verifyCertificate: false),
+  );
+  check(await sessions.moveNext(), 'second accepted session');
+  final accepting = QuicBindingConnection.start(sessions.current);
+  final initiator = await QuicBindingConnection.start(dialled);
+  final acceptor = await accepting;
+  final incoming = StreamIterator(acceptor.incoming);
+  final channel = initiator.open(Uint8List.fromList([0]));
+  await channel.send(Uint8List.fromList('ping'.codeUnits));
+  check(await incoming.moveNext(), 'binding channel');
+  final served = incoming.current;
+  final request = StreamIterator(served.stream);
+  check(await request.moveNext(), 'binding subframe');
+  await served.send(request.current);
+  // Its close completes once the dialler took the reply and confirmed: the
+  // binding reads a channel's next record only once the previous one was
+  // taken.
+  final closing = served.close();
+  final reply = await channel.stream.toList();
+  check(
+    reply.length == 1 && String.fromCharCodes(reply.single) == 'ping',
+    'binding echo',
+  );
+  check((await channel.done).isOk, 'binding channel closed');
+  await closing;
+  await request.cancel();
+  check(initiator.exporterBound && acceptor.exporterBound, 'HELLO EXPORTER');
+  await initiator.close();
+  check((await acceptor.peerGoAwayStatus).code == 33, 'binding close');
+  await acceptor.done;
+  await sessions.cancel();
   await listener.close();
   watchdog.cancel();
+  print('native smoke: binding OK');
   print('native smoke: OK');
 }
 

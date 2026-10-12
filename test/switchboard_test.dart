@@ -14,6 +14,9 @@ Authors:
 // included), the proxy between the frame mux and the binding, and the ends
 // of connections.
 
+@TestOn('vm')
+library;
+
 import 'dart:async';
 import 'dart:typed_data';
 

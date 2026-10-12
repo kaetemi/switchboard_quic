@@ -694,9 +694,15 @@ class _Direction {
 
   void _receive(Uint8List chunk) {
     to._announce(receiver);
-    if (reset || stopSent) {
+    if (reset) {
       // Discarded: credit back at once.
       _credit(chunk.length);
+      return;
+    }
+    if (stopSent) {
+      // Discarded; a stopped stream gets no more stream credit (the
+      // sender is to stop), only the connection's.
+      _creditConnection(chunk.length);
       return;
     }
     buffer.add(chunk);
@@ -801,6 +807,15 @@ class _Direction {
     });
   }
 
+  /// The receiver discarded [n] bytes of a direction it stopped: window
+  /// back to the connection only.
+  void _creditConnection(int n) {
+    scheduleMicrotask(() {
+      from._connectionConsumed += n;
+      from._retryBlocked();
+    });
+  }
+
   /// This side's read direction ends at once: a pending read and every
   /// later one fail with a reset of [code]; STOP_SENDING goes to the
   /// sender, whose confirming reset is not observable here.
@@ -816,7 +831,10 @@ class _Direction {
     }
     buffer.clear();
     if (dropped > 0) {
-      _credit(dropped);
+      // As a QUIC stack: no stream credit for a direction it stopped, so
+      // a write stalled at the window fails with the STOP_SENDING rather
+      // than completing first.
+      _creditConnection(dropped);
     }
     final read = _read;
     _read = null;
