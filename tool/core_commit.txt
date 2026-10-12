@@ -1,0 +1,13 @@
+# Polyverse Switchboard
+# Microservice Network Architecture
+# Copyright (C) 2018-2026  Jan BOON (Kaetemi)
+# Authors:
+#   Jan Boon <jan.boon@kaetemi.be>
+#   Claude Opus 5.5 <noreply@anthropic.com>
+#
+# The commit of the core package (https://github.com/kaetemi/switchboard) this
+# package is tested against. CI (.github/workflows/ci.yml) checks it out next
+# to the package, where the path dependency ../switchboard finds it; move it
+# forward together with a change that needs a newer core. Lines starting with
+# # are comments; the first other line is the commit.
+01ccd03fdb620658f2d27c456556a6c1ca3a700c

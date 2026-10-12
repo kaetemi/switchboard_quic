@@ -562,19 +562,17 @@ void main() {
         0,
         serverConfig(window: 768),
         path: '/sb',
-        advertisedHost: '127.0.0.2',
       );
       addTearDown(server.close);
       // Delay each UDP flight. The close exceeds one stream window and therefore cannot
-      // finish before the provider is allowed to tear down the client's context.
-      await UdpRelay.start(
+      // finish before the provider is allowed to tear down the client's context. The relay
+      // has a port of its own on 127.0.0.1 (other loopback addresses are Linux's only).
+      final relay = await UdpRelay.start(
         server.port,
-        address: '127.0.0.2',
-        port: server.port,
         delay: const Duration(milliseconds: 100),
       );
       final incoming = server.sessions.first;
-      final endpoint = server.endpoint.toString();
+      final endpoint = server.endpoint.replace(port: relay.port).toString();
       final client = closeOnlyInIsolate(endpoint);
       final session = await incoming;
       await client.timeout(const Duration(seconds: 10));

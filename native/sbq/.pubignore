@@ -1,0 +1,12 @@
+# Polyverse Switchboard
+# Microservice Network Architecture
+# Copyright (C) 2018-2026  Jan BOON (Kaetemi)
+# Authors:
+#   Jan Boon <jan.boon@kaetemi.be>
+#   Claude Opus 5.5 <noreply@anthropic.com>
+#
+# What pub leaves out of native/sbq when the package is published. For pub it
+# replaces .gitignore here, which keeps prebuilt/ out of git (releases carry
+# the libraries instead): the published package ships native/sbq/prebuilt/,
+# which tool/fetch_prebuilt.sh fills from a release before publishing.
+/target/

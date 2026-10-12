@@ -1,0 +1,116 @@
+# Polyverse Switchboard
+# Microservice Network Architecture
+# Copyright (C) 2018-2026  Jan BOON (Kaetemi)
+# Authors:
+#   Jan Boon <jan.boon@kaetemi.be>
+#   Claude Opus 5.5 <noreply@anthropic.com>
+#   GPT-6 Astra <noreply@openai.com>
+#
+# CI of switchboard_quic, one job per platform: the shim (cargo fmt, clippy,
+# test), then the Dart package (analyze, format, the VM suite, whose build
+# hook builds the shim with cargo, and the AOT smoke), on Linux x64 and arm64,
+# macOS arm64 and x64, and Windows x64; the Node.js suite on Linux x64 only.
+# Core is checked out next to the package at the commit in
+# tool/core_commit.txt, where the path dependency ../switchboard finds it.
+#
+# Not here yet: the browser suites (tool/browser_smoke.sh, tool/web_smoke.sh),
+# which need headless Chrome on the runners, a later step.
+#
+# macOS minutes cost ten times Linux minutes: one job per platform, nothing
+# repeated, and a timeout on each.
+
+name: ci
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: ${{ matrix.platform }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      # Every platform reports, whichever fails first.
+      fail-fast: false
+      matrix:
+        include:
+          - { platform: linux_x64, runner: ubuntu-latest, node: true }
+          - { platform: linux_arm64, runner: ubuntu-24.04-arm }
+          - { platform: macos_arm64, runner: macos-latest }
+          # An available Intel macOS image (macos-13 is retired).
+          - { platform: macos_x64, runner: macos-15-intel }
+          - { platform: windows_x64, runner: windows-latest }
+    defaults:
+      run:
+        # Git Bash on Windows; .gitattributes keeps the scripts LF there.
+        shell: bash
+        working-directory: switchboard_quic
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          path: switchboard_quic
+
+      - name: Core commit
+        id: core
+        run: echo "commit=$(grep -v '^#' tool/core_commit.txt | head -n 1 | tr -d '[:space:]')" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v5
+        with:
+          repository: kaetemi/switchboard
+          ref: ${{ steps.core.outputs.commit }}
+          path: switchboard
+
+      # The action's ref selects the toolchain (it has no version tags).
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: switchboard_quic/native/sbq -> target
+
+      - uses: dart-lang/setup-dart@v1
+        with:
+          sdk: 3.13.5
+
+      - name: cargo fmt
+        working-directory: switchboard_quic/native/sbq
+        run: cargo fmt --check
+
+      - name: cargo clippy
+        working-directory: switchboard_quic/native/sbq
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      - name: cargo test
+        working-directory: switchboard_quic/native/sbq
+        run: cargo test --locked
+
+      - name: dart pub get
+        run: dart pub get
+
+      - name: dart analyze
+        run: dart analyze
+
+      - name: dart format
+        run: dart format --output=none --set-exit-if-changed .
+
+      - name: VM suite
+        run: dart test -j 2
+
+      - name: Node.js suite
+        if: matrix.node
+        run: |
+          node --version
+          dart test -j 2 -P node
+
+      - name: AOT smoke
+        run: sh tool/aot_smoke.sh

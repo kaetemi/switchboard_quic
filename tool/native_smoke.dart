@@ -5,6 +5,7 @@ Copyright (C) 2018-2026  Jan BOON (Kaetemi)
 Authors:
   Jan Boon <jan.boon@kaetemi.be>
   Claude Opus 5.5 <noreply@anthropic.com>
+  GPT-6 Astra <noreply@openai.com>
 */
 
 // Smoke test of the native provider, for JIT (`dart run tool/native_smoke.dart`)
@@ -136,6 +137,7 @@ Future<void> main() async {
   check((await channel.done).isOk, 'binding channel closed');
   await closing;
   await request.cancel();
+  await _hellos(initiator, acceptor);
   check(initiator.exporterBound && acceptor.exporterBound, 'HELLO EXPORTER');
   await initiator.close();
   check((await acceptor.peerGoAwayStatus).code == 33, 'binding close');
@@ -241,6 +243,7 @@ Future<void> _webTransport(
   );
   await closing;
   await request.cancel();
+  await _hellos(initiator, acceptor);
   check(
     initiator.exporterBound && acceptor.exporterBound,
     'WebTransport HELLO EXPORTER',
@@ -254,6 +257,20 @@ Future<void> _webTransport(
   await sessions.cancel();
   await listener.close();
   print('native smoke: WebTransport OK');
+}
+
+/// Waits (up to 5 s) until both ends have the other's `HELLO`. It travels on
+/// the control stream, which a channel's records may overtake: the acceptor
+/// writes its `HELLO` once it has read the initiator's control stream, and may
+/// have answered a channel before that.
+Future<void> _hellos(QuicBindingConnection a, QuicBindingConnection b) async {
+  final elapsed = Stopwatch()..start();
+  while (a.peerHello == null || b.peerHello == null) {
+    if (elapsed.elapsed >= const Duration(seconds: 5)) {
+      throw TimeoutException('both peers must receive HELLO', elapsed.elapsed);
+    }
+    await Future<void>.delayed(const Duration(milliseconds: 20));
+  }
 }
 
 Future<Uint8List> _readAll(QuicStream s) async {

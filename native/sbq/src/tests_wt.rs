@@ -317,7 +317,9 @@ fn a_session_accepted_with_its_protocol_streams_both_ways_and_the_exporter() {
 #[test]
 fn refusals_carry_their_status() {
     let mut h = Harness::new();
-    let (l, port) = h.wt_server(300);
+    // This bounds TLS, HTTP/3 and the unanswered request below. Allow a loaded runner or
+    // an emulated debug build to handshake, while staying below the client's 5 s deadline.
+    let (l, port) = h.wt_server(2_000);
     for status in [404u32, 403, 400] {
         let c = h.wt_dial(port, "/elsewhere", "https://evil.example", PROTOCOLS);
         let (s, _) = h.wt_request(l);
