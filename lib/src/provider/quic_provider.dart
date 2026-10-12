@@ -127,7 +127,13 @@ abstract interface class QuicSession {
   /// Closes the session with an application [code] (0 to 255 here) and a
   /// [reason] (at most 1024 bytes of UTF-8; longer reasons are cut at a
   /// character boundary). Idempotent; completes once the session has ended
-  /// (as [done]). Data still in flight is discarded.
+  /// (as [done]). Data still in flight is discarded, and what is pending on
+  /// the session fails at once. Over WebTransport, where the close is data
+  /// on the CONNECT stream that disposing of the stack would discard, the
+  /// session has ended once the peer's stack acknowledged the close, or a
+  /// bounded wait for that passed (the native provider: three round trips,
+  /// within 0.2 to 2 s, the wait a peer that is gone costs); the provider can
+  /// then be disposed of without cutting the close short.
   Future<void> close(int code, String reason);
 
   /// Completes when the session has ended, with how.
@@ -253,7 +259,11 @@ class QuicClientConfig {
   /// with `unreachable` (a provider that tries several addresses of a name
   /// may give each attempt its own). Zero for no deadline of its own:
   /// [idleTimeout] alone bounds it then, and nothing does when that is zero
-  /// too.
+  /// too. Over WebTransport it bounds the QUIC handshake and again the
+  /// HTTP/3 exchange that establishes the session (the server's SETTINGS and
+  /// its response); with zero, a provider may still bound that exchange
+  /// (the native provider: 10 seconds), which no idle timeout would end
+  /// while the server's stack answers.
   final Duration handshakeTimeout;
 }
 
@@ -295,7 +305,9 @@ class QuicServerConfig {
   /// [QuicListener.sessions]. Zero for no deadline of its own: [idleTimeout]
   /// alone bounds it then, and with that zero too a client that goes silent
   /// halfway through its handshake holds its state until the listener
-  /// closes.
+  /// closes. A WebTransport listener also bounds a request's HTTP/3
+  /// exchange and its wait for an answer with it; with zero, a provider may
+  /// still bound those (the native provider: 10 seconds).
   final Duration handshakeTimeout;
 }
 

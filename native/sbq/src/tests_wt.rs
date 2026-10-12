@@ -1621,7 +1621,7 @@ fn old_closed_sessions_are_not_mistaken_for_future_sessions() {
     let mut h = Harness::new();
     let (l, port) = h.wt_server_with(5_000, 128);
     let raw = Raw::wt(port);
-    let (_keep_send, mut keep_recv, _) = raw.request(&headers(&request_fields(b"/sb")));
+    let (_keep_send, mut keep_recv, keep_sid) = raw.request(&headers(&request_fields(b"/sb")));
     let (keep, _) = h.wt_request(l);
     assert_eq!(unsafe { sbq_wt_accept(keep, std::ptr::null(), 0) }, 0);
     assert_eq!(Raw::status(&mut keep_recv), Ok(200));
@@ -1638,7 +1638,75 @@ fn old_closed_sessions_are_not_mistaken_for_future_sessions() {
     }
     let (_send, mut recv) = raw.wt_stream(oldest, b"late");
     assert_eq!(reset_code(&mut recv), Some(wt::err::WT_SESSION_GONE));
+    // A late stream of the live session, older than every refused one, is still its own.
+    let (_send, _recv) = raw.wt_stream(keep_sid, b"late but live");
+    h.stream_of(keep);
     // A future CONNECT ID is still bufferable, even beyond every accepted peer stream.
     let (_send, _recv) = raw.wt_stream(4_000, b"future");
     assert!(raw.conn.close_reason().is_none());
+}
+
+/// A UDP relay to the listener on `port`, on the loopback; what the client sends is dropped
+/// while `drop_up` is set. Returns the relay's port and its task.
+fn relay(
+    port: u16,
+    drop_up: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> (u16, tokio::task::JoinHandle<()>) {
+    let sock = block(tokio::net::UdpSocket::bind("127.0.0.1:0")).unwrap();
+    let local = sock.local_addr().unwrap().port();
+    let server: std::net::SocketAddr = ([127, 0, 0, 1], port).into();
+    let task = ctx::rt().spawn(async move {
+        let mut client = None;
+        let mut buf = vec![0u8; 65536];
+        while let Ok((n, from)) = sock.recv_from(&mut buf).await {
+            if from == server {
+                if let Some(c) = client {
+                    let _ = sock.send_to(&buf[..n], c).await;
+                }
+            } else {
+                client = Some(from);
+                if !drop_up.load(std::sync::atomic::Ordering::Relaxed) {
+                    let _ = sock.send_to(&buf[..n], server).await;
+                }
+            }
+        }
+    });
+    (local, task)
+}
+
+#[test]
+fn a_close_whose_fin_is_never_acknowledged_reports_closed_and_resets_nothing() {
+    let mut h = Harness::new();
+    let (l, port) = h.wt_server(5_000);
+    let drop_up = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (relay_port, relay_task) = relay(port, drop_up.clone());
+    let raw = Raw::wt(relay_port);
+    // Two sessions: the second keeps the QUIC connection up once the first has closed.
+    let mut sessions = Vec::new();
+    for _ in 0..2 {
+        let (send, mut recv, _) = raw.request(&headers(&request_fields(b"/sb")));
+        let (session, _) = h.wt_request(l);
+        assert_eq!(unsafe { sbq_wt_accept(session, std::ptr::null(), 0) }, 0);
+        assert_eq!(Raw::status(&mut recv), Ok(200));
+        sessions.push((send, recv, session));
+    }
+    // From here no acknowledgement of the client reaches the server.
+    drop_up.store(true, std::sync::atomic::Ordering::Relaxed);
+    let start = Instant::now();
+    assert_eq!(close(sessions[0].2, 9, "bye"), 0);
+    // CLOSED waits for the acknowledgement, and without one comes with the close wait.
+    let e = h.closed(sessions[0].2);
+    let waited = start.elapsed();
+    assert_eq!((e.a, e.b), (SBQ_CLOSE_APP_LOCAL, 9));
+    assert!(
+        waited >= Duration::from_millis(150) && waited < Duration::from_secs(3),
+        "{waited:?}"
+    );
+    std::thread::sleep(Duration::from_millis(200));
+    // The capsule and FIN reached the client; no reset after them took them back (quinn
+    // discards a stream's unread data when a reset arrives).
+    let recv = &mut sessions[0].1;
+    let got = block(recv.read_to_end(4096)).expect("the CONNECT stream ends with FIN");
+    assert_eq!(got, capsule_frame(&wt::close_capsule(9, b"bye")));
+    relay_task.abort();
 }

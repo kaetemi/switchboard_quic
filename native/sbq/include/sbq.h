@@ -300,9 +300,9 @@ int64_t sbq_server_config(const uint8_t *alpn,
 // Frees a configuration; connections and listeners made with it are unaffected.
 int32_t sbq_config_free(uint64_t config);
 
-// Listens on `host` (an IP address literal, UTF-8) and `port` (0 for any) with a
-// server configuration. Resolve names asynchronously before calling. Returns the listener
-// handle; INCOMING events follow (WT_REQUEST for HTTP/3).
+// Listens on `host` (an IP address literal, UTF-8; a name is `SBQ_ERR_ARG`, since resolving
+// it here could block: resolve it before) and `port` (0 for any) with a server configuration.
+// Returns the listener handle; INCOMING events follow (WT_REQUEST for HTTP/3).
 int64_t sbq_listen(uint64_t ctx_id,
                    uint64_t config,
                    const uint8_t *host,
@@ -387,13 +387,13 @@ int32_t sbq_wt_drain(uint64_t session);
 //
 // A WebTransport session: `code` is a u32 (`SBQ_ERR_ARG` beyond) and the reason is cut to 1024
 // bytes at a character boundary (invalid UTF-8 is `SBQ_ERR_ARG`); a live session sends
-// WT_CLOSE_SESSION with them and FIN on its
-// CONNECT stream, and its streams are reset and stopped with WT_SESSION_GONE; CLOSED
-// (`SBQ_CLOSE_APP_LOCAL`) follows acknowledgement of the CONNECT close or the bounded wait.
-// Application I/O fails immediately. The QUIC connection is closed once its last
-// session has, and the peer has closed the CONNECT stream (or three round trips passed, within
-// 0.2 to 2 s). A client's session still connecting is abandoned; a pending request is refused
-// 503.
+// WT_CLOSE_SESSION with them and FIN on its CONNECT stream, and its streams fail at once.
+// Once the peer's stack acknowledged the capsule and FIN, or three round trips passed without
+// that (within 0.2 to 2 s), the session's streams are reset and stopped with WT_SESSION_GONE
+// and CLOSED (`SBQ_CLOSE_APP_LOCAL`) is posted: an embedder may tear down its context then
+// without cutting the close short. The QUIC connection is closed once its last session has,
+// and the peer has closed the CONNECT stream (or the same wait passed). A client's session
+// still connecting is abandoned; a pending request is refused 503.
 int32_t sbq_conn_close(uint64_t conn, uint64_t code, const uint8_t *reason, size_t reason_len);
 
 // Forgets a connection and its streams; one still open is closed with code 0 first (a session:

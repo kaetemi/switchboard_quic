@@ -1,18 +1,4 @@
-<!--
-Polyverse Switchboard
-Microservice Network Architecture
-Copyright (C) 2018-2026  Jan BOON (Kaetemi)
-Authors:
-  Jan Boon <jan.boon@kaetemi.be>
-  Claude Opus 5.5 <noreply@anthropic.com>
-  GPT-6 Astra <noreply@openai.com>
--->
-
 ## 0.1.0-dev.1
-
-* Harden HTTP/3 framing, SETTINGS, QPACK prefixes and Huffman errors, Structured Fields parameters, CONNECT trailers, and capsule validation. Bound outstanding request handles and failed/closing session tasks, and recognize retired session IDs without unbounded history; stop and reset abandoned streams explicitly, including cancelled writers that hold deferred session resets.
-* Keep the native context alive until a local WebTransport close is acknowledged or its bounded wait expires, including when the last session is closed from an isolate.
-* Fix partial WebTransport stream headers stalling with small flow-control windows, binary protocol lengths of 128–255 bytes, authority routing, URI userinfo/port validation, draft-02 server negotiation, and pending CONNECT handling on GOAWAY or listener close. Move listener DNS resolution out of the synchronous native ABI.
 
 * Package created: the provider interface the binding is written against.
 * The native stream provider (`switchboard_quic_native.dart`): raw QUIC over quinn through a Rust shim with a flat C ABI (`native/sbq`), loaded through a build hook (prebuilt library or `cargo build`). quinn's priorities are strict only, so the provider puts the priority classes 1 (ordinary) and 0 (bulk) on one quinn level, where their streams interleave, and class 2 (control) strictly above; error codes beyond QUIC's 2^62 - 1 are argument errors.
@@ -148,3 +134,23 @@ Authors:
   quinn streams. `tool/native_smoke.dart` (JIT and AOT) runs a
   WebTransport session and the binding over it; `tool/browser_smoke.sh`
   runs headless Chromium against a listener of the native provider.
+* The HTTP/3 layer after review: stricter validation of framing,
+  SETTINGS, QPACK prefixes, Huffman padding, Structured Fields
+  parameters, field names and values, CONNECT trailers and capsules;
+  outstanding request handles bounded with the sessions of a
+  connection; the streams of sessions that are gone told from those of
+  sessions still to come without a history; every stream the layer gives
+  up stopped or reset explicitly, a cancelled task's included, and a FIN
+  once sent never reset. Fixed: a stream header cut short by a small
+  window stalled the stream; protocol names of 128 to 255 bytes; a
+  draft-02 server without `ENABLE_CONNECT_PROTOCOL`; a CONNECT after an
+  HTTP/3 `GOAWAY`. `sbq_listen` takes an address literal (the provider
+  resolves a listen name asynchronously).
+* A local WebTransport close completes (`CLOSED` in the shim, `close()`
+  and `done` in the provider) once the peer's stack acknowledged it, or
+  after a bounded wait (three round trips, 0.2 to 2 s), so that a
+  provider disposed of right after does not cut the close short; the
+  provider contract says so. A WebTransport listener routes by path
+  only: the `:authority` a client used is not checked (it is
+  `requestAuthority`). The HTTP/3 exchanges keep a 10 s deadline when
+  the handshake deadline is zero, as the contract now says.

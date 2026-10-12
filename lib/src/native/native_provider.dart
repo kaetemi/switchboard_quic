@@ -172,7 +172,9 @@ final class NativeQuicProvider implements QuicConnector {
 
   /// Ends every session and listener of this isolate at once (sessions close
   /// with code 0) and releases the shim's context. The provider starts again
-  /// on the next [connect] or [listen].
+  /// on the next [connect] or [listen]. A WebTransport session's close is
+  /// cut short with its QUIC connection (its peer reads the session as
+  /// lost): to end one gracefully, await its [QuicSession.close] first.
   static void shutdown() => _Sbq._current?.shutdown();
 
   /// Connects to a `quic://host:port` endpoint (raw QUIC, the ALPN tokens
@@ -359,10 +361,13 @@ final class NativeQuicProvider implements QuicConnector {
   /// configuration's own [QuicServerConfig.alpn] is not used), HTTP/3 over
   /// them, and each extended CONNECT a session request, answered here:
   ///
-  /// * a request for another authority or path than this listener (its
-  ///   query aside) is refused with 404; [advertisedHost] names the served
-  ///   host, defaulting to [host]. A wildcard bind without [advertisedHost]
-  ///   accepts any host on its port;
+  /// * a request for another path than [path] (its query aside) is refused
+  ///   with 404. The request's `:authority` is not checked (it is the
+  ///   session's [NativeQuicSession.requestAuthority]): a node is reached
+  ///   under other names and ports than the ones it advertises (a DNS name
+  ///   or an address, `localhost` or `127.0.0.1`, a port forwarded by NAT or
+  ///   a load balancer), and what protects a session is its certificate,
+  ///   its `Origin` and identification, not the name a client used;
   /// * one whose `Origin` is not among [allowedOrigins] with 403 (null, the
   ///   default, allows any; a request without `Origin` comes from a client
   ///   that is not a browser, and passes);
@@ -376,9 +381,13 @@ final class NativeQuicProvider implements QuicConnector {
   /// Accepted sessions arrive on [NativeWebTransportListener.sessions]. A
   /// connection may carry up to 16 sessions; the stream limit
   /// ([QuicServerConfig.maxStreamsBidi]) is the connection's, plus one for a
-  /// CONNECT stream. [QuicServerConfig.handshakeTimeout] also bounds the wait
-  /// of a request for its answer, and the life of a connection without a
-  /// session. The listener's endpoint is `https://advertisedHost:port/path`.
+  /// CONNECT stream. [QuicServerConfig.handshakeTimeout] also bounds the
+  /// HTTP/3 exchange of a request (its headers, the client's SETTINGS), its
+  /// wait for an answer (then 503), and the life of a connection without a
+  /// session; when it is zero, these bounds are 10 seconds (the QUIC
+  /// handshake itself then has no deadline of its own, as in [listen]). The
+  /// listener's endpoint is `https://advertisedHost:port/path`
+  /// ([advertisedHost] defaults to [host]; it names the endpoint only).
   Future<NativeWebTransportListener> listenWebTransport(
     String host,
     int port,
@@ -429,10 +438,6 @@ final class NativeQuicProvider implements QuicConnector {
       endpoint,
       config.maxStreamsBidi,
       path: endpoint.path,
-      authorityHost:
-          advertisedHost != null || (host != '0.0.0.0' && host != '::')
-          ? endpoint.host
-          : null,
       allowedOrigins: allowedOrigins?.toSet(),
       protocols: List.unmodifiable(protocols),
     );
@@ -628,7 +633,6 @@ final class NativeWebTransportListener
     this.endpoint,
     this._maxIncoming, {
     required this.path,
-    required this.authorityHost,
     required this.allowedOrigins,
     required this.protocols,
   }) {
@@ -647,9 +651,6 @@ final class NativeWebTransportListener
 
   /// The path sessions are accepted on.
   final String path;
-
-  // A wildcard bind without advertisedHost accepts any host on its port.
-  final String? authorityHost;
 
   /// The origins a browser's session may come from; null for any.
   final Set<String>? allowedOrigins;
@@ -684,8 +685,7 @@ final class NativeWebTransportListener
     var status = 0;
     if (_closed) {
       status = 503;
-    } else if (!_acceptsAuthority(request.authority) ||
-        request.path.split('?').first != path) {
+    } else if (request.path.split('?').first != path) {
       status = 404;
     } else if (request.origin != null &&
         allowedOrigins != null &&
@@ -724,24 +724,6 @@ final class NativeWebTransportListener
         request: request,
       ),
     );
-  }
-
-  bool _acceptsAuthority(String authority) {
-    try {
-      final uri = Uri.tryParse('https://$authority');
-      return uri != null &&
-          uri.host.isNotEmpty &&
-          uri.userInfo.isEmpty &&
-          !uri.authority.contains('@') &&
-          uri.path.isEmpty &&
-          !uri.hasQuery &&
-          !uri.hasFragment &&
-          uri.port == port &&
-          (authorityHost == null || uri.host == authorityHost!.toLowerCase());
-    } on FormatException {
-      // Simple Uri parsing can defer validation until a getter (notably port).
-      return false;
-    }
   }
 
   /// Stops accepting: new connections are refused, and requests on the
@@ -1003,8 +985,10 @@ final class NativeQuicSession implements QuicSession {
   /// WebTransport: `WT_CLOSE_SESSION` with the code (0 to 2^32 - 1) and the
   /// reason, then FIN on the CONNECT stream; the shim closes the QUIC
   /// connection once the peer has closed the CONNECT stream in turn, or
-  /// after a bounded wait. Completion waits for that close attempt, so
-  /// disposing the provider after `await close()` does not pre-empt it.
+  /// after a bounded wait. The future completes once the peer's stack
+  /// acknowledged the close, or after three round trips (within 0.2 to
+  /// 2 s) without that, so that disposing of the provider after
+  /// `await close()` does not cut the close short.
   @override
   Future<void> close(int code, String reason) {
     _checkCode(code, webTransport: isWebTransport);

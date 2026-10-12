@@ -107,7 +107,7 @@ const expression = `(async () => {
     await new Promise((r) => setTimeout(r, 300));
     // Another path: refused.
     try {
-      const other = new WebTransport('${wtUrl}'.replace(/\\/sb$/, '/elsewhere'), options);
+      const other = new WebTransport('${wtUrl}'.replace(/\\/sb(\\?.*)?$/, '/elsewhere'), options);
       other.closed.catch(() => {});
       await timeout(other.ready, 8000, 'ready elsewhere');
       out.otherPath = 'connected';

@@ -214,6 +214,73 @@ Future<void> closeOnlyInIsolate(String endpoint) => Isolate.run(() async {
   await Future<void>.delayed(const Duration(milliseconds: 100));
 });
 
+/// A UDP relay to a listener on the IPv4 loopback, standing for a path the
+/// test controls: a port forwarded by NAT, a slow link, a peer that is gone.
+/// Every datagram is passed on after [delay]; what the client sends is
+/// dropped while [dropFromClient] is set.
+class UdpRelay {
+  UdpRelay._(this._socket, this._target, this.delay);
+
+  /// Binds [address] and [port] (0: any) and relays to [target]; closed
+  /// after the test.
+  static Future<UdpRelay> start(
+    int target, {
+    String address = '127.0.0.1',
+    int port = 0,
+    Duration delay = Duration.zero,
+  }) async {
+    final relay = UdpRelay._(
+      await RawDatagramSocket.bind(address, port),
+      target,
+      delay,
+    );
+    relay._socket.listen(relay._relay);
+    addTearDown(relay.close);
+    return relay;
+  }
+
+  final RawDatagramSocket _socket;
+  final int _target;
+  final Duration delay;
+  final _timers = <Timer>[];
+  InternetAddress? _clientAddress;
+  int _clientPort = 0;
+  bool dropFromClient = false;
+
+  int get port => _socket.port;
+
+  void _relay(RawSocketEvent event) {
+    if (event != RawSocketEvent.read) return;
+    for (var d = _socket.receive(); d != null; d = _socket.receive()) {
+      final data = d.data;
+      final InternetAddress to;
+      final int toPort;
+      if (d.port == _target && d.address == InternetAddress.loopbackIPv4) {
+        final client = _clientAddress;
+        if (client == null) continue;
+        (to, toPort) = (client, _clientPort);
+      } else {
+        _clientAddress = d.address;
+        _clientPort = d.port;
+        if (dropFromClient) continue;
+        (to, toPort) = (InternetAddress.loopbackIPv4, _target);
+      }
+      if (delay == Duration.zero) {
+        _socket.send(data, to, toPort);
+      } else {
+        _timers.add(Timer(delay, () => _socket.send(data, to, toPort)));
+      }
+    }
+  }
+
+  void close() {
+    for (final t in _timers) {
+      t.cancel();
+    }
+    _socket.close();
+  }
+}
+
 void main() {
   setUpAll(() {
     provider = NativeQuicProvider();
@@ -500,37 +567,12 @@ void main() {
       addTearDown(server.close);
       // Delay each UDP flight. The close exceeds one stream window and therefore cannot
       // finish before the provider is allowed to tear down the client's context.
-      final proxy = await RawDatagramSocket.bind('127.0.0.2', server.port);
-      final timers = <Timer>[];
-      addTearDown(() {
-        for (final timer in timers) {
-          timer.cancel();
-        }
-        proxy.close();
-      });
-      InternetAddress? peerAddress;
-      int? peerPort;
-      proxy.listen((event) {
-        if (event != RawSocketEvent.read) return;
-        Datagram? packet;
-        while ((packet = proxy.receive()) != null) {
-          final data = packet!;
-          final fromServer = data.port == server.port;
-          if (!fromServer) {
-            peerAddress = data.address;
-            peerPort = data.port;
-          }
-          final target = fromServer
-              ? peerAddress!
-              : InternetAddress.loopbackIPv4;
-          final port = fromServer ? peerPort! : server.port;
-          timers.add(
-            Timer(const Duration(milliseconds: 100), () {
-              proxy.send(data.data, target, port);
-            }),
-          );
-        }
-      });
+      await UdpRelay.start(
+        server.port,
+        address: '127.0.0.2',
+        port: server.port,
+        delay: const Duration(milliseconds: 100),
+      );
       final incoming = server.sessions.first;
       final endpoint = server.endpoint.toString();
       final client = closeOnlyInIsolate(endpoint);
@@ -568,20 +610,40 @@ void main() {
       },
     );
 
-    test('advertised authority is enforced', () async {
+    test('the authority is not checked: other names and ports reach the '
+        'listener, which routes by path', () async {
+      // Advertised under a name the client does not use, and reached by
+      // another name and, as through a forwarded port, at another port.
       final listener = await provider.listenWebTransport(
         '127.0.0.1',
         0,
         serverConfig(),
         path: '/sb',
-        advertisedHost: 'localhost',
+        advertisedHost: 'node.invalid',
       );
       addTearDown(listener.close);
+      expect(listener.endpoint.host, 'node.invalid');
       final incoming = StreamQueue(listener.sessions);
       addTearDown(incoming.cancel);
+      final forwarded = await UdpRelay.start(listener.port);
+      for (final (host, port) in [
+        ('127.0.0.1', listener.port),
+        ('localhost', listener.port),
+        ('127.0.0.1', forwarded.port),
+      ]) {
+        final client = await provider.connect(
+          Uri.parse('https://$host:$port/sb?node=1'),
+          clientConfig(),
+        );
+        final server = await incoming.next as NativeQuicSession;
+        expect(server.requestAuthority, '$host:$port');
+        expect(server.requestPath, '/sb?node=1');
+        await client.close(0, '');
+        await server.done;
+      }
       await expectLater(
         provider.connect(
-          listener.endpoint.replace(host: '127.0.0.1'),
+          Uri.parse('https://127.0.0.1:${forwarded.port}/elsewhere'),
           clientConfig(),
         ),
         throwsA(
@@ -592,11 +654,7 @@ void main() {
           ),
         ),
       );
-      final client = await provider.connect(listener.endpoint, clientConfig());
-      final server = await incoming.next;
-      await client.close(0, '');
-      await server.done;
-      expect(listener.answered, {404: 1, 200: 1});
+      expect(listener.answered, {200: 3, 404: 1});
     });
 
     test('allowed origins match the exact string', () async {
@@ -1247,6 +1305,36 @@ void contract(Mode mode) {
       // Idempotent.
       await p.client.close(1, 'again');
     });
+
+    test(
+      'a close completes when the peer is gone: at once on raw QUIC, '
+      'after a bounded wait for its acknowledgement over WebTransport',
+      () async {
+        final server = await Server.start(mode);
+        final relay = await UdpRelay.start(server.port);
+        final accepted = server.accept();
+        final client = await provider.connect(
+          server.endpoint.replace(port: relay.port),
+          clientConfig(),
+        );
+        await accepted;
+        // Nothing the client sends arrives any more, its close included.
+        relay.dropFromClient = true;
+        final watch = Stopwatch()..start();
+        await client.close(9, 'gone').timeout(const Duration(seconds: 5));
+        final waited = watch.elapsed;
+        final end = await client.done;
+        expect((end.code, end.byPeer, end.lost), (9, false, false));
+        if (mode.wt) {
+          // No acknowledgement can come: three round trips, at least 0.2 s,
+          // at most 2 s.
+          expect(waited, greaterThan(const Duration(milliseconds: 150)));
+          expect(waited, lessThan(const Duration(seconds: 3)));
+        } else {
+          expect(waited, lessThan(const Duration(milliseconds: 500)));
+        }
+      },
+    );
 
     test('the server closes', () async {
       final server = await Server.start(mode);

@@ -333,7 +333,7 @@ fn poll_drains_whatever_the_cap() {
 
 #[test]
 fn config_errors() {
-    let _h = Harness::new();
+    let h = Harness::new();
     let bad = b"\x05abc";
     let none = std::ptr::null();
     let r = unsafe {
@@ -423,6 +423,34 @@ fn config_errors() {
     let mut msg = [0u8; 256];
     let n = unsafe { sbq_last_error(msg.as_mut_ptr(), msg.len()) };
     assert!(n > 0);
+    // A listener takes an address literal: a name would need a blocking lookup in the call.
+    let (cert, key) = self_signed("localhost");
+    let cfg = unsafe {
+        sbq_server_config(
+            ALPN.as_ptr(),
+            ALPN.len(),
+            cert.as_ptr(),
+            cert.len(),
+            key.as_ptr(),
+            key.len(),
+            1,
+            1 << 16,
+            1 << 20,
+            0,
+            0,
+            0,
+        )
+    };
+    assert!(cfg > 0);
+    let name = b"localhost";
+    let r = unsafe { sbq_listen(h.ctx, cfg as u64, name.as_ptr(), name.len(), 0) };
+    assert_eq!(r, SBQ_ERR_ARG);
+    assert!(
+        ctx::last_error().contains("address literal"),
+        "{}",
+        ctx::last_error()
+    );
+    assert_eq!(sbq_config_free(cfg as u64), 0);
     assert_eq!(write_one(12345), SBQ_ERR_HANDLE);
     assert_eq!(sbq_config_free(12345), SBQ_ERR_HANDLE as i32);
     assert_eq!(sbq_abi_version(), SBQ_ABI_VERSION);

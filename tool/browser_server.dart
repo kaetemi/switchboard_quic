@@ -8,7 +8,9 @@ Authors:
 */
 
 // The server side of tool/browser_smoke.sh: a WebTransport listener of the
-// native provider on https://127.0.0.1:port/sb with a fresh self-signed
+// native provider on https://127.0.0.1:port/sb (advertised under a name the
+// browser does not use, which the listener does not check, and dialled with
+// a query, which it routes past) with a fresh self-signed
 // certificate (ECDSA P-256, valid 14 days, what a browser accepts for
 // serverCertificateHashes), and a plain HTTP server for the page the browser
 // runs the probe in (http://127.0.0.1 is a secure context). It prints
@@ -50,12 +52,14 @@ Future<void> main() async {
     ),
     path: '/sb',
     allowedOrigins: [origin],
+    advertisedHost: 'node.invalid',
   );
+  final url = 'https://127.0.0.1:${listener.port}/sb?probe=1';
   final hash = cert.sha256
       .map((b) => b.toRadixString(16).padLeft(2, '0'))
       .join();
   print(
-    'READY ${jsonEncode({'webtransport': listener.endpoint.toString(), 'page': '$origin/', 'origin': origin, 'certificateSha256': hash, 'certificateBytes': cert.certificateDer.length})}',
+    'READY ${jsonEncode({'webtransport': url, 'page': '$origin/', 'origin': origin, 'certificateSha256': hash, 'certificateBytes': cert.certificateDer.length})}',
   );
 
   final result = <String, Object?>{};
@@ -81,6 +85,11 @@ Future<void> main() async {
       ?.map((b) => b.toRadixString(16).padLeft(2, '0'))
       .join();
   expectThat(session.requestOrigin == origin, 'the Origin of the request');
+  expectThat(session.requestPath == '/sb?probe=1', 'the path and its query');
+  expectThat(
+    session.requestAuthority == '127.0.0.1:${listener.port}',
+    'the authority the browser used',
+  );
   expectThat(session.protocol == 'switchboard', 'the protocol selected');
 
   final streams = StreamIterator(session.incomingStreams);

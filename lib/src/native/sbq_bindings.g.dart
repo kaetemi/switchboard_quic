@@ -170,9 +170,9 @@ external int sbq_server_config(
 @ffi.Native<ffi.Int32 Function(ffi.Uint64)>(isLeaf: true)
 external int sbq_config_free(int config);
 
-/// Listens on `host` (an IP address literal, UTF-8) and `port` (0 for any) with a
-/// server configuration. Resolve names asynchronously before calling. Returns the listener
-/// handle; INCOMING events follow (WT_REQUEST for HTTP/3).
+/// Listens on `host` (an IP address literal, UTF-8; a name is `SBQ_ERR_ARG`, since resolving
+/// it here could block: resolve it before) and `port` (0 for any) with a server configuration.
+/// Returns the listener handle; INCOMING events follow (WT_REQUEST for HTTP/3).
 @ffi.Native<
   ffi.Int64 Function(
     ffi.Uint64,
@@ -321,13 +321,13 @@ external int sbq_wt_drain(int session);
 ///
 /// A WebTransport session: `code` is a u32 (`SBQ_ERR_ARG` beyond) and the reason is cut to 1024
 /// bytes at a character boundary (invalid UTF-8 is `SBQ_ERR_ARG`); a live session sends
-/// WT_CLOSE_SESSION with them and FIN on its
-/// CONNECT stream, and its streams are reset and stopped with WT_SESSION_GONE; CLOSED
-/// (`SBQ_CLOSE_APP_LOCAL`) follows acknowledgement of the CONNECT close or the bounded wait.
-/// Application I/O fails immediately. The QUIC connection is closed once its last
-/// session has, and the peer has closed the CONNECT stream (or three round trips passed, within
-/// 0.2 to 2 s). A client's session still connecting is abandoned; a pending request is refused
-/// 503.
+/// WT_CLOSE_SESSION with them and FIN on its CONNECT stream, and its streams fail at once.
+/// Once the peer's stack acknowledged the capsule and FIN, or three round trips passed without
+/// that (within 0.2 to 2 s), the session's streams are reset and stopped with WT_SESSION_GONE
+/// and CLOSED (`SBQ_CLOSE_APP_LOCAL`) is posted: an embedder may tear down its context then
+/// without cutting the close short. The QUIC connection is closed once its last session has,
+/// and the peer has closed the CONNECT stream (or the same wait passed). A client's session
+/// still connecting is abandoned; a pending request is refused 503.
 @ffi.Native<
   ffi.Int32 Function(ffi.Uint64, ffi.Uint64, ffi.Pointer<ffi.Uint8>, ffi.Size)
 >(isLeaf: true)

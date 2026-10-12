@@ -34,8 +34,10 @@ Authors:
 //! the time a stream may take to send its header. Unknown frame types, settings, capsules and
 //! unidirectional stream types are ignored (frames and capsules skipped without buffering).
 //!
-//! Locks: the connection's `state` and a session's `st` are never held together, nor while a
-//! stream is registered; events are posted to the context's queue only.
+//! Locks: the connection's `state` and a session's `st` are never held together. A session's
+//! `st` comes before its stream set and the stream table: registering a stream and a close's
+//! snapshot of the session's streams both hold it, so that no stream escapes the close. Events
+//! are posted to the context's queue only.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
@@ -1981,21 +1983,35 @@ async fn writer(
                 }
             }
             Write::Close(b, streams, notification) => {
-                // The enclosing timeout and the slot's closing timer cover a peer that gives
-                // no send credit, never acknowledges the FIN, or leaves CONNECT open forever.
-                let _ = within(h3.close_wait(), async {
-                    send.write_all(&b).await.ok()?;
-                    send.finish().ok()?;
-                    send.stopped().await.ok()
-                })
-                .await;
+                // The close wait, and the slot's closing timer (which cancels this task), cover
+                // a peer that gives no send credit, never acknowledges the FIN, or leaves
+                // CONNECT open forever.
+                let wait = h3.close_wait();
+                let started = Instant::now();
+                let finished = matches!(
+                    within(wait, async {
+                        send.write_all(&b).await.ok()?;
+                        send.finish().ok()
+                    })
+                    .await,
+                    Some(Some(()))
+                );
+                if finished {
+                    // Out of the guard: a FIN sent stays sent. Resetting the stream now would
+                    // only discard a close still in flight, which quinn retransmits while the
+                    // connection lasts.
+                    let fin = send.take();
+                    let _ = within(wait.saturating_sub(started.elapsed()), fin.stopped()).await;
+                }
                 drop(streams);
                 drop(notification);
                 break;
             }
             Write::Finish => {
-                let _ = send.finish();
-                let _ = within(h3.close_wait(), send.stopped()).await;
+                if send.finish().is_ok() {
+                    let fin = send.take();
+                    let _ = within(h3.close_wait(), fin.stopped()).await;
+                }
                 break;
             }
             Write::Reset(code) => {
@@ -2898,6 +2914,51 @@ mod tests {
             fields[4].1 = path.to_vec();
             assert!(parse_request(&fields).is_err());
         }
+    }
+
+    #[test]
+    fn legitimate_fields_are_accepted() {
+        let mut fields = request();
+        fields[3].1 = b"[::1]:4433".to_vec();
+        fields[4].1 = b"/sb?x=1&y=%20".to_vec();
+        fields.extend(
+            [
+                (b"te".as_slice(), b"Trailers".as_slice()),
+                (b"origin", b"null"),
+                (b"user-agent", b"Mozilla/5.0 (X11) HeadlessChrome/149.0.0.0"),
+                (b"x-empty", b""),
+                (b"x-obs-text", b"a\xe9b"),
+                (b"x-tab", b"a\tb"),
+                (b"sec-webtransport-http3-draft02", b"1"),
+                (b"wt-available-protocols", b"\"switchboard\";q=1"),
+                (b"wt-available-protocols", b"\"other\""),
+                (b"host", b"[::1]:4433"),
+            ]
+            .into_iter()
+            .map(|(n, v)| (n.to_vec(), v.to_vec())),
+        );
+        let r = parse_request(&fields).unwrap();
+        assert!(r.webtransport() && r.draft02);
+        assert_eq!(r.path, b"/sb?x=1&y=%20");
+        assert_eq!(r.origin.as_deref(), Some(b"null".as_slice()));
+        assert_eq!(
+            r.protocols,
+            Some(vec!["switchboard".to_string(), "other".to_string()])
+        );
+        // Field names are lowercase in HTTP/3: an uppercase one is malformed (RFC 9114 4.2).
+        let mut fields = request();
+        fields.push((b"Origin".to_vec(), b"https://a.test".to_vec()));
+        assert!(parse_request(&fields).is_err());
+        let response = [
+            (b":status".as_slice(), b"200".as_slice()),
+            (b"sec-webtransport-http3-draft", b"draft02"),
+            (b"wt-protocol", b"\"switchboard\";x"),
+            (b"server", b"Example/1.0"),
+        ]
+        .map(|(n, v)| (n.to_vec(), v.to_vec()));
+        let r = parse_response(&response).unwrap();
+        assert_eq!((r.status, r.draft02), (200, true));
+        assert_eq!(r.protocol.as_deref(), Some("switchboard"));
     }
 
     #[test]

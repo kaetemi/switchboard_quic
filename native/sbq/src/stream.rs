@@ -129,12 +129,15 @@ impl StreamObj {
         }
     }
 
-    /// The session ended: reset the send direction and stop the receive direction with
-    /// WT_SESSION_GONE, as the WebTransport draft requires of every stream of the session.
+    /// This side closed the stream's session: reads and writes fail at once, as on an ended
+    /// connection, while the wire resets wait for `session_gone` (once the close has reached
+    /// the peer).
     pub fn session_ended(&self) {
         lock(&self.inner).gone = true;
     }
 
+    /// The session ended: reset the send direction and stop the receive direction with
+    /// WT_SESSION_GONE, as the WebTransport draft requires of every stream of the session.
     pub fn session_gone(&self) {
         let code = VarInt::from_u64(wt::err::WT_SESSION_GONE).expect("in range");
         let mut g = lock(&self.inner);

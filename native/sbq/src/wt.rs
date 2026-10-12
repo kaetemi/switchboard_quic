@@ -21,7 +21,8 @@ pub mod err {
     pub(crate) const WT_BUFFERED_STREAM_REJECTED: u64 = 0x3994_bd84;
     /// A data stream aborted because its session ended.
     pub(crate) const WT_SESSION_GONE: u64 = 0x170d_7b68;
-    /// The server's response selected a protocol the client did not offer (draft-13 and later).
+    /// The server's response selected a protocol the client did not offer (draft-15 and later;
+    /// drafts 13 and 14 have the client ignore such a `WT-Protocol`).
     pub(crate) const WT_ALPN_ERROR: u64 = 0x0817_b3dd;
     /// The peer's SETTINGS or transport parameters lack what WebTransport needs (draft-15 and
     /// later; older peers read it as an unknown code).
