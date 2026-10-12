@@ -1581,7 +1581,7 @@ final class _Sbq {
   static String? _loadIntoProcess() {
     final name = Platform.isWindows
         ? 'sbq.dll'
-        : Platform.isMacOS
+        : Platform.isMacOS || Platform.isIOS
         ? 'libsbq.dylib'
         : 'libsbq.so';
     final exeDir = File(Platform.resolvedExecutable).parent.path;
@@ -1613,8 +1613,9 @@ final class _Sbq {
           Pointer<Void> Function(Pointer<Utf8>, Int32),
           Pointer<Void> Function(Pointer<Utf8>, int)
         >('dlopen');
-    // RTLD_NOW | RTLD_GLOBAL.
-    final flags = Platform.isMacOS ? 0x2 | 0x8 : 0x2 | 0x100;
+    // RTLD_NOW | RTLD_GLOBAL: RTLD_GLOBAL is 0x8 on Apple's platforms, 0x100
+    // on glibc, musl and Android's bionic.
+    final flags = Platform.isMacOS || Platform.isIOS ? 0x2 | 0x8 : 0x2 | 0x100;
     return using(
           (arena) => dlopen(path.toNativeUtf8(allocator: arena), flags),
         ) !=

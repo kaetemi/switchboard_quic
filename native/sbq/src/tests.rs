@@ -92,6 +92,19 @@ impl Harness {
         idle_ms: u64,
         handshake_ms: u64,
     ) -> (u64, u16, [u8; 32]) {
+        self.server_at("127.0.0.1", max_bidi, window, idle_ms, handshake_ms)
+            .unwrap_or_else(|e| panic!("listen: {e}"))
+    }
+
+    /// A listener on `host` (an address literal), or why `sbq_listen` refused it.
+    pub(crate) fn server_at(
+        &mut self,
+        host: &str,
+        max_bidi: u64,
+        window: u64,
+        idle_ms: u64,
+        handshake_ms: u64,
+    ) -> Result<(u64, u16, [u8; 32]), String> {
         let (cert, key) = self_signed("localhost");
         let mut hash = [0u8; 32];
         unsafe { sbq_sha256(cert.as_ptr(), cert.len(), hash.as_mut_ptr()) };
@@ -112,13 +125,14 @@ impl Harness {
             )
         };
         assert!(cfg > 0, "server config: {}", ctx::last_error());
-        let host = b"127.0.0.1";
         let l = unsafe { sbq_listen(self.ctx, cfg as u64, host.as_ptr(), host.len(), 0) };
-        assert!(l > 0, "listen: {}", ctx::last_error());
         assert_eq!(sbq_config_free(cfg as u64), 0);
+        if l <= 0 {
+            return Err(ctx::last_error());
+        }
         let port = sbq_listener_port(l as u64);
         assert!(port > 0);
-        (l as u64, port as u16, hash)
+        Ok((l as u64, port as u16, hash))
     }
 
     /// Starts a connection; returns its handle (CONNECTED or CLOSED follows).
@@ -1085,5 +1099,29 @@ fn dial_falls_back_to_the_other_family() {
     assert!(conn.is_ok(), "dial failed");
     assert!(started.elapsed() < Duration::from_secs(5));
     assert_eq!(conn.ok().unwrap().remote_address(), addrs[1]);
+    h.wait("incoming", |e| e.kind == SBQ_EV_INCOMING && e.a == l as i64);
+}
+
+/// A listener on the IPv6 wildcard is dual-stack wherever the platform allows it: an IPv4
+/// client reaches `::` as it does on Linux and macOS by default, also on Windows, whose IPv6
+/// sockets are IPv6-only unless told otherwise. Skipped on a host without IPv6.
+#[test]
+fn a_listener_on_the_ipv6_wildcard_accepts_ipv4_clients() {
+    let mut h = Harness::new();
+    let (l, port, _) = match h.server_at("::", 16, 1 << 20, 30_000, 0) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("skipped: cannot listen on [::]: {e}");
+            return;
+        }
+    };
+    let c = h.dial_with(port, SBQ_VERIFY_NONE, &[], 30_000, 5_000);
+    let ev = h.wait("connected or closed", |e| {
+        (e.kind == SBQ_EV_CONNECTED || e.kind == SBQ_EV_CLOSED) && e.handle == c
+    });
+    assert_eq!(
+        ev.kind, SBQ_EV_CONNECTED,
+        "an IPv4 client did not reach [::]"
+    );
     h.wait("incoming", |e| e.kind == SBQ_EV_INCOMING && e.a == l as i64);
 }

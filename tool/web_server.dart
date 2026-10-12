@@ -173,9 +173,11 @@ Future<void> main() async {
     if (!stop.isCompleted) stop.complete();
   });
   final signals = [
-    ProcessSignal.sigterm.watch().listen((_) {
-      if (!stop.isCompleted) stop.complete();
-    }),
+    // SIGTERM cannot be watched on Windows.
+    if (!Platform.isWindows)
+      ProcessSignal.sigterm.watch().listen((_) {
+        if (!stop.isCompleted) stop.complete();
+      }),
     ProcessSignal.sigint.watch().listen((_) {
       if (!stop.isCompleted) stop.complete();
     }),

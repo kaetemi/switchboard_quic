@@ -314,9 +314,31 @@ async fn handshake(
     }
 }
 
+/// The UDP socket of a listener. A socket on an IPv6 address is made dual-stack where the
+/// platform allows it (IPV6_V6ONLY off), as quinn makes its client sockets: Linux and macOS
+/// default to dual-stack, Windows to IPv6 only, where a listener on `::` would not hear IPv4
+/// clients. Where the option cannot be changed, the socket keeps the platform's default.
+fn bind_udp(addr: SocketAddr) -> std::io::Result<std::net::UdpSocket> {
+    use socket2::{Domain, Protocol, Socket, Type};
+    let socket = Socket::new(Domain::for_address(addr), Type::DGRAM, Some(Protocol::UDP))?;
+    if addr.is_ipv6() {
+        let _ = socket.set_only_v6(false);
+    }
+    socket.bind(&addr.into())?;
+    Ok(socket.into())
+}
+
 pub fn listen(ctx: &Arc<Ctx>, sp: &ServerParams, addr: SocketAddr) -> Result<u64, String> {
     let _g = rt().enter();
-    let endpoint = Endpoint::server(sp.config.clone(), addr)
+    let endpoint = bind_udp(addr)
+        .and_then(|socket| {
+            Endpoint::new(
+                quinn::EndpointConfig::default(),
+                Some(sp.config.clone()),
+                socket,
+                Arc::new(quinn::TokioRuntime),
+            )
+        })
         .map_err(|e| format!("cannot listen on {addr}: {e}"))?;
     let h = next_handle();
     let closed = Arc::new(AtomicBool::new(false));

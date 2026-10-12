@@ -1,0 +1,15 @@
+# Polyverse Switchboard
+# Microservice Network Architecture
+# Copyright (C) 2018-2026  Jan BOON (Kaetemi)
+# Authors:
+#   Jan Boon <jan.boon@kaetemi.be>
+#   Claude Opus 5.5 <noreply@anthropic.com>
+#
+# LF in every checkout, Windows' included (Git for Windows converts to CRLF by
+# default): the shell scripts under tool/ run in Git Bash, which does not take
+# CRLF, and `dart format` and `cargo fmt --check` see the same bytes on every
+# platform.
+* text=auto eol=lf
+*.so binary
+*.dylib binary
+*.dll binary

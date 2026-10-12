@@ -675,6 +675,7 @@ dependencies = [
  "ring",
  "rustls",
  "rustls-platform-verifier",
+ "socket2",
  "time",
  "tokio",
 ]
