@@ -309,7 +309,9 @@ int32_t sbq_conn_stats(uint64_t conn, struct SbqStats *out);
 
 // Opens a bidirectional stream: returns its handle if the peer's stream limit allows it now,
 // otherwise `SBQ_WOULD_BLOCK` and an OPENED event carries the stream once it does (one event
-// per blocked call). Nothing reaches the peer before the first write.
+// per blocked call). Nothing reaches the peer before the first write. `SBQ_ERR_STATE` during
+// the handshake; `SBQ_ERR_CONNECTION` once the connection has ended, also when its handshake
+// never completed.
 int64_t sbq_stream_open(uint64_t conn);
 
 // Writes up to `len` (> 0) bytes; returns how many were accepted (the peer's flow control

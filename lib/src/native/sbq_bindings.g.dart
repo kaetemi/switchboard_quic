@@ -301,7 +301,9 @@ external int sbq_conn_stats(int conn, ffi.Pointer<SbqStats> out);
 
 /// Opens a bidirectional stream: returns its handle if the peer's stream limit allows it now,
 /// otherwise `SBQ_WOULD_BLOCK` and an OPENED event carries the stream once it does (one event
-/// per blocked call). Nothing reaches the peer before the first write.
+/// per blocked call). Nothing reaches the peer before the first write. `SBQ_ERR_STATE` during
+/// the handshake; `SBQ_ERR_CONNECTION` once the connection has ended, also when its handshake
+/// never completed.
 @ffi.Native<ffi.Int64 Function(ffi.Uint64)>(isLeaf: true)
 external int sbq_stream_open(int conn);
 

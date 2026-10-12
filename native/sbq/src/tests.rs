@@ -827,6 +827,38 @@ fn a_handshake_deadline_ends_a_dial_to_a_silent_peer() {
     assert_eq!(sbq_conn_release(unbounded), 0);
 }
 
+#[test]
+fn a_stream_cannot_be_opened_on_a_connection_whose_handshake_failed() {
+    let mut h = Harness::new();
+    let silent = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let port = silent.local_addr().unwrap().port();
+    // During the handshake: not available yet.
+    let timed_out = h.dial_with(port, SBQ_VERIFY_NONE, &[], 0, 200);
+    let abandoned = h.dial_with(port, SBQ_VERIFY_NONE, &[], 0, 0);
+    assert_eq!(sbq_stream_open(timed_out), SBQ_ERR_STATE);
+    assert_eq!(sbq_stream_open(abandoned), SBQ_ERR_STATE);
+    // After CLOSED, as SBQ_EV_CLOSED says: the connection has ended, though it never had a
+    // `Connection`, whether the deadline or this side ended the handshake.
+    let e = h.wait("deadline", |e| {
+        e.kind == SBQ_EV_CLOSED && e.handle == timed_out
+    });
+    assert_eq!(e.a, SBQ_CLOSE_TIMED_OUT);
+    assert_eq!(sbq_stream_open(timed_out), SBQ_ERR_CONNECTION);
+    assert_eq!(
+        unsafe { sbq_conn_close(abandoned, 0, std::ptr::null(), 0) },
+        0
+    );
+    let e = h.wait("abandoned", |e| {
+        e.kind == SBQ_EV_CLOSED && e.handle == abandoned
+    });
+    assert_eq!(e.a, SBQ_CLOSE_APP_LOCAL);
+    assert_eq!(sbq_stream_open(abandoned), SBQ_ERR_CONNECTION);
+    for c in [timed_out, abandoned] {
+        assert_eq!(sbq_conn_release(c), 0);
+        assert_eq!(sbq_stream_open(c), SBQ_ERR_HANDLE);
+    }
+}
+
 /// A UDP relay that passes a client's first flight to a server (what the client sends before the
 /// server's first answer) and nothing after it, in either direction: a client that starts a
 /// handshake and goes silent, as the server sees it.

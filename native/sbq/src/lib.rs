@@ -721,7 +721,9 @@ pub unsafe extern "C" fn sbq_conn_stats(conn: u64, out: *mut SbqStats) -> i32 {
 
 /// Opens a bidirectional stream: returns its handle if the peer's stream limit allows it now,
 /// otherwise `SBQ_WOULD_BLOCK` and an OPENED event carries the stream once it does (one event
-/// per blocked call). Nothing reaches the peer before the first write.
+/// per blocked call). Nothing reaches the peer before the first write. `SBQ_ERR_STATE` during
+/// the handshake; `SBQ_ERR_CONNECTION` once the connection has ended, also when its handshake
+/// never completed.
 #[no_mangle]
 pub extern "C" fn sbq_stream_open(conn: u64) -> i64 {
     stream::open(conn)

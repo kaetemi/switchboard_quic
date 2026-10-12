@@ -77,3 +77,7 @@
 * `QuicChannel.sendWindow` documented as the core contract has it for a
   binding over a stack's flow control: an estimate (room for one largest
   subframe while writable), not a count.
+* Fix: `sbq_stream_open` on a connection whose handshake never completed
+  returns `SBQ_ERR_CONNECTION` after its CLOSED event, as the event's
+  documentation says, instead of `SBQ_ERR_STATE`, which stays the answer
+  during the handshake.
