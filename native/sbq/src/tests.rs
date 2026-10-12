@@ -27,13 +27,13 @@ extern "C" fn doorbell(_ctx: u64) {
 
 const ALPN: &[u8] = b"\x0bswitchboard";
 
-struct Harness {
-    ctx: u64,
-    backlog: Vec<SbqEvent>,
+pub(crate) struct Harness {
+    pub(crate) ctx: u64,
+    pub(crate) backlog: Vec<SbqEvent>,
 }
 
 impl Harness {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let ctx = sbq_init(doorbell, 2);
         assert!(ctx > 0);
         Harness {
@@ -42,7 +42,7 @@ impl Harness {
         }
     }
 
-    fn pump(&mut self) {
+    pub(crate) fn pump(&mut self) {
         let mut buf = [SbqEvent::default(); 16];
         loop {
             let n = unsafe { sbq_poll(self.ctx, buf.as_mut_ptr(), buf.len()) };
@@ -53,13 +53,13 @@ impl Harness {
         }
     }
 
-    fn sleep(&self) {
+    pub(crate) fn sleep(&self) {
         let g = RANG.lock().unwrap();
         let _ = RANG_CV.wait_timeout(g, Duration::from_millis(10)).unwrap();
     }
 
     /// Waits (up to 10 s) for an event matching `pred` and removes it from the backlog.
-    fn wait(&mut self, what: &str, pred: impl Fn(&SbqEvent) -> bool) -> SbqEvent {
+    pub(crate) fn wait(&mut self, what: &str, pred: impl Fn(&SbqEvent) -> bool) -> SbqEvent {
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
             self.pump();
@@ -75,12 +75,17 @@ impl Harness {
         }
     }
 
-    fn server(&mut self, max_bidi: u64, window: u64, idle_ms: u64) -> (u64, u16, [u8; 32]) {
+    pub(crate) fn server(
+        &mut self,
+        max_bidi: u64,
+        window: u64,
+        idle_ms: u64,
+    ) -> (u64, u16, [u8; 32]) {
         self.server_with(max_bidi, window, idle_ms, 0)
     }
 
     /// A listener on the loopback whose handshakes have `handshake_ms` (0: no deadline).
-    fn server_with(
+    pub(crate) fn server_with(
         &mut self,
         max_bidi: u64,
         window: u64,
@@ -117,12 +122,12 @@ impl Harness {
     }
 
     /// Starts a connection; returns its handle (CONNECTED or CLOSED follows).
-    fn dial(&mut self, port: u16, verify: i32, pins: &[[u8; 32]], idle_ms: u64) -> u64 {
+    pub(crate) fn dial(&mut self, port: u16, verify: i32, pins: &[[u8; 32]], idle_ms: u64) -> u64 {
         self.dial_with(port, verify, pins, idle_ms, 0)
     }
 
     /// Starts a connection whose handshake has `handshake_ms` (0: no deadline).
-    fn dial_with(
+    pub(crate) fn dial_with(
         &mut self,
         port: u16,
         verify: i32,
@@ -166,7 +171,7 @@ impl Harness {
     }
 
     /// A connected pair: (client connection, server connection).
-    fn pair(&mut self, listener: u64, port: u16) -> (u64, u64) {
+    pub(crate) fn pair(&mut self, listener: u64, port: u16) -> (u64, u64) {
         let c = self.dial(port, SBQ_VERIFY_NONE, &[], 30_000);
         self.wait("connected", |e| e.kind == SBQ_EV_CONNECTED && e.handle == c);
         let s = self
@@ -177,7 +182,7 @@ impl Harness {
         (c, s)
     }
 
-    fn write_all(&mut self, stream: u64, data: &[u8]) {
+    pub(crate) fn write_all(&mut self, stream: u64, data: &[u8]) {
         let mut off = 0;
         while off < data.len() {
             let n = unsafe { sbq_stream_write(stream, data[off..].as_ptr(), data.len() - off) };
@@ -192,7 +197,7 @@ impl Harness {
     }
 
     /// Reads until FIN; returns the data, or the reset code as Err.
-    fn read_all(&mut self, stream: u64) -> Result<Vec<u8>, u64> {
+    pub(crate) fn read_all(&mut self, stream: u64) -> Result<Vec<u8>, u64> {
         let mut out = Vec::new();
         let mut buf = vec![0u8; 65536];
         loop {
@@ -212,7 +217,7 @@ impl Harness {
         }
     }
 
-    fn close_reason(&self, conn: u64) -> String {
+    pub(crate) fn close_reason(&self, conn: u64) -> String {
         let mut buf = [0u8; 256];
         let n = unsafe { sbq_conn_close_reason(conn, buf.as_mut_ptr(), buf.len()) };
         assert!(n >= 0);
@@ -226,7 +231,7 @@ impl Drop for Harness {
     }
 }
 
-fn self_signed(subject: &str) -> (Vec<u8>, Vec<u8>) {
+pub(crate) fn self_signed(subject: &str) -> (Vec<u8>, Vec<u8>) {
     let mut cert = vec![0u8; 4096];
     let mut key = vec![0u8; 4096];
     let (mut cl, mut kl) = (0usize, 0usize);
@@ -267,7 +272,7 @@ fn exporter(conn: u64) -> [u8; 32] {
     out
 }
 
-fn write_one(h: u64) -> i64 {
+pub(crate) fn write_one(h: u64) -> i64 {
     let b = [0u8; 1];
     unsafe { sbq_stream_write(h, b.as_ptr(), 1) }
 }
@@ -768,7 +773,7 @@ fn close_codes_and_idle_timeout() {
 }
 
 /// Waits (up to 10 s) for `cond`.
-fn until(what: &str, cond: impl Fn() -> bool) {
+pub(crate) fn until(what: &str, cond: impl Fn() -> bool) {
     let deadline = Instant::now() + Duration::from_secs(10);
     while !cond() {
         assert!(Instant::now() < deadline, "timed out waiting for {what}");

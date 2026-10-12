@@ -16,7 +16,7 @@ Authors:
 #include <stdint.h>
 
 // Version of this ABI; the Dart layer refuses a library with another.
-#define SBQ_ABI_VERSION 3
+#define SBQ_ABI_VERSION 4
 
 // Success.
 #define SBQ_OK 0
@@ -51,13 +51,19 @@ Authors:
 // `sbq_init` was not called, or the runtime could not start.
 #define SBQ_ERR_INIT -9
 
+// The peer reset (read) or stopped (write) a WebTransport stream with a code outside the
+// WebTransport application range: the direction ended without an application code.
+#define SBQ_NO_CODE -10
+
 // Results at or below `-SBQ_CODE_BASE` carry an application error code.
 #define SBQ_CODE_BASE 16
 
-// A listener accepted a connection, handshake complete. handle = connection, a = listener.
+// A listener accepted a raw QUIC connection, handshake complete. handle = connection,
+// a = listener.
 #define SBQ_EV_INCOMING 1
 
-// An outgoing connection completed its handshake. handle = connection.
+// An outgoing connection completed its handshake, or a WebTransport session received its 2xx
+// response. handle = connection or session.
 #define SBQ_EV_CONNECTED 2
 
 // A connection ended, or its handshake failed. handle = connection, a = `SBQ_CLOSE_*`,
@@ -66,7 +72,7 @@ Authors:
 // `SBQ_ERR_CONNECTION` from then on; release them.
 #define SBQ_EV_CLOSED 3
 
-// The peer opened a bidirectional stream. handle = stream, a = connection.
+// The peer opened a bidirectional stream. handle = stream, a = connection or session.
 #define SBQ_EV_STREAM 4
 
 // A stream `sbq_stream_open` waited for is open. handle = stream, a = connection.
@@ -79,12 +85,27 @@ Authors:
 #define SBQ_EV_WRITABLE 7
 
 // The peer sent STOP_SENDING; the send direction was reset with the same code.
-// handle = stream, a = code.
+// handle = stream, a = code (on a WebTransport stream the application code, -1 for none).
 #define SBQ_EV_STOPPED 8
 
 // Every byte of the finished send direction was acknowledged (or the reset this side sent
 // was). handle = stream.
 #define SBQ_EV_FINISHED_ACKED 9
+
+// A WebTransport request reached a listener: handle = session (pending), a = listener, b = the
+// draft version the client signalled (2 or 7). Read its fields with `sbq_wt_request`, and
+// answer with `sbq_wt_accept` (the session is live when it returns) or `sbq_wt_reject` (release
+// the handle then). A request not answered within the listener's handshake deadline (10 s
+// without one) is refused 503 and gets CLOSED (`SBQ_CLOSE_REFUSED`, b = 503).
+#define SBQ_EV_WT_REQUEST 10
+
+// The peer asked to drain a WebTransport session: WT_DRAIN_SESSION, or an HTTP/3 GOAWAY on its
+// connection. handle = session. At most once per session.
+#define SBQ_EV_DRAINING 11
+
+// The peer opened a unidirectional stream on a WebTransport session: handle = stream (receive
+// direction only), a = session.
+#define SBQ_EV_UNI_STREAM 12
 
 // The peer closed the connection with an application code (CONNECTION_CLOSE 0x1d).
 #define SBQ_CLOSE_APP_REMOTE 1
@@ -111,8 +132,39 @@ Authors:
 // The host could not be resolved, or no socket could be opened.
 #define SBQ_CLOSE_UNREACHABLE 8
 
-// Any other end (version mismatch, connection ids exhausted, ...).
+// Any other end (version mismatch, connection ids exhausted, a WebTransport protocol the client
+// did not offer, ...).
 #define SBQ_CLOSE_OTHER 9
+
+// A WebTransport session was refused: the server answered with a status other than 2xx, b = the
+// HTTP status (also in the reason, "HTTP status 404"); or a listener refused a request that was
+// not answered in time (b = 503).
+#define SBQ_CLOSE_REFUSED 10
+
+// The peer reset a WebTransport session's CONNECT stream (b = the HTTP/3 code), or ended it
+// without a response: the session is lost.
+#define SBQ_CLOSE_SESSION_RESET 11
+
+// This side's HTTP/3 layer ended the session or its connection, for the peer's protocol
+// violation: b = the HTTP/3 error code, the reason says what.
+#define SBQ_CLOSE_H3_LOCAL 12
+
+// The peer closed the QUIC connection under a WebTransport session: b = its HTTP/3 error code.
+#define SBQ_CLOSE_H3_REMOTE 13
+
+// `sbq_wt_request` fields: the request's `:authority`.
+#define SBQ_WT_AUTHORITY 1
+
+// The request's `:path` (with its query, as sent).
+#define SBQ_WT_PATH 2
+
+// The request's `Origin` (`SBQ_ERR_STATE` when it has none).
+#define SBQ_WT_ORIGIN 3
+
+// The protocols the client offered in `WT-Available-Protocols`, in its order, in the wire form
+// of an ALPN list (each preceded by its length byte; empty when none was offered, or the field
+// was malformed; protocols longer than 255 bytes are left out).
+#define SBQ_WT_PROTOCOLS 4
 
 // Certificate verification of a client: the platform's trust store.
 #define SBQ_VERIFY_PLATFORM 0
@@ -164,8 +216,8 @@ uint32_t sbq_abi_version(void);
 // Returns the context id, or 0 on failure.
 uint64_t sbq_init(SbqDoorbell doorbell, uint32_t worker_threads);
 
-// Ends a context: closes its connections (code 0) and listeners, drops its streams and queued
-// events. When it returns, the doorbell will not be called again for this context. Not a leaf
+// Ends a context: closes its connections (code 0), WebTransport sessions and their HTTP/3
+// connections, and listeners, drops its streams and queued events. When it returns, the doorbell will not be called again for this context. Not a leaf
 // call: it waits for a doorbell call in progress.
 int32_t sbq_shutdown(uint64_t ctx_id);
 
@@ -195,7 +247,8 @@ int32_t sbq_generate_self_signed(const uint8_t *subject,
                                  size_t *key_len);
 
 // Creates a client configuration. `alpn` is the ALPN list in wire form (each token preceded by
-// its length byte); `verify` one of `SBQ_VERIFY_*`; `pins` `pin_count` SHA-256 hashes of 32
+// its length byte; a list that offers `h3` gives the connection HTTP/3's transport parameters:
+// 16 unidirectional streams and the datagram parameter); `verify` one of `SBQ_VERIFY_*`; `pins` `pin_count` SHA-256 hashes of 32
 // bytes each (`SBQ_VERIFY_PINNED`); `max_bidi` the bidirectional streams the server may open at
 // once; windows in bytes; times in milliseconds, 0 for none. `handshake_ms` bounds each
 // handshake attempt of a connect (one per address tried): CLOSED with `SBQ_CLOSE_TIMED_OUT`
@@ -220,7 +273,11 @@ int64_t sbq_client_config(const uint8_t *alpn,
 // once). `handshake_ms` bounds the handshake of each connection the listener accepts: one not
 // complete by then is abandoned (closed) and never announced; 0 leaves it to the idle timeout,
 // and with both 0 a client that goes silent mid-handshake is kept until the listener closes.
-// TLS 1.3 only, no client authentication, no 0-RTT.
+// TLS 1.3 only, no client authentication, no 0-RTT. A list that offers `h3` makes a listener of
+// WebTransport: its connections that negotiate `h3` run HTTP/3 (WT_REQUEST events instead of
+// INCOMING), with HTTP/3's transport parameters (16 unidirectional streams, the datagram
+// parameter, `max_bidi` + 1 bidirectional streams for the CONNECT stream), which then apply to
+// every connection of the listener; `handshake_ms` also bounds a request's wait for its answer.
 int64_t sbq_server_config(const uint8_t *alpn,
                           size_t alpn_len,
                           const uint8_t *cert,
@@ -265,12 +322,72 @@ int64_t sbq_connect(uint64_t ctx_id,
                     const uint8_t *server_name,
                     size_t server_name_len);
 
+// Starts a WebTransport session: connects to `host` and `port` as `sbq_connect` does (the
+// configuration's ALPN list must offer `h3`), then sends the extended CONNECT for
+// `https://authority/path` (`authority` is the `:authority`, `host:port` without the default
+// port 443; `path` the `:path`), with `origin` as its `Origin` when not empty (browsers send
+// one, nodes need not), and offering `protocols` (wire form of an ALPN list, printable ASCII
+// each; empty for none) in `WT-Available-Protocols`. The request carries the draft-02 header
+// too, and SETTINGS advertise draft-02 and draft-07. Returns the session handle at once;
+// CONNECTED follows the server's 2xx (the selected protocol from `sbq_conn_protocol`, the
+// exporter from `sbq_conn_exporter`), or CLOSED: `SBQ_CLOSE_REFUSED` with the HTTP status for
+// another response, `SBQ_CLOSE_OTHER` for a protocol that was not offered, `SBQ_CLOSE_H3_LOCAL`
+// for a server without WebTransport, the kinds of `sbq_connect` for the QUIC handshake. The
+// configuration's handshake deadline bounds the QUIC handshake and again the HTTP/3 exchange
+// (`SBQ_CLOSE_TIMED_OUT`). The session uses its QUIC connection alone, which is closed when the
+// session ends.
+int64_t sbq_connect_wt(uint64_t ctx_id,
+                       uint64_t config,
+                       const uint8_t *host,
+                       size_t host_len,
+                       uint16_t port,
+                       const uint8_t *server_name,
+                       size_t server_name_len,
+                       const uint8_t *authority,
+                       size_t authority_len,
+                       const uint8_t *path,
+                       size_t path_len,
+                       const uint8_t *origin,
+                       size_t origin_len,
+                       const uint8_t *protocols,
+                       size_t protocols_len);
+
+// Copies a field of a WebTransport request (`SBQ_WT_*`) into `out` (up to `cap` bytes); returns
+// its full length, `SBQ_ERR_STATE` when the request has no such field (no `Origin`) or the
+// session is not a server's, `SBQ_ERR_ARG` for an unknown field.
+int64_t sbq_wt_request(uint64_t session, int32_t field, uint8_t *out, size_t cap);
+
+// Accepts a pending WebTransport request with the protocol `protocol` (one the client offered;
+// empty for none): the 2xx response goes out (with `WT-Protocol`, and the draft-02 header to a
+// draft-02 client), and the session is live when this returns `SBQ_OK`: streams the client
+// opened meanwhile follow as STREAM events. `SBQ_ERR_STATE` when it is not pending (answered,
+// or refused for lack of an answer), `SBQ_ERR_ARG` for a protocol not offered.
+int32_t sbq_wt_accept(uint64_t session, const uint8_t *protocol, size_t protocol_len);
+
+// Refuses a pending WebTransport request with an HTTP status (300 to 599: 403 for an origin
+// not allowed, 404 for another path, 503 while shutting down, ...); then release the handle (no
+// CLOSED follows). The streams the client opened for it are refused with WT_SESSION_GONE.
+int32_t sbq_wt_reject(uint64_t session, uint32_t status);
+
+// Sends WT_DRAIN_SESSION on a live WebTransport session (at most once; later calls do
+// nothing): the peer's DRAINING.
+int32_t sbq_wt_drain(uint64_t session);
+
 // Closes a connection with an application error code (CONNECTION_CLOSE 0x1d) and a reason;
 // during the handshake, abandons it. CLOSED follows (`SBQ_CLOSE_APP_LOCAL`, unless the peer's
 // close arrived first). Data in flight is discarded.
+//
+// A WebTransport session: `code` is a u32 (`SBQ_ERR_ARG` beyond) and the reason is cut to 1024
+// bytes at a character boundary; a live session sends WT_CLOSE_SESSION with them and FIN on its
+// CONNECT stream, and its streams are reset and stopped with WT_SESSION_GONE; CLOSED
+// (`SBQ_CLOSE_APP_LOCAL`) is posted at once. The QUIC connection is closed once its last
+// session has, and the peer has closed the CONNECT stream (or three round trips passed, within
+// 0.2 to 2 s). A client's session still connecting is abandoned; a pending request is refused
+// 503.
 int32_t sbq_conn_close(uint64_t conn, uint64_t code, const uint8_t *reason, size_t reason_len);
 
-// Forgets a connection and its streams; one still open is closed with code 0 first.
+// Forgets a connection and its streams; one still open is closed with code 0 first (a session:
+// WT_CLOSE_SESSION 0, no CLOSED event).
 int32_t sbq_conn_release(uint64_t conn);
 
 // Copies the reason of a connection's end into `out` (up to `cap` bytes): the peer's or this
@@ -282,6 +399,11 @@ int64_t sbq_conn_close_reason(uint64_t conn, uint8_t *out, size_t cap);
 // bytes for `label` and `context` (an empty context equals no context in TLS 1.3).
 // `SBQ_ERR_STATE` before the handshake completed; `SBQ_ERR_ARG` for a length the exporter
 // cannot produce (more than 255 times the hash length of the cipher suite).
+//
+// A WebTransport session: the draft's per-session exporter, the TLS exporter with the label
+// `EXPORTER-WebTransport` and the context `session ID (u64, big endian) || len8 label || label
+// || len8 context || context`; `label` and `context` at most 255 bytes each. Available from
+// CONNECTED on a client, from WT_REQUEST on a server.
 int32_t sbq_conn_exporter(uint64_t conn,
                           const uint8_t *label,
                           size_t label_len,
@@ -295,13 +417,16 @@ int32_t sbq_conn_exporter(uint64_t conn,
 int32_t sbq_conn_peer_cert_sha256(uint64_t conn, uint8_t *out);
 
 // Copies the negotiated ALPN protocol into `out` (up to `cap` bytes); returns its full length,
-// or `SBQ_ERR_STATE` when none was negotiated.
+// or `SBQ_ERR_STATE` when none was negotiated. A WebTransport session: the protocol selected
+// with `WT-Protocol` (length 0 when none), `SBQ_ERR_STATE` before the session is established.
 int64_t sbq_conn_protocol(uint64_t conn, uint8_t *out, size_t cap);
 
 // Copies the peer's address (`ip:port`, IPv6 in brackets) into `out`; returns its length.
 int64_t sbq_conn_remote(uint64_t conn, uint8_t *out, size_t cap);
 
-// Changes how many bidirectional streams the peer may have open at once (MAX_STREAMS).
+// Changes how many bidirectional streams the peer may have open at once (MAX_STREAMS). On a
+// WebTransport session, the limit of its QUIC connection: `count` plus the CONNECT stream (the
+// sessions pooled on a connection share it).
 int32_t sbq_conn_set_max_bidi(uint64_t conn, uint64_t count);
 
 // Fills `out` with the connection's statistics.
@@ -309,16 +434,22 @@ int32_t sbq_conn_stats(uint64_t conn, struct SbqStats *out);
 
 // Opens a bidirectional stream: returns its handle if the peer's stream limit allows it now,
 // otherwise `SBQ_WOULD_BLOCK` and an OPENED event carries the stream once it does (one event
-// per blocked call). Nothing reaches the peer before the first write.
+// per blocked call). Nothing reaches the peer before the first write. On a WebTransport session
+// (live) the stream carries the session's header; `SBQ_ERR_STATE` before the session is live,
+// `SBQ_ERR_CONNECTION` once the connection or session has ended.
 int64_t sbq_stream_open(uint64_t conn);
 
 // Writes up to `len` (> 0) bytes; returns how many were accepted (the peer's flow control
 // credit bounds it), `SBQ_WOULD_BLOCK` (WRITABLE follows), the peer's STOP_SENDING code at or
-// below `-SBQ_CODE_BASE` (the direction has been reset with it), or an error.
+// below `-SBQ_CODE_BASE` (the direction has been reset with it; `SBQ_NO_CODE` on a WebTransport
+// stream for a code outside the application range), or an error (`SBQ_ERR_STATE` on a stream
+// without a send direction). On a stream of a WebTransport session this side opened, the stream
+// header goes first, ahead of the data and the FIN.
 int64_t sbq_stream_write(uint64_t stream, const uint8_t *data, size_t len);
 
 // Reads up to `cap` (> 0) bytes into `buf`; returns how many, `SBQ_WOULD_BLOCK` (READABLE
-// follows), `SBQ_FIN`, the peer's reset code at or below `-SBQ_CODE_BASE`, or an error.
+// follows), `SBQ_FIN`, the peer's reset code at or below `-SBQ_CODE_BASE` (`SBQ_NO_CODE` as for
+// writes), or an error.
 // Data not read stays in quinn and holds back the peer's flow control credit.
 int64_t sbq_stream_read(uint64_t stream, uint8_t *buf, size_t cap);
 
@@ -333,15 +464,20 @@ int64_t sbq_stream_poll_reset(uint64_t stream);
 
 // Finishes the send direction (FIN after everything written). FINISHED_ACKED follows once the
 // peer acknowledged every byte. Returns `SBQ_OK`, the code of a STOP_SENDING received, or an
-// error.
+// error; on a WebTransport stream whose header could not be written yet, `SBQ_WOULD_BLOCK`
+// (WRITABLE follows; call again).
 int64_t sbq_stream_finish(uint64_t stream);
 
 // Resets the send direction with `code` (RESET_STREAM); also after a finish, to abandon what is
-// not acknowledged yet. A no-op on a direction reset already.
+// not acknowledged yet. A no-op on a direction reset already. On a WebTransport stream `code` is
+// an application code (u32, mapped into the HTTP/3 space); `SBQ_ERR_ARG` beyond. Without
+// RESET_STREAM_AT (quinn has none) a reset may lose the stream header with the data, and the
+// peer then cannot tell which session the reset stream belonged to.
 int64_t sbq_stream_reset(uint64_t stream, uint64_t code);
 
 // Asks the peer to stop sending with `code` (STOP_SENDING); the receive direction ends here at
-// once, and data still arriving is discarded. A no-op once the direction has ended.
+// once, and data still arriving is discarded. A no-op once the direction has ended. Codes as for
+// `sbq_stream_reset`.
 int64_t sbq_stream_stop(uint64_t stream, uint64_t code);
 
 // Sets the send priority: higher first, strictly; round robin within a level. Initially 0.

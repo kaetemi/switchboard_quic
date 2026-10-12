@@ -17,34 +17,35 @@ use crate::h3::{put_varint, VARINT_MAX};
 /// HTTP/3 error codes the WebTransport draft defines.
 pub mod err {
     /// A data stream refused because its session does not exist (yet).
-    pub const WT_BUFFERED_STREAM_REJECTED: u64 = 0x3994_bd84;
+    pub(crate) const WT_BUFFERED_STREAM_REJECTED: u64 = 0x3994_bd84;
     /// A data stream aborted because its session ended.
-    pub const WT_SESSION_GONE: u64 = 0x170d_7b68;
+    pub(crate) const WT_SESSION_GONE: u64 = 0x170d_7b68;
     /// The server's response selected a protocol the client did not offer (draft-13 and later).
-    pub const WT_ALPN_ERROR: u64 = 0x0817_b3dd;
+    pub(crate) const WT_ALPN_ERROR: u64 = 0x0817_b3dd;
     /// The peer's SETTINGS or transport parameters lack what WebTransport needs (draft-15 and
     /// later; older peers read it as an unknown code).
-    pub const WT_REQUIREMENTS_NOT_MET: u64 = 0x212c_0d48;
+    pub(crate) const WT_REQUIREMENTS_NOT_MET: u64 = 0x212c_0d48;
 }
 
 /// Capsule types (RFC 9297 and the draft).
+#[allow(dead_code)]
 pub mod capsule {
-    pub const DATAGRAM: u64 = 0x00;
-    pub const WT_CLOSE_SESSION: u64 = 0x2843;
-    pub const WT_DRAIN_SESSION: u64 = 0x78ae;
+    pub(crate) const DATAGRAM: u64 = 0x00;
+    pub(crate) const WT_CLOSE_SESSION: u64 = 0x2843;
+    pub(crate) const WT_DRAIN_SESSION: u64 = 0x78ae;
     /// Defined by the HTTP/2 draft only; receiving one over HTTP/3 is a session error.
-    pub const WT_MAX_STREAM_DATA: u64 = 0x190b_4d3e;
+    pub(crate) const WT_MAX_STREAM_DATA: u64 = 0x190b_4d3e;
     /// Defined by the HTTP/2 draft only; receiving one over HTTP/3 is a session error.
-    pub const WT_STREAM_DATA_BLOCKED: u64 = 0x190b_4d42;
+    pub(crate) const WT_STREAM_DATA_BLOCKED: u64 = 0x190b_4d42;
 }
 
 /// The longest message of a WT_CLOSE_SESSION capsule.
-pub const MAX_CLOSE_MESSAGE: usize = 1024;
+pub(crate) const MAX_CLOSE_MESSAGE: usize = 1024;
 
 /// The first HTTP/3 error code of the WebTransport application error codes.
-pub const APP_CODE_FIRST: u64 = 0x52e4_a40f_a8db;
+pub(crate) const APP_CODE_FIRST: u64 = 0x52e4_a40f_a8db;
 /// The last one (the code of 0xffffffff).
-pub const APP_CODE_LAST: u64 = 0x52e5_ac98_3162;
+pub(crate) const APP_CODE_LAST: u64 = 0x52e5_ac98_3162;
 
 /// The HTTP/3 error code that carries the WebTransport application error code `code`: `first +
 /// n + floor(n / 0x1e)`, which skips the reserved codepoints of HTTP/3.
@@ -64,7 +65,7 @@ pub fn h3_to_app(h3: u64) -> Option<u32> {
 }
 
 /// The TLS exporter label of WebTransport's keying material exporter.
-pub const EXPORTER_LABEL: &[u8] = b"EXPORTER-WebTransport";
+pub(crate) const EXPORTER_LABEL: &[u8] = b"EXPORTER-WebTransport";
 
 /// The TLS exporter context of a session's exporter for the application's `label` and
 /// `context` (draft section "Use of Keying Material Exporters"): the session ID as a 64-bit

@@ -20,39 +20,40 @@ use std::sync::OnceLock;
 
 use crate::h3_tables::{HUFFMAN, STATIC_TABLE};
 
-/// HTTP/3 error codes (RFC 9114 section 8.1, RFC 9204 section 6, RFC 9297).
+/// HTTP/3 error codes (RFC 9114 section 8.1, RFC 9204 section 6), the whole registry of them.
+#[allow(dead_code)]
 pub mod err {
-    pub const H3_NO_ERROR: u64 = 0x100;
-    pub const H3_GENERAL_PROTOCOL_ERROR: u64 = 0x101;
-    pub const H3_INTERNAL_ERROR: u64 = 0x102;
-    pub const H3_STREAM_CREATION_ERROR: u64 = 0x103;
-    pub const H3_CLOSED_CRITICAL_STREAM: u64 = 0x104;
-    pub const H3_FRAME_UNEXPECTED: u64 = 0x105;
-    pub const H3_FRAME_ERROR: u64 = 0x106;
-    pub const H3_EXCESSIVE_LOAD: u64 = 0x107;
-    pub const H3_ID_ERROR: u64 = 0x108;
-    pub const H3_SETTINGS_ERROR: u64 = 0x109;
-    pub const H3_MISSING_SETTINGS: u64 = 0x10a;
-    pub const H3_REQUEST_REJECTED: u64 = 0x10b;
-    pub const H3_REQUEST_CANCELLED: u64 = 0x10c;
-    pub const H3_REQUEST_INCOMPLETE: u64 = 0x10d;
-    pub const H3_MESSAGE_ERROR: u64 = 0x10e;
-    pub const QPACK_DECOMPRESSION_FAILED: u64 = 0x200;
-    pub const QPACK_ENCODER_STREAM_ERROR: u64 = 0x201;
-    pub const QPACK_DECODER_STREAM_ERROR: u64 = 0x202;
+    pub(crate) const H3_NO_ERROR: u64 = 0x100;
+    pub(crate) const H3_GENERAL_PROTOCOL_ERROR: u64 = 0x101;
+    pub(crate) const H3_INTERNAL_ERROR: u64 = 0x102;
+    pub(crate) const H3_STREAM_CREATION_ERROR: u64 = 0x103;
+    pub(crate) const H3_CLOSED_CRITICAL_STREAM: u64 = 0x104;
+    pub(crate) const H3_FRAME_UNEXPECTED: u64 = 0x105;
+    pub(crate) const H3_FRAME_ERROR: u64 = 0x106;
+    pub(crate) const H3_EXCESSIVE_LOAD: u64 = 0x107;
+    pub(crate) const H3_ID_ERROR: u64 = 0x108;
+    pub(crate) const H3_SETTINGS_ERROR: u64 = 0x109;
+    pub(crate) const H3_MISSING_SETTINGS: u64 = 0x10a;
+    pub(crate) const H3_REQUEST_REJECTED: u64 = 0x10b;
+    pub(crate) const H3_REQUEST_CANCELLED: u64 = 0x10c;
+    pub(crate) const H3_REQUEST_INCOMPLETE: u64 = 0x10d;
+    pub(crate) const H3_MESSAGE_ERROR: u64 = 0x10e;
+    pub(crate) const QPACK_DECOMPRESSION_FAILED: u64 = 0x200;
+    pub(crate) const QPACK_ENCODER_STREAM_ERROR: u64 = 0x201;
+    pub(crate) const QPACK_DECODER_STREAM_ERROR: u64 = 0x202;
 }
 
 /// Frame types (RFC 9114 section 7.2), and WebTransport's bidirectional stream signal.
 pub mod frame {
-    pub const DATA: u64 = 0x00;
-    pub const HEADERS: u64 = 0x01;
-    pub const CANCEL_PUSH: u64 = 0x03;
-    pub const SETTINGS: u64 = 0x04;
-    pub const PUSH_PROMISE: u64 = 0x05;
-    pub const GOAWAY: u64 = 0x07;
-    pub const MAX_PUSH_ID: u64 = 0x0d;
+    pub(crate) const DATA: u64 = 0x00;
+    pub(crate) const HEADERS: u64 = 0x01;
+    pub(crate) const CANCEL_PUSH: u64 = 0x03;
+    pub(crate) const SETTINGS: u64 = 0x04;
+    pub(crate) const PUSH_PROMISE: u64 = 0x05;
+    pub(crate) const GOAWAY: u64 = 0x07;
+    pub(crate) const MAX_PUSH_ID: u64 = 0x0d;
     /// WT_STREAM: not a frame, the signal at the start of a WebTransport bidirectional stream.
-    pub const WT_STREAM: u64 = 0x41;
+    pub(crate) const WT_STREAM: u64 = 0x41;
 
     /// HTTP/2 frame types HTTP/3 reserves (PRIORITY, PING, WINDOW_UPDATE, CONTINUATION):
     /// receiving one is H3_FRAME_UNEXPECTED.
@@ -63,28 +64,28 @@ pub mod frame {
 
 /// Unidirectional stream types (RFC 9114 section 6.2, RFC 9204, the WebTransport draft).
 pub mod stream_type {
-    pub const CONTROL: u64 = 0x00;
-    pub const PUSH: u64 = 0x01;
-    pub const QPACK_ENCODER: u64 = 0x02;
-    pub const QPACK_DECODER: u64 = 0x03;
-    pub const WEBTRANSPORT: u64 = 0x54;
+    pub(crate) const CONTROL: u64 = 0x00;
+    pub(crate) const PUSH: u64 = 0x01;
+    pub(crate) const QPACK_ENCODER: u64 = 0x02;
+    pub(crate) const QPACK_DECODER: u64 = 0x03;
+    pub(crate) const WEBTRANSPORT: u64 = 0x54;
 }
 
 /// SETTINGS identifiers.
 pub mod setting {
-    pub const QPACK_MAX_TABLE_CAPACITY: u64 = 0x01;
-    pub const MAX_FIELD_SECTION_SIZE: u64 = 0x06;
-    pub const QPACK_BLOCKED_STREAMS: u64 = 0x07;
+    pub(crate) const QPACK_MAX_TABLE_CAPACITY: u64 = 0x01;
+    pub(crate) const MAX_FIELD_SECTION_SIZE: u64 = 0x06;
+    pub(crate) const QPACK_BLOCKED_STREAMS: u64 = 0x07;
     /// RFC 9220.
-    pub const ENABLE_CONNECT_PROTOCOL: u64 = 0x08;
+    pub(crate) const ENABLE_CONNECT_PROTOCOL: u64 = 0x08;
     /// RFC 9297.
-    pub const H3_DATAGRAM: u64 = 0x33;
+    pub(crate) const H3_DATAGRAM: u64 = 0x33;
     /// The draft identifier of H3_DATAGRAM, still sent by Chrome.
-    pub const H3_DATAGRAM_DRAFT: u64 = 0xffd277;
+    pub(crate) const H3_DATAGRAM_DRAFT: u64 = 0xffd277;
     /// draft-ietf-webtrans-http3-02 SETTINGS_ENABLE_WEBTRANSPORT (Chrome 149 sends it).
-    pub const ENABLE_WEBTRANSPORT_DRAFT02: u64 = 0x2b603742;
+    pub(crate) const ENABLE_WEBTRANSPORT_DRAFT02: u64 = 0x2b603742;
     /// draft-ietf-webtrans-http3-07 to -12 SETTINGS_WEBTRANSPORT_MAX_SESSIONS.
-    pub const WEBTRANSPORT_MAX_SESSIONS_DRAFT07: u64 = 0xc671706a;
+    pub(crate) const WEBTRANSPORT_MAX_SESSIONS_DRAFT07: u64 = 0xc671706a;
 
     /// HTTP/2 settings HTTP/3 reserves: receiving one is H3_SETTINGS_ERROR.
     pub fn is_reserved_h2(id: u64) -> bool {
@@ -102,7 +103,7 @@ pub fn is_grease(v: u64) -> bool {
 // QUIC variable-length integers (RFC 9000 section 16).
 
 /// The largest value a variable-length integer holds.
-pub const VARINT_MAX: u64 = (1 << 62) - 1;
+pub(crate) const VARINT_MAX: u64 = (1 << 62) - 1;
 
 /// The encoded length of `v` (1, 2, 4 or 8).
 pub fn varint_len(v: u64) -> usize {
@@ -176,7 +177,7 @@ pub fn encode_settings(pairs: &[(u64, u64)]) -> Vec<u8> {
 }
 
 /// The most settings a peer may send in its SETTINGS frame (reserved ones included).
-pub const MAX_SETTINGS: usize = 256;
+pub(crate) const MAX_SETTINGS: usize = 256;
 
 /// The settings a peer sent: its values by identifier (reserved GREASE settings dropped), and
 /// the order they came in, for logs.
