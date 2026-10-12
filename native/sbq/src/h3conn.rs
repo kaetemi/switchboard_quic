@@ -73,7 +73,8 @@ const MAX_SKIP_BEFORE_HEADERS: u64 = 64 << 10;
 /// when nothing else sets it (the configuration's handshake deadline does).
 pub(crate) const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 /// The bounds of the wait for the peer to close a CONNECT stream before the QUIC connection is
-/// closed (three round trips, within these).
+/// closed, and of a server's wait for the client to close the QUIC connection itself (three
+/// round trips, within these).
 const MIN_CLOSE_WAIT: Duration = Duration::from_millis(200);
 const MAX_CLOSE_WAIT: Duration = Duration::from_secs(2);
 /// Unidirectional streams granted to the peer of an `h3` connection: its control and QPACK
@@ -1184,9 +1185,14 @@ impl H3Conn {
     // --- The peer's unidirectional streams.
 
     async fn uni(self: Arc<Self>, mut r: Reader) {
-        let started = Instant::now();
-        let ty = match within(self.request_timeout, r.varint()).await {
-            Some(Ok(Some(t))) => t,
+        // No deadline on the stream type: a peer sends it when it pleases. quiche (Chrome) sends
+        // the type of a QPACK stream with its first instruction, and the stream a peer opens opens
+        // the lower ones of its kind with it, typeless; stopping a peer's QPACK stream is fatal to
+        // the connection (Chrome closes it, "STOP_SENDING received for QPACK send stream"). The
+        // unidirectional stream limit (H3_UNI_STREAMS) bounds what such streams hold, and they
+        // end with the connection.
+        let ty = match r.varint().await {
+            Ok(Some(t)) => t,
             // Nothing to keep, but stopped explicitly rather than dropped (quinn stops a dropped
             // stream with 0).
             _ => {
@@ -1243,12 +1249,7 @@ impl H3Conn {
                     self.fail(err::H3_STREAM_CREATION_ERROR, "a push stream from a client")
                 }
             }
-            stream_type::WEBTRANSPORT => match within(
-                self.request_timeout.saturating_sub(started.elapsed()),
-                r.varint(),
-            )
-            .await
-            {
+            stream_type::WEBTRANSPORT => match within(self.request_timeout, r.varint()).await {
                 Some(Ok(Some(sid))) => self.route(sid, Held::Uni(r.recv.take())),
                 _ => abort(None, Some(&mut r.recv), err::H3_STREAM_CREATION_ERROR),
             },
@@ -1804,9 +1805,13 @@ impl H3Conn {
         (self.conn.rtt() * 3).clamp(MIN_CLOSE_WAIT, MAX_CLOSE_WAIT)
     }
 
-    /// Closes the QUIC connection once its last session has finished closing (its CONNECT
-    /// stream closed by both sides, or the wait for it over): the draft's advice, so that the
-    /// close of a session reaches the peer before the connection's.
+    /// Closes the QUIC connection once its last session has finished closing: the draft's
+    /// advice, so that the close of a session reaches the peer before the connection's. A client
+    /// closes it once both sides closed the CONNECT stream (or the wait for that is over). A
+    /// server leaves it to the client for the close wait: Chrome reports a session closed only
+    /// after it sent its FIN in answer, and a connection close that arrives first fails the
+    /// session instead (the page sees "Connection lost.", whatever the close said), while it
+    /// closes the connection itself once it has reported the close.
     fn check_close(&self) {
         let wait = self.close_wait();
         let (close, tasks) = {
@@ -1817,7 +1822,7 @@ impl H3Conn {
                     peer, us, since, ..
                 } = s
                 {
-                    if (*peer && *us) || since.elapsed() >= wait {
+                    if (self.client && *peer && *us) || since.elapsed() >= wait {
                         done.push(*sid);
                     }
                 }

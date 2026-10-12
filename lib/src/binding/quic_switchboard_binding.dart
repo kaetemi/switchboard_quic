@@ -17,12 +17,10 @@ import 'package:switchboard/switchboard.dart';
 
 import '../provider/quic_provider.dart';
 import 'quic_binding_connection.dart';
+import 'quic_dial.dart';
 import 'quic_options.dart';
 
 final Logger _log = Logger('Switchboard.Quic');
-
-/// The ALPN token of raw QUIC, and the WebTransport protocol value.
-const String switchboardAlpn = 'switchboard';
 
 /// The [SwitchboardBinding] of the QUIC and WebTransport binding: a
 /// `Switchboard` node dials `quic://host:port` endpoints (raw QUIC, ALPN
@@ -158,112 +156,32 @@ class QuicSwitchboardBinding extends SwitchboardBinding {
     return super.normalise(endpoint);
   }
 
-  /// Dials [endpoint]. The connect is bounded by
+  /// Dials [endpoint] ([connectQuicBinding]). The connect is bounded by
   /// [BindingDialSettings.timeout] when it is positive: on expiry the dial
   /// fails with [StatusCode.unavailable], and a session the provider still
   /// yields afterwards is closed with [StatusCode.cancelled] (a connect
   /// cannot be cancelled), so that it never reaches [dialled].
   @override
   Future<MuxConnection> dial(Uri endpoint, BindingDialSettings settings) async {
-    final scheme = endpoint.scheme.toLowerCase();
-    final webTransport = scheme == webTransportScheme;
-    if (!webTransport && (endpoint.host.isEmpty || !endpoint.hasPort)) {
-      throw SwitchboardException.of(
-        StatusCode.invalidArgument,
-        'a quic endpoint names a host and a port: $endpoint',
-      );
-    }
-    final options = settings.options;
-    final timeout = settings.timeout > Duration.zero
-        ? settings.timeout
-        : Duration.zero;
-    final verified = webTransport
-        ? webTransportCertificateVerified || certificateHashes.isNotEmpty
-        : verifyCertificate || certificateHashes.isNotEmpty;
-    final config = QuicClientConfig(
-      alpn: const [switchboardAlpn],
-      serverCertificateHashes: certificateHashes,
+    final webTransport = endpoint.scheme.toLowerCase() == webTransportScheme;
+    final connection = await connectQuicBinding(
+      connector,
+      endpoint,
+      options: settings.options,
+      quicOptions: quicOptions,
+      identityRules: identityRules,
       verifyCertificate: webTransport
           ? webTransportCertificateVerified
           : verifyCertificate,
-      maxStreamsBidi: options.maxChannels > 0 ? options.maxChannels : 65536,
-      streamReceiveWindow: options.initialWindow,
-      connectionReceiveWindow: options.receiveHighWaterMarkBytes > 0
-          ? options.receiveHighWaterMarkBytes
-          : 16 << 20,
+      certificateHashes: certificateHashes,
+      timeout: settings.timeout,
       idleTimeout: idleTimeout,
       keepAlive: _stackKeepAlive,
-      handshakeTimeout: timeout,
-    );
-    final QuicSession session;
-    try {
-      final connecting = connector.connect(
-        Uri(
-          scheme: scheme,
-          host: endpoint.host,
-          port: endpoint.hasPort ? endpoint.port : null,
-          path: webTransport ? endpoint.path : null,
-        ),
-        config,
-      );
-      session = await (timeout > Duration.zero
-          ? connecting.timeout(
-              timeout,
-              onTimeout: () {
-                _abandon(connecting);
-                throw SwitchboardException.of(
-                  StatusCode.unavailable,
-                  'cannot reach $endpoint: not connected within $timeout',
-                );
-              },
-            )
-          : connecting);
-    } on QuicException catch (e) {
-      throw SwitchboardException.of(
-        e.kind == QuicExceptionKind.unsupportedScheme
-            ? StatusCode.unimplemented
-            : StatusCode.unavailable,
-        'cannot reach $endpoint: ${e.message}',
-      );
-    }
-    final rules =
-        identityRules ??
-        QuicIdentityRules.initiator(
-          certificateVerified: verified,
-          hasCredential: settings.localIdentity != null,
-          verifiesCredentials: options.identityVerifier != null,
-        );
-    final connection = await QuicBindingConnection.start(
-      session,
-      options: options,
-      quicOptions: quicOptions.copyWith(identity: rules),
-      isWebTransport: webTransport,
       localIdentity: settings.localIdentity,
     );
-    if (!connection.isOpen) {
-      // Ended while it started: the session, or the identification rules.
-      final status = await connection.done;
-      throw SwitchboardException(
-        status.known == StatusCode.unauthenticated
-            ? status
-            : Status.of(StatusCode.unavailable, '$endpoint: $status'),
-      );
-    }
     if (dialled.length == 64) dialled.removeAt(0);
     dialled.add(connection);
     return connection;
-  }
-
-  /// Closes the session a connect given up on still yields, and swallows
-  /// its failure.
-  static void _abandon(Future<QuicSession> connecting) {
-    connecting
-        .then(
-          (session) =>
-              session.close(StatusCode.cancelled.code, 'dial abandoned'),
-          onError: (Object _) {},
-        )
-        .ignore();
   }
 }
 

@@ -154,3 +154,64 @@
   only: the `:authority` a client used is not checked (it is
   `requestAuthority`). The HTTP/3 exchanges keep a 10 s deadline when
   the handshake deadline is zero, as the contract now says.
+* The web provider (`package:switchboard_quic/switchboard_quic_web.dart`):
+  `WebQuicProvider`, a `QuicConnector` of `https://` WebTransport sessions
+  through the browser's W3C API (`dart:js_interop` and `package:web`, with
+  extensions for what `package:web` 1.1.1 lacks: `protocol`, `draining`,
+  `exportKeyingMaterial`, `getStats`, `createSendGroup`, the `protocols`
+  option, the streams' `sendOrder` and `sendGroup`, and both forms of the
+  `WebTransportError` constructor, each feature-tested at run time). Reads
+  pull through a default reader and keep the rest of a chunk; writes copy
+  and wait for the writer's `ready`; resets and `STOP_SENDING` carry
+  `WebTransportError` codes, and the reader's and writer's `closed` tell the
+  peer's; the session's end comes from `closed`; priority classes become
+  send orders and groups where the browser has them; streams the browser
+  refuses for want of credit are asked for again. The library exports
+  `core.dart` too.
+* `connectQuicBinding`, in `core.dart`: the dial of `QuicSwitchboardBinding`
+  on its own (connect through a provider, bounded, with the identification
+  rules the certificate's verification calls for, and start the binding),
+  for `ReconnectingClient.connections` in a browser;
+  `QuicSwitchboardBinding.dial` uses it, and `switchboardAlpn` moved with
+  it.
+* Provider contract (what the web provider teaches, provider-neutral): a
+  provider whose stack refuses a stream for want of credit waits itself; a
+  provider may leave the peer's streams in the stack while nobody listens;
+  a reset or stop code the stack cannot carry is an `ArgumentError`, never
+  another code; `stopped` follows the stack's report of a closed direction
+  where acknowledgement is not observable; a close is complete once a stack
+  that delivers it on its own took it; configuration the stack decides is
+  ignored (a browser always verifies certificates); the exporter is null
+  where the stack cannot export the length asked; `remote` may be the
+  endpoint's host and port; over WebTransport without `RESET_STREAM_AT`, a
+  reset that overtakes a stream's header can leave the peer without the
+  stream.
+* Fix (the shim's HTTP/3 layer): the type of a peer's unidirectional stream
+  no longer has a deadline. Chrome's stack sends the type of a QPACK stream
+  with its first instruction, and the stream it opens next opens that one,
+  typeless; the shim stopped it at the handshake deadline, which Chrome
+  answers by closing the connection, so every Chrome session to a native
+  listener ended after 10 s. A typeless stream holds one of the 16
+  unidirectional streams the peer is granted (no ABI change).
+* Fix (the shim's HTTP/3 layer): once its last WebTransport session has
+  closed, a server leaves the QUIC connection's close to the client for
+  the close wait (three round trips, 0.2 to 2 s) instead of closing it as
+  soon as both sides closed the CONNECT stream. Chrome reports a session
+  closed only after it sent its FIN in answer to the close, and a
+  connection close that arrives before that report fails the session: a
+  node's close of a browser's session, its `GOAWAY` when idle included,
+  reached the page as "Connection lost." (the binding's
+  `CONNECTION_LOST`) instead of its code whenever the connection close
+  overtook that report, which load made frequent. Chrome closes the
+  connection itself once it reported the close; a client of the shim
+  still closes it at once (no ABI change).
+* Tests: `test/web_provider_test.dart` and `test/web_binding_test.dart` in
+  headless Chrome (`dart test -P web`, run by `tool/web_smoke.sh` with
+  `tool/web_server.dart`, native WebTransport listeners and a Switchboard
+  node, as the server): the provider against the contract, the binding
+  over it, and `ReconnectingClient.connections`; shim tests of a typeless
+  unidirectional stream outliving the deadline and of a server leaving the
+  connection's close to the client. A browser test resets a stream only
+  once the server has it: a reset that overtakes the stream's header loses
+  it at a quinn server (no `RESET_STREAM_AT`), which then cannot tell the
+  stream's session.

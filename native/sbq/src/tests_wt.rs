@@ -1425,6 +1425,72 @@ fn held_stream_timeout_and_missing_settings_are_bounded() {
 }
 
 #[test]
+fn a_typeless_peer_stream_outlives_the_deadline() {
+    // quiche (Chrome) sends the type of a QPACK stream with its first instruction, and opening a
+    // later stream opens the earlier ones, typeless: stopping one would end the connection.
+    let mut h = Harness::new();
+    let (l, port) = h.wt_server(250);
+    let raw = Raw::wt(port);
+    let (_send, mut recv, _) = raw.request(&headers(&request_fields(b"/sb")));
+    let (session, _) = h.wt_request(l);
+    assert_eq!(unsafe { sbq_wt_accept(session, std::ptr::null(), 0) }, 0);
+    assert_eq!(Raw::status(&mut recv), Ok(200));
+    let (mut encoder, _decoder) = block(async {
+        let encoder = raw.conn.open_uni().await.unwrap();
+        let mut decoder = raw.conn.open_uni().await.unwrap();
+        decoder
+            .write_all(&[h3::stream_type::QPACK_DECODER as u8])
+            .await
+            .unwrap();
+        (encoder, decoder)
+    });
+    std::thread::sleep(Duration::from_millis(750));
+    let stopped = ctx::rt().block_on(async {
+        tokio::time::timeout(Duration::from_millis(200), encoder.stopped()).await
+    });
+    assert!(stopped.is_err(), "the typeless stream was stopped");
+    assert!(raw.conn.close_reason().is_none());
+    block(async {
+        encoder
+            .write_all(&[h3::stream_type::QPACK_ENCODER as u8])
+            .await
+            .unwrap()
+    });
+    std::thread::sleep(Duration::from_millis(100));
+    assert!(raw.conn.close_reason().is_none());
+}
+
+#[test]
+fn a_server_leaves_the_connection_close_to_the_client_for_the_close_wait() {
+    // Chrome reports a session closed only after it sent its FIN in answer to the close, and a
+    // connection close that arrives first fails the session ("Connection lost." to the page): a
+    // server closes the QUIC connection itself only after the close wait (three round trips, at
+    // least 200 ms), however soon both sides closed the CONNECT stream.
+    let mut h = Harness::new();
+    let (l, port) = h.wt_server(5_000);
+    let raw = Raw::wt(port);
+    let (mut cs, mut cr, _) = raw.request(&headers(&request_fields(b"/sb")));
+    let (s, _) = h.wt_request(l);
+    assert_eq!(unsafe { sbq_wt_accept(s, std::ptr::null(), 0) }, 0);
+    assert_eq!(Raw::status(&mut cr), Ok(200));
+    let started = Instant::now();
+    assert_eq!(close(s, 9, "bye"), 0);
+    // The capsule and FIN arrive, and the client answers with its FIN at once.
+    assert_eq!(reset_code(&mut cr), None);
+    block(async { cs.finish().unwrap() });
+    let e = h.closed(s);
+    assert_eq!((e.a, e.b), (SBQ_CLOSE_APP_LOCAL, 9));
+    std::thread::sleep(Duration::from_millis(100));
+    let early = raw.conn.close_reason();
+    if started.elapsed() < Duration::from_millis(200) {
+        assert!(early.is_none(), "closed before the close wait: {early:?}");
+    }
+    // A client that does not close it: the server does, after the close wait.
+    assert_eq!(closed_with(raw.closed()), err::H3_NO_ERROR);
+    assert!(started.elapsed() >= Duration::from_millis(200));
+}
+
+#[test]
 fn closing_one_pooled_session_releases_its_streams_and_tasks_without_peer_fin() {
     let mut h = Harness::new();
     let (l, port) = h.wt_server(5_000);
