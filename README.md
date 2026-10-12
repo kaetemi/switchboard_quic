@@ -14,7 +14,7 @@ The binding of [Polyverse Switchboard](https://github.com/kaetemi/switchboard) t
 
 The binding is written once against a stream provider interface (`lib/src/provider/quic_provider.dart`), for two providers: the native provider over [quinn](https://github.com/quinn-rs/quinn) through FFI (a Rust shim in `native/`), and the web provider over the browser's WebTransport API.
 
-Status: the binding layer is complete for both kinds of session; the native provider speaks raw QUIC (`quic://host:port`) and WebTransport over HTTP/3 (`https://host:port/path`, the HTTP/3 layer in its shim), as a client and as a listener, tested against web-transport-quinn and headless Chromium; the web provider runs the binding over the browser's own WebTransport API, tested in headless Chrome 149 against the native provider's listeners and a Switchboard node behind them. Platforms: everything runs on Linux x86-64; the shim's tests pass on Linux aarch64 under qemu, and the shim's tests, the VM suite and the AOT smoke on Windows x86-64 under wine (with quinn-udp patched for wine's sockets, outside the tree); macOS, iOS and Android are only checked by the compiler so far. CI covers Linux x64 and arm64, macOS arm64 and x64, and Windows x64, and releases carry the shim prebuilt for those five (`native/README.md`, "Platforms" and "Releases").
+Status: the binding layer is complete for both kinds of session; the native provider speaks raw QUIC (`quic://host:port`) and WebTransport over HTTP/3 (`https://host:port/path`, the HTTP/3 layer in its shim), as a client and as a listener, tested against web-transport-quinn and headless Chromium; the web provider runs the binding over the browser's own WebTransport API, tested in headless Chrome 149 against the native provider's listeners and a Switchboard node behind them. Platforms: everything runs on Linux x86-64; the shim's tests pass on Linux aarch64 under qemu, and the shim's tests, the VM suite and the AOT smoke on Windows x86-64 under wine (with quinn-udp patched for wine's sockets, outside the tree); macOS, iOS and Android are only checked by the compiler so far. The CI and release workflows are configured for Linux x64 and arm64, macOS arm64 and x64, and Windows x64; neither has run on GitHub yet, and no prebuilt release has been verified there (`native/README.md`, "Platforms" and "Releases").
 
 | Library | What | Platforms |
 | --- | --- | --- |
@@ -118,7 +118,7 @@ A browser reaches a WebTransport listener with the W3C API: `new WebTransport('h
 
 ### Building the shim
 
-The package's build hook (`hook/build.dart`) supplies the shim to `dart run`, `dart test` and `dart build cli`: a prebuilt library from `native/sbq/prebuilt/<os>_<arch>/` when there is one, else `cargo build --release` for the host when cargo is found (on `PATH`, in `$CARGO_HOME/bin` or in `~/.cargo/bin`; about a minute the first time), else a clear failure; it never downloads anything, and never builds for iOS or Android. So either fetch a release's prebuilt libraries or install a Rust toolchain (<https://rustup.rs>; ring needs a C compiler, on Windows the MSVC build tools rustup asks for). Without Rust:
+The package's build hook (`hook/build.dart`) supplies the shim to `dart run`, `dart test` and `dart build cli`: a prebuilt library from `native/sbq/prebuilt/<os>_<arch>/` when there is one, else `cargo build --release --locked` for the host when cargo is found (on `PATH` or in `~/.cargo/bin`, `%USERPROFILE%\.cargo\bin` on Windows; about a minute the first time), else a clear failure; it never downloads anything, and never builds for iOS or Android. So either fetch a release's prebuilt libraries or install a Rust toolchain (<https://rustup.rs>; ring needs a C compiler, on Windows the MSVC build tools rustup asks for). Without Rust:
 
 ```sh
 tool/fetch_prebuilt.sh v0.1.0               # a release's libraries for linux_x64, linux_arm64,
@@ -126,7 +126,7 @@ tool/fetch_prebuilt.sh v0.1.0               # a release's libraries for linux_x6
                                             # against its SHA256SUMS, into native/sbq/prebuilt/
 ```
 
-A tag `v*` builds and attaches them (`.github/workflows/release.yml`); the pub package, once published, will ship them under `native/sbq/prebuilt/` so that its users need neither (`native/README.md`, "Releases"). With Rust, by hand:
+The release workflow (`.github/workflows/release.yml`) builds all five before creating a draft, checks the exact asset set, and publishes once the libraries and `SHA256SUMS` are attached. A rerun verifies an existing published release without replacing it; the pub package, once published, will ship them under `native/sbq/prebuilt/` so that its users need neither (`native/README.md`, "Releases"). With Rust, by hand:
 
 ```sh
 cd native/sbq

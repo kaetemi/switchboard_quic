@@ -5,6 +5,7 @@ Copyright (C) 2018-2026  Jan BOON (Kaetemi)
 Authors:
   Jan Boon <jan.boon@kaetemi.be>
   Claude Opus 5.5 <noreply@anthropic.com>
+  GPT-6 Astra <noreply@openai.com>
 */
 
 // Provides the native shim (native/sbq) as the code asset `package:switchboard_quic/sbq`,
@@ -18,6 +19,8 @@ Authors:
 //    %USERPROFILE%\.cargo\bin), into native/sbq/target. When rustc's own host is of another
 //    architecture than the Dart VM (an x64 Dart SDK under Rosetta 2 or Windows' emulation with
 //    an arm64 Rust toolchain), it builds with an explicit `--target` of the VM's architecture.
+// Dart 3.13 filters CARGO_HOME from normal hook invocations; custom installs
+// should put cargo on PATH (or build a prebuilt with their Rust environment).
 // 3. Otherwise the build fails, naming the ways out. iOS and Android are never built here.
 //
 // A library whose header (ELF, Mach-O or PE) names another architecture or format than the
@@ -26,10 +29,13 @@ Authors:
 // Which of the two happened is printed (`dart run -v`, or the hook's stdout file under
 // .dart_tool/hooks_runner) and written to sbq_source.txt in the hook's output directory.
 
+import 'dart:convert';
 import 'dart:io';
 
 import 'package:code_assets/code_assets.dart';
 import 'package:hooks/hooks.dart';
+
+import 'binary_target.dart';
 
 void main(List<String> args) async {
   await build(args, (input, output) async {
@@ -48,7 +54,6 @@ void main(List<String> args) async {
     if (File.fromUri(prebuilt).existsSync()) {
       library = prebuilt;
       source = 'prebuilt ${prebuilt.toFilePath()}';
-      output.dependencies.add(prebuilt);
     } else {
       final missing =
           'switchboard_quic: no prebuilt native library for '
@@ -79,17 +84,20 @@ void main(List<String> args) async {
           'native/sbq, or place a prebuilt library at that path ($fetch).',
         );
       }
-      final triple = await _cargoTarget(cargo, arch);
+      final triple = await _cargoTarget(cargo, arch, crate);
       final target = crate.resolve('target/');
       final result = await Process.run(
         cargo,
         [
           'build',
           '--release',
+          '--locked',
+          '--message-format=json',
           '--manifest-path',
           crate.resolve('Cargo.toml').toFilePath(),
           if (triple != null) ...['--target', triple],
         ],
+        workingDirectory: crate.toFilePath(),
         environment: {'CARGO_TARGET_DIR': target.toFilePath()},
       );
       if (result.exitCode != 0) {
@@ -98,9 +106,36 @@ void main(List<String> args) async {
           '(exit ${result.exitCode}):\n${result.stderr}',
         );
       }
-      library = target.resolve(
-        '${triple == null ? '' : '$triple/'}release/$fileName',
-      );
+      // Cargo config can set build.target too. Use the artifact from this
+      // invocation, never an old host library left in target/release.
+      Uri? built;
+      for (final line in (result.stdout as String).split('\n')) {
+        final Object? message;
+        try {
+          message = jsonDecode(line);
+        } on FormatException {
+          continue;
+        }
+        if (message is Map<String, dynamic> &&
+            message['reason'] == 'compiler-artifact' &&
+            message['target'] is Map<String, dynamic> &&
+            (message['target'] as Map<String, dynamic>)['name'] == 'sbq' &&
+            message['filenames'] is List<dynamic>) {
+          for (final path in message['filenames'] as List<dynamic>) {
+            if (path is String &&
+                File(path).uri.pathSegments.last == fileName) {
+              built = File(path).uri;
+            }
+          }
+        }
+      }
+      if (built == null) {
+        throw StateError(
+          'switchboard_quic: cargo succeeded but reported no $fileName artifact '
+          'for ${os.name}_${arch.name}',
+        );
+      }
+      library = built;
       source =
           'cargo build ($cargo${triple == null ? '' : ' --target $triple'}) '
           '-> ${library.toFilePath()}';
@@ -115,13 +150,22 @@ void main(List<String> args) async {
     }
     // Dart 3.13's hooks runner bundles a library of another architecture
     // without a word, which then fails to load with a misleading message.
-    final found = _binaryTarget(File.fromUri(library));
-    if (found != null && found != (_binaryFormat(os), arch.name)) {
+    final found = binaryTargets(File.fromUri(library).readAsBytesSync());
+    if (found == null) {
       throw StateError(
-        'switchboard_quic: ${library.toFilePath()} is built for ${found.$2} '
+        'switchboard_quic: ${library.toFilePath()} has an unsupported or '
+        'malformed native library header for ${os.name}_${arch.name}',
+      );
+    }
+    if (found.$1 != _binaryFormat(os) || !found.$2.contains(arch.name)) {
+      throw StateError(
+        'switchboard_quic: ${library.toFilePath()} is built for ${found.$2.join(', ')} '
         '(${found.$1}), not for ${os.name}_${arch.name}',
       );
     }
+    // Track the actual file as well: cargo clean or a replacement must not
+    // leave a cached hook pointing at a missing or unchecked library.
+    output.dependencies.add(library);
     stdout.writeln('switchboard_quic: native library from $source');
     await File.fromUri(input.outputDirectory.resolve('sbq_source.txt'))
         .writeAsString('$source\n');
@@ -142,61 +186,6 @@ String _binaryFormat(OS os) => switch (os) {
   OS.macOS || OS.iOS => 'Mach-O',
   _ => 'ELF',
 };
-
-/// The format and the architecture (an [Architecture] name) of the library
-/// [file] from its header, or null for a format or a machine not known here
-/// (a universal Mach-O binary among them).
-(String, String)? _binaryTarget(File file) {
-  final List<int> head;
-  try {
-    final f = file.openSync();
-    try {
-      head = f.readSync(4096);
-    } finally {
-      f.closeSync();
-    }
-  } on FileSystemException {
-    return null;
-  }
-  int u16(int at) => head[at] | head[at + 1] << 8;
-  int u32(int at) => u16(at) | u16(at + 2) << 16;
-  if (head.length >= 20 &&
-      head[0] == 0x7f &&
-      head[1] == 0x45 &&
-      head[2] == 0x4c &&
-      head[3] == 0x46 &&
-      head[5] == 1) {
-    final arch = switch (u16(18)) {
-      0x3e => 'x64',
-      0xb7 => 'arm64',
-      0x03 => 'ia32',
-      0x28 => 'arm',
-      0xf3 => head[4] == 2 ? 'riscv64' : 'riscv32',
-      _ => null,
-    };
-    return arch == null ? null : ('ELF', arch);
-  }
-  if (head.length >= 8 && u32(0) == 0xfeedfacf) {
-    final arch = switch (u32(4)) {
-      0x01000007 => 'x64',
-      0x0100000c => 'arm64',
-      _ => null,
-    };
-    return arch == null ? null : ('Mach-O', arch);
-  }
-  if (head.length >= 0x40 && head[0] == 0x4d && head[1] == 0x5a) {
-    final pe = u32(0x3c);
-    if (pe + 6 > head.length || u32(pe) != 0x00004550) return null;
-    final arch = switch (u16(pe + 4)) {
-      0x8664 => 'x64',
-      0xaa64 => 'arm64',
-      0x014c => 'ia32',
-      _ => null,
-    };
-    return arch == null ? null : ('PE', arch);
-  }
-  return null;
-}
 
 /// cargo on PATH, else in `$CARGO_HOME/bin`, else in rustup's default location
 /// (`~/.cargo/bin`, `%USERPROFILE%\.cargo\bin` on Windows).
@@ -229,7 +218,7 @@ String? _findCargo() {
 /// toolchain (which then needs that target: `rustup target add`). Null too when
 /// rustc cannot tell or the architecture is not one this maps; the hook checks
 /// the library's architecture either way.
-Future<String?> _cargoTarget(String cargo, Architecture arch) async {
+Future<String?> _cargoTarget(String cargo, Architecture arch, Uri crate) async {
   final rustArch = switch (arch) {
     Architecture.x64 => 'x86_64',
     Architecture.arm64 => 'aarch64',
@@ -244,7 +233,7 @@ Future<String?> _cargoTarget(String cargo, Architecture arch) async {
   try {
     result = await Process.run(sibling.existsSync() ? sibling.path : 'rustc', [
       '-vV',
-    ]);
+    ], workingDirectory: crate.toFilePath());
   } on ProcessException {
     return null;
   }

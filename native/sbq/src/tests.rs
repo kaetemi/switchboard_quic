@@ -5,6 +5,7 @@ Copyright (C) 2018-2026  Jan BOON (Kaetemi)
 Authors:
   Jan Boon <jan.boon@kaetemi.be>
   Claude Opus 5.5 <noreply@anthropic.com>
+  GPT-6 Astra <noreply@openai.com>
   GLM 5.3 Flash <noreply@z.ai>
 */
 
@@ -1107,14 +1108,19 @@ fn dial_falls_back_to_the_other_family() {
 /// sockets are IPv6-only unless told otherwise. Skipped on a host without IPv6.
 #[test]
 fn a_listener_on_the_ipv6_wildcard_accepts_ipv4_clients() {
+    // Probe the OS independently: a failure in the shim or quinn must not turn into a skip.
+    use socket2::{Domain, Protocol, Socket, Type};
+    let probe = (|| -> std::io::Result<()> {
+        let socket = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP))?;
+        socket.set_only_v6(false)?;
+        socket.bind(&"[::]:0".parse::<std::net::SocketAddr>().unwrap().into())
+    })();
+    if let Err(e) = probe {
+        eprintln!("skipped: OS cannot bind a dual-stack IPv6 socket: {e}");
+        return;
+    }
     let mut h = Harness::new();
-    let (l, port, _) = match h.server_at("::", 16, 1 << 20, 30_000, 0) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("skipped: cannot listen on [::]: {e}");
-            return;
-        }
-    };
+    let (l, port, _) = h.server_at("::", 16, 1 << 20, 30_000, 0).unwrap();
     let c = h.dial_with(port, SBQ_VERIFY_NONE, &[], 30_000, 5_000);
     let ev = h.wait("connected or closed", |e| {
         (e.kind == SBQ_EV_CONNECTED || e.kind == SBQ_EV_CLOSED) && e.handle == c

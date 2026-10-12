@@ -4,6 +4,7 @@
 # Authors:
 #   Jan Boon <jan.boon@kaetemi.be>
 #   Claude Opus 5.5 <noreply@anthropic.com>
+#   GPT-6 Astra <noreply@openai.com>
 #
 # CI of switchboard_quic, one job per platform: the shim (cargo fmt, clippy,
 # test), then the Dart package (analyze, format, the VM suite, whose build
@@ -28,6 +29,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test:
     name: ${{ matrix.platform }}
@@ -41,7 +46,7 @@ jobs:
           - { platform: linux_x64, runner: ubuntu-latest, node: true }
           - { platform: linux_arm64, runner: ubuntu-24.04-arm }
           - { platform: macos_arm64, runner: macos-latest }
-          # The last Intel macOS image GitHub offers (macos-13 is retired).
+          # An available Intel macOS image (macos-13 is retired).
           - { platform: macos_x64, runner: macos-15-intel }
           - { platform: windows_x64, runner: windows-latest }
     defaults:

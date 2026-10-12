@@ -237,9 +237,10 @@ Authors:
   dual-stack where the platform allows it (`IPV6_V6ONLY` off, as quinn
   makes its client sockets). On Windows, whose IPv6 sockets are IPv6-only
   by default, a listener on `::` took no IPv4 client; Linux and macOS
-  were dual-stack already (no ABI change).
-* The build hook finds cargo in `$CARGO_HOME/bin` and
-  `%USERPROFILE%\.cargo\bin` too; builds with an explicit `--target` when
+  normally defaulted to dual-stack (Linux can set `bindv6only`; no ABI change).
+* The build hook finds cargo in `%USERPROFILE%\.cargo\bin` too
+  (`$CARGO_HOME/bin` only when the hook runner passes that variable;
+  Dart 3.13 filters it); builds with an explicit `--target` when
   rustc's host is of another architecture than the Dart VM (an x64 Dart
   SDK under Rosetta 2 or Windows' emulation); refuses a library whose
   header names another architecture or format than the target's (Dart
@@ -264,3 +265,17 @@ Authors:
   waits for both `HELLO`s before it checks that they carry `EXPORTER` (a
   channel's records may overtake the control stream, as a run under wine
   showed).
+* Ports review: reject unknown or malformed library headers, accept a
+  universal Mach-O library only with the target slice, check ELF byte order
+  and class, and follow PE headers beyond the first page. Six VM tests cover
+  these checks. Cargo builds use `--locked` and the artifact reported by that
+  invocation (including a configured `build.target`); the library is a cache
+  dependency, so `cargo clean` cannot leave a cached hook pointing at it.
+* Release review: build artifacts before touching a release, limit repository
+  write access to the publishing job, serialize releases for a tag, and verify
+  an existing published release without replacing its assets. Fetching checks
+  manifest paths, hashes and duplicates before downloading; installs use unique
+  temporary files and atomic replacement of each library.
+* Port tests: a dual-stack test skips only when the OS cannot provide a
+  dual-stack socket, and the refusal test allows 2 s for the handshake and
+  request (300 ms failed under qemu), below the client's 5 s deadline.

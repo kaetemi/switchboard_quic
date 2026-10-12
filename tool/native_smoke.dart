@@ -5,6 +5,7 @@ Copyright (C) 2018-2026  Jan BOON (Kaetemi)
 Authors:
   Jan Boon <jan.boon@kaetemi.be>
   Claude Opus 5.5 <noreply@anthropic.com>
+  GPT-6 Astra <noreply@openai.com>
 */
 
 // Smoke test of the native provider, for JIT (`dart run tool/native_smoke.dart`)
@@ -263,8 +264,11 @@ Future<void> _webTransport(
 /// writes its `HELLO` once it has read the initiator's control stream, and may
 /// have answered a channel before that.
 Future<void> _hellos(QuicBindingConnection a, QuicBindingConnection b) async {
-  for (var i = 0; i < 250; i++) {
-    if (a.peerHello != null && b.peerHello != null) return;
+  final elapsed = Stopwatch()..start();
+  while (a.peerHello == null || b.peerHello == null) {
+    if (elapsed.elapsed >= const Duration(seconds: 5)) {
+      throw TimeoutException('both peers must receive HELLO', elapsed.elapsed);
+    }
     await Future<void>.delayed(const Duration(milliseconds: 20));
   }
 }
