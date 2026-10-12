@@ -203,7 +203,8 @@ final class NativeQuicProvider implements QuicConnector {
   /// Listens on [host] (an address, `0.0.0.0` or `::` for every interface)
   /// and [port] (0 for any free port) for raw QUIC connections.
   /// [advertisedHost] is the host of [NativeQuicListener.endpoint]
-  /// (default [host]).
+  /// (default [host]). A negative duration in [config] is an
+  /// [ArgumentError], as in [connect]'s configuration.
   Future<NativeQuicListener> listen(
     String host,
     int port,
@@ -232,6 +233,9 @@ final class NativeQuicProvider implements QuicConnector {
   }
 
   static int _clientConfig(QuicClientConfig c) {
+    final idle = _millis(c.idleTimeout, 'idleTimeout');
+    final keepAlive = _millis(c.keepAlive, 'keepAlive');
+    final handshake = _millis(c.handshakeTimeout, 'handshakeTimeout');
     final alpn = _alpnWire(c.alpn);
     final pins = BytesBuilder(copy: false);
     for (final h in c.serverCertificateHashes) {
@@ -256,8 +260,9 @@ final class NativeQuicProvider implements QuicConnector {
         c.maxStreamsBidi,
         c.streamReceiveWindow,
         c.connectionReceiveWindow,
-        c.idleTimeout.inMilliseconds,
-        c.keepAlive.inMilliseconds,
+        idle,
+        keepAlive,
+        handshake,
       ),
     );
     if (r <= 0) throw _Sbq.failure(r, 'client configuration');
@@ -265,6 +270,9 @@ final class NativeQuicProvider implements QuicConnector {
   }
 
   static int _serverConfig(QuicServerConfig c) {
+    final idle = _millis(c.idleTimeout, 'idleTimeout');
+    final keepAlive = _millis(c.keepAlive, 'keepAlive');
+    final handshake = _millis(c.handshakeTimeout, 'handshakeTimeout');
     final alpn = _alpnWire(c.alpn);
     final r = using(
       (arena) => sbq_server_config(
@@ -277,12 +285,25 @@ final class NativeQuicProvider implements QuicConnector {
         c.maxStreamsBidi,
         c.streamReceiveWindow,
         c.connectionReceiveWindow,
-        c.idleTimeout.inMilliseconds,
-        c.keepAlive.inMilliseconds,
+        idle,
+        keepAlive,
+        handshake,
       ),
     );
     if (r <= 0) throw _Sbq.failure(r, 'server configuration');
     return r;
+  }
+
+  /// A duration of a configuration in whole milliseconds for the shim, where
+  /// 0 is none: rounded up, so that a positive one stays positive. A
+  /// negative one, which would reach the shim as a huge unsigned value, is
+  /// an [ArgumentError].
+  static int _millis(Duration d, String name) {
+    if (d.isNegative) {
+      throw ArgumentError.value(d, name, 'must not be negative');
+    }
+    final ms = d.inMilliseconds;
+    return d.inMicroseconds.remainder(1000) == 0 ? ms : ms + 1;
   }
 
   static Uint8List _alpnWire(List<String> tokens) {

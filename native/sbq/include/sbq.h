@@ -16,7 +16,7 @@ Authors:
 #include <stdint.h>
 
 // Version of this ABI; the Dart layer refuses a library with another.
-#define SBQ_ABI_VERSION 2
+#define SBQ_ABI_VERSION 3
 
 // Success.
 #define SBQ_OK 0
@@ -92,7 +92,8 @@ Authors:
 // This side closed the connection (`sbq_conn_close`); code and reason are the ones given.
 #define SBQ_CLOSE_APP_LOCAL 2
 
-// The idle timeout expired (or the handshake timed out).
+// The idle timeout expired, or the handshake did not complete within its deadline (the
+// configuration's `handshake_ms`, else the idle timeout).
 #define SBQ_CLOSE_TIMED_OUT 3
 
 // This side's stack detected a transport error; b = the transport error code.
@@ -196,8 +197,11 @@ int32_t sbq_generate_self_signed(const uint8_t *subject,
 // Creates a client configuration. `alpn` is the ALPN list in wire form (each token preceded by
 // its length byte); `verify` one of `SBQ_VERIFY_*`; `pins` `pin_count` SHA-256 hashes of 32
 // bytes each (`SBQ_VERIFY_PINNED`); `max_bidi` the bidirectional streams the server may open at
-// once; windows in bytes; times in milliseconds, 0 for none. 0-RTT is never used. Returns the
-// configuration handle (free it with `sbq_config_free`) or an error.
+// once; windows in bytes; times in milliseconds, 0 for none. `handshake_ms` bounds each
+// handshake attempt of a connect (one per address tried): CLOSED with `SBQ_CLOSE_TIMED_OUT`
+// follows when none completed in time; with 0 the idle timeout alone bounds the handshake, and
+// with both 0 nothing does. 0-RTT is never used. Returns the configuration handle (free it with
+// `sbq_config_free`) or an error.
 int64_t sbq_client_config(const uint8_t *alpn,
                           size_t alpn_len,
                           int32_t verify,
@@ -207,12 +211,16 @@ int64_t sbq_client_config(const uint8_t *alpn,
                           uint64_t stream_window,
                           uint64_t conn_window,
                           uint64_t idle_ms,
-                          uint64_t keep_alive_ms);
+                          uint64_t keep_alive_ms,
+                          uint64_t handshake_ms);
 
 // Creates a server configuration: ALPN list in wire form, the certificate DER (optionally
 // followed by the DER certificates of its chain), the private key DER (PKCS#8, SEC1 or
 // PKCS#1), and limits as for `sbq_client_config` (`max_bidi`: streams the client may open at
-// once). TLS 1.3 only, no client authentication, no 0-RTT.
+// once). `handshake_ms` bounds the handshake of each connection the listener accepts: one not
+// complete by then is abandoned (closed) and never announced; 0 leaves it to the idle timeout,
+// and with both 0 a client that goes silent mid-handshake is kept until the listener closes.
+// TLS 1.3 only, no client authentication, no 0-RTT.
 int64_t sbq_server_config(const uint8_t *alpn,
                           size_t alpn_len,
                           const uint8_t *cert,
@@ -223,7 +231,8 @@ int64_t sbq_server_config(const uint8_t *alpn,
                           uint64_t stream_window,
                           uint64_t conn_window,
                           uint64_t idle_ms,
-                          uint64_t keep_alive_ms);
+                          uint64_t keep_alive_ms,
+                          uint64_t handshake_ms);
 
 // Frees a configuration; connections and listeners made with it are unaffected.
 int32_t sbq_config_free(uint64_t config);
@@ -245,7 +254,9 @@ int32_t sbq_listener_close(uint64_t listener);
 
 // Connects to `host` (UTF-8 name or address, resolved in the runtime) and `port`, sending
 // `server_name` (UTF-8) for SNI and verification, with a client configuration. Returns the
-// connection handle at once; CONNECTED or CLOSED follows.
+// connection handle at once; CONNECTED or CLOSED follows (`SBQ_CLOSE_TIMED_OUT` once the
+// configuration's handshake deadline passed, or its idle timeout). The attempt is abandoned with
+// `sbq_conn_close` or `sbq_conn_release`.
 int64_t sbq_connect(uint64_t ctx_id,
                     uint64_t config,
                     const uint8_t *host,
@@ -298,7 +309,9 @@ int32_t sbq_conn_stats(uint64_t conn, struct SbqStats *out);
 
 // Opens a bidirectional stream: returns its handle if the peer's stream limit allows it now,
 // otherwise `SBQ_WOULD_BLOCK` and an OPENED event carries the stream once it does (one event
-// per blocked call). Nothing reaches the peer before the first write.
+// per blocked call). Nothing reaches the peer before the first write. `SBQ_ERR_STATE` during
+// the handshake; `SBQ_ERR_CONNECTION` once the connection has ended, also when its handshake
+// never completed.
 int64_t sbq_stream_open(uint64_t conn);
 
 // Writes up to `len` (> 0) bytes; returns how many were accepted (the peer's flow control

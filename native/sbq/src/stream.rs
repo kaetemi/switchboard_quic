@@ -272,6 +272,11 @@ pub fn open(conn_h: u64) -> i64 {
     let Some(obj) = crate::ctx::get(&CONNS, conn_h) else {
         return SBQ_ERR_HANDLE;
     };
+    // Ended first: a connection whose handshake never completed has no `Connection` either, and
+    // after CLOSED it fails as an ended one does, not as one still in its handshake.
+    if lock(&obj.end).is_some() {
+        return SBQ_ERR_CONNECTION;
+    }
     let Some(conn) = obj.connection() else {
         return SBQ_ERR_STATE;
     };

@@ -87,8 +87,11 @@ external int sbq_generate_self_signed(
 /// Creates a client configuration. `alpn` is the ALPN list in wire form (each token preceded by
 /// its length byte); `verify` one of `SBQ_VERIFY_*`; `pins` `pin_count` SHA-256 hashes of 32
 /// bytes each (`SBQ_VERIFY_PINNED`); `max_bidi` the bidirectional streams the server may open at
-/// once; windows in bytes; times in milliseconds, 0 for none. 0-RTT is never used. Returns the
-/// configuration handle (free it with `sbq_config_free`) or an error.
+/// once; windows in bytes; times in milliseconds, 0 for none. `handshake_ms` bounds each
+/// handshake attempt of a connect (one per address tried): CLOSED with `SBQ_CLOSE_TIMED_OUT`
+/// follows when none completed in time; with 0 the idle timeout alone bounds the handshake, and
+/// with both 0 nothing does. 0-RTT is never used. Returns the configuration handle (free it with
+/// `sbq_config_free`) or an error.
 @ffi.Native<
   ffi.Int64 Function(
     ffi.Pointer<ffi.Uint8>,
@@ -96,6 +99,7 @@ external int sbq_generate_self_signed(
     ffi.Int32,
     ffi.Pointer<ffi.Uint8>,
     ffi.Size,
+    ffi.Uint64,
     ffi.Uint64,
     ffi.Uint64,
     ffi.Uint64,
@@ -114,12 +118,16 @@ external int sbq_client_config(
   int conn_window,
   int idle_ms,
   int keep_alive_ms,
+  int handshake_ms,
 );
 
 /// Creates a server configuration: ALPN list in wire form, the certificate DER (optionally
 /// followed by the DER certificates of its chain), the private key DER (PKCS#8, SEC1 or
 /// PKCS#1), and limits as for `sbq_client_config` (`max_bidi`: streams the client may open at
-/// once). TLS 1.3 only, no client authentication, no 0-RTT.
+/// once). `handshake_ms` bounds the handshake of each connection the listener accepts: one not
+/// complete by then is abandoned (closed) and never announced; 0 leaves it to the idle timeout,
+/// and with both 0 a client that goes silent mid-handshake is kept until the listener closes.
+/// TLS 1.3 only, no client authentication, no 0-RTT.
 @ffi.Native<
   ffi.Int64 Function(
     ffi.Pointer<ffi.Uint8>,
@@ -128,6 +136,7 @@ external int sbq_client_config(
     ffi.Size,
     ffi.Pointer<ffi.Uint8>,
     ffi.Size,
+    ffi.Uint64,
     ffi.Uint64,
     ffi.Uint64,
     ffi.Uint64,
@@ -147,6 +156,7 @@ external int sbq_server_config(
   int conn_window,
   int idle_ms,
   int keep_alive_ms,
+  int handshake_ms,
 );
 
 /// Frees a configuration; connections and listeners made with it are unaffected.
@@ -183,7 +193,9 @@ external int sbq_listener_close(int listener);
 
 /// Connects to `host` (UTF-8 name or address, resolved in the runtime) and `port`, sending
 /// `server_name` (UTF-8) for SNI and verification, with a client configuration. Returns the
-/// connection handle at once; CONNECTED or CLOSED follows.
+/// connection handle at once; CONNECTED or CLOSED follows (`SBQ_CLOSE_TIMED_OUT` once the
+/// configuration's handshake deadline passed, or its idle timeout). The attempt is abandoned with
+/// `sbq_conn_close` or `sbq_conn_release`.
 @ffi.Native<
   ffi.Int64 Function(
     ffi.Uint64,
@@ -289,7 +301,9 @@ external int sbq_conn_stats(int conn, ffi.Pointer<SbqStats> out);
 
 /// Opens a bidirectional stream: returns its handle if the peer's stream limit allows it now,
 /// otherwise `SBQ_WOULD_BLOCK` and an OPENED event carries the stream once it does (one event
-/// per blocked call). Nothing reaches the peer before the first write.
+/// per blocked call). Nothing reaches the peer before the first write. `SBQ_ERR_STATE` during
+/// the handshake; `SBQ_ERR_CONNECTION` once the connection has ended, also when its handshake
+/// never completed.
 @ffi.Native<ffi.Int64 Function(ffi.Uint64)>(isLeaf: true)
 external int sbq_stream_open(int conn);
 
@@ -401,7 +415,7 @@ final class SbqStats extends ffi.Struct {
   external int udp_rx_datagrams;
 }
 
-const int SBQ_ABI_VERSION = 2;
+const int SBQ_ABI_VERSION = 3;
 
 const int SBQ_OK = 0;
 

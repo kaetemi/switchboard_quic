@@ -52,3 +52,41 @@
   instead of at this side's own confirmation timeout. The fake provider
   gives a stopped direction no more stream credit, as a QUIC stack.
 * The node-level tests are marked `@TestOn('vm')`.
+* Handshake deadline: `handshakeTimeout` in `QuicClientConfig` and
+  `QuicServerConfig` (10 s by default; zero leaves the handshake to the
+  idle timeout, quinn's only bound, as before). The shim enforces it
+  (ABI 3: a trailing `handshake_ms` of `sbq_client_config` and
+  `sbq_server_config`): a connect that runs out of time ends as a
+  handshake the idle timeout ended (`unreachable`), and a listener
+  abandons an incoming handshake not complete in time, so neither a dial
+  to a black hole nor a client that goes silent halfway through its
+  handshake is held forever when there is no idle timeout.
+* Provider contract: `QuicConnector.connect` cannot be cancelled; a
+  caller that stops waiting closes the session it still yields.
+  `QuicSwitchboardBinding.dial` bounds the connect by the node's connect
+  timeout (`BindingDialSettings.timeout`), fails with `UNAVAILABLE` on
+  expiry and closes a session that lands later with `CANCELLED`, also for
+  direct callers; the same timeout is the handshake deadline it asks for.
+* `QuicSwitchboardBinding.keepAlive`: the QUIC stack's keep-alive is the
+  binding's own, a third of `idleTimeout` by default (none without an
+  idle timeout, `Duration.zero` disables it), and no longer follows
+  `MuxOptions.keepAliveInterval`, the control `PING`, the application's
+  probe: a control interval above the idle timeout no longer lets a
+  quiet connection idle out, and turning the control `PING` on or off
+  leaves the stack's keep-alive as it is.
+* `QuicChannel.sendWindow` documented as the core contract has it for a
+  binding over a stack's flow control: an estimate (room for one largest
+  subframe while writable), not a count.
+* Fix: `sbq_stream_open` on a connection whose handshake never completed
+  returns `SBQ_ERR_CONNECTION` after its CLOSED event, as the event's
+  documentation says, instead of `SBQ_ERR_STATE`, which stays the answer
+  during the handshake.
+* Negative durations are argument errors: the native provider throws
+  `ArgumentError` for a negative `idleTimeout`, `keepAlive` or
+  `handshakeTimeout` in either configuration instead of passing it to
+  the shim as a huge unsigned value (a negative handshake deadline used
+  to mean none), and rounds a positive one up to whole milliseconds, so
+  that it never becomes none; `QuicSwitchboardBinding` throws for a
+  negative `idleTimeout` or `keepAlive` when constructed. The provider
+  contract says so of its configurations, and the fake provider checks
+  it too.

@@ -381,6 +381,185 @@ void main() {
     });
   });
 
+  group('dialling', () {
+    Matcher unavailableWith(String text) => throwsA(
+      isA<SwitchboardException>()
+          .having((e) => e.code, 'code', StatusCode.unavailable)
+          .having((e) => e.status.reason, 'reason', contains(text)),
+    );
+
+    test('a connect that outlasts the dial timeout fails UNAVAILABLE, and '
+        'the session it yields later is closed CANCELLED', () async {
+      final network = FakeQuicNetwork();
+      final server = node();
+      final listener = await listen(network, server, 'slow-1');
+      final connector = network.connector()..connectGate = Completer<void>();
+      final binding = QuicSwitchboardBinding(connector);
+      const timeout = Duration(milliseconds: 100);
+      // A direct caller, without a node's own timeout around the dial.
+      await expectLater(
+        binding.dial(
+          listener.endpoint,
+          const BindingDialSettings(options: fast, timeout: timeout),
+        ),
+        unavailableWith('not connected within $timeout'),
+      );
+      // The stack was asked for the same deadline.
+      expect(connector.configs.single.handshakeTimeout, timeout);
+      expect(network.pairs, isEmpty);
+      // The handshake completes after all: its session is closed at once.
+      connector.connectGate!.complete();
+      await until(() => network.pairs.isNotEmpty);
+      final (client, acceptor) = network.pairs.single;
+      final end = await client.done.timeout(limit);
+      expect(client.closes, [(StatusCode.cancelled.code, 'dial abandoned')]);
+      expect((end.code, end.byPeer), (StatusCode.cancelled.code, false));
+      expect(
+        (await acceptor.done.timeout(limit)).code,
+        StatusCode.cancelled.code,
+      );
+      expect(binding.dialled, isEmpty);
+    });
+
+    test('through a node: its connect timeout bounds the dial, and the late '
+        'session is closed CANCELLED', () async {
+      final network = FakeQuicNetwork();
+      final server = node();
+      server.registerService(echo, echoService);
+      final listener = await listen(network, server, 'slow-2');
+      final connector = network.connector()..connectGate = Completer<void>();
+      final binding = QuicSwitchboardBinding(connector);
+      final client = Switchboard(
+        muxOptions: fast,
+        bindings: [binding],
+        connectTimeout: const Duration(milliseconds: 100),
+      );
+      addTearDown(client.close);
+      await expectLater(
+        client.connect(listener.endpoint),
+        throwsCode(StatusCode.unavailable),
+      );
+      expect(
+        connector.configs.single.handshakeTimeout,
+        const Duration(milliseconds: 100),
+      );
+      connector.connectGate!.complete();
+      await until(() => network.pairs.isNotEmpty);
+      final (session, _) = network.pairs.single;
+      await session.done.timeout(limit);
+      expect(session.closes, [(StatusCode.cancelled.code, 'dial abandoned')]);
+      expect(binding.dialled, isEmpty);
+      // The next dial, not held, connects.
+      connector.connectGate = null;
+      final talk = await client.openTalkAt(
+        listener.endpoint,
+        ChannelAddress(type: echo),
+      );
+      expect(text((await talk.request('ECHO', bytes('late'))).payload), 'late');
+      expect(binding.dialled, hasLength(1));
+    });
+
+    test('without a dial timeout the connect is not bounded, nor its '
+        'handshake', () async {
+      final network = FakeQuicNetwork();
+      final server = node();
+      final listener = await listen(network, server, 'slow-3');
+      final connector = network.connector()..connectGate = Completer<void>();
+      final binding = QuicSwitchboardBinding(connector);
+      final dialling = binding.dial(
+        listener.endpoint,
+        const BindingDialSettings(options: fast, timeout: Duration.zero),
+      );
+      await settle(150);
+      expect(connector.configs.single.handshakeTimeout, Duration.zero);
+      connector.connectGate!.complete();
+      final connection = await dialling.timeout(limit);
+      addTearDown(connection.close);
+      expect(binding.dialled, [connection]);
+    });
+
+    test('the stack keep-alive is the binding\'s: a third of the idle '
+        'timeout by default, none without one, or as given, whatever the '
+        'control PING interval', () async {
+      final network = FakeQuicNetwork();
+      Future<QuicClientConfig> dialledWith(
+        QuicSwitchboardBinding binding,
+        MuxOptions options,
+      ) async {
+        // Nothing listens: the dial fails, and the connector kept the
+        // configuration it was asked for.
+        await expectLater(
+          binding.dial(
+            Uri.parse('quic://nowhere:1'),
+            BindingDialSettings(options: options, timeout: limit),
+          ),
+          throwsCode(StatusCode.unavailable),
+        );
+        return (binding.connector as FakeQuicConnector).configs.single;
+      }
+
+      for (final interval in [
+        null,
+        const Duration(seconds: 1),
+        const Duration(seconds: 10),
+        const Duration(minutes: 5),
+      ]) {
+        final options = MuxOptions(keepAliveInterval: interval);
+        final byDefault = await dialledWith(
+          QuicSwitchboardBinding(network.connector()),
+          options,
+        );
+        expect(byDefault.idleTimeout, const Duration(seconds: 30));
+        expect(byDefault.keepAlive, const Duration(seconds: 10));
+        expect(byDefault.handshakeTimeout, limit);
+        final shorter = await dialledWith(
+          QuicSwitchboardBinding(
+            network.connector(),
+            idleTimeout: const Duration(seconds: 3),
+          ),
+          options,
+        );
+        expect(shorter.keepAlive, const Duration(seconds: 1));
+        final noIdle = await dialledWith(
+          QuicSwitchboardBinding(
+            network.connector(),
+            idleTimeout: Duration.zero,
+          ),
+          options,
+        );
+        expect(noIdle.idleTimeout, Duration.zero);
+        expect(noIdle.keepAlive, Duration.zero);
+        final given = await dialledWith(
+          QuicSwitchboardBinding(
+            network.connector(),
+            keepAlive: const Duration(seconds: 4),
+          ),
+          options,
+        );
+        expect(given.keepAlive, const Duration(seconds: 4));
+        final off = await dialledWith(
+          QuicSwitchboardBinding(network.connector(), keepAlive: Duration.zero),
+          options,
+        );
+        expect(off.keepAlive, Duration.zero);
+        expect(off.idleTimeout, const Duration(seconds: 30));
+      }
+    });
+
+    test('a negative idle timeout or keep-alive is an ArgumentError', () {
+      final connector = FakeQuicNetwork().connector();
+      const negative = Duration(microseconds: -1);
+      expect(
+        () => QuicSwitchboardBinding(connector, idleTimeout: negative),
+        throwsArgumentError,
+      );
+      expect(
+        () => QuicSwitchboardBinding(connector, keepAlive: negative),
+        throwsArgumentError,
+      );
+    });
+  });
+
   group('identity', () {
     test('nodes identify both ways with exporter-bound proofs, and the '
         'scoped policy admits the identified peer', () async {

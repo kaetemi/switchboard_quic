@@ -37,7 +37,13 @@ import 'dart:typed_data';
 /// dials `https://` only.
 abstract interface class QuicConnector {
   /// Connects to [endpoint] with [config]. Fails with a [QuicException]
-  /// (`unreachable`, `handshakeFailed`, `unsupportedScheme`, ...).
+  /// (`unreachable`, `handshakeFailed`, `unsupportedScheme`, ...); a
+  /// handshake that runs past [QuicClientConfig.handshakeTimeout] fails
+  /// with `unreachable`.
+  ///
+  /// The attempt cannot be cancelled. A caller that stops waiting (a
+  /// timeout of its own) closes the session the future still yields, and
+  /// ignores its failure, as for [QuicSession.openStream].
   Future<QuicSession> connect(Uri endpoint, QuicClientConfig config);
 }
 
@@ -190,7 +196,8 @@ abstract interface class QuicStream {
   Future<int?> get stopped;
 }
 
-/// Client configuration.
+/// Client configuration. Its durations are zero (none) or positive: a
+/// provider rejects a negative one with an [ArgumentError].
 class QuicClientConfig {
   const QuicClientConfig({
     required this.alpn,
@@ -201,6 +208,7 @@ class QuicClientConfig {
     this.connectionReceiveWindow = 16 << 20,
     this.idleTimeout = const Duration(seconds: 30),
     this.keepAlive = const Duration(seconds: 10),
+    this.handshakeTimeout = const Duration(seconds: 10),
   });
 
   /// ALPN tokens to offer, in order (`switchboard` for raw QUIC); for
@@ -226,11 +234,21 @@ class QuicClientConfig {
   /// Zero for none (the stack's and the peer's limits apply).
   final Duration idleTimeout;
 
-  /// Zero for none.
+  /// The interval of the stack's own keep-alive (QUIC `PING` frames), which
+  /// keeps a quiet connection from reaching [idleTimeout]; shorter than it
+  /// (a third, say). Zero for none.
   final Duration keepAlive;
+
+  /// How long the handshake may take before [QuicConnector.connect] fails
+  /// with `unreachable` (a provider that tries several addresses of a name
+  /// may give each attempt its own). Zero for no deadline of its own:
+  /// [idleTimeout] alone bounds it then, and nothing does when that is zero
+  /// too.
+  final Duration handshakeTimeout;
 }
 
-/// Server configuration (native provider).
+/// Server configuration (native provider). Its durations are zero (none)
+/// or positive, as in [QuicClientConfig].
 class QuicServerConfig {
   const QuicServerConfig({
     required this.alpn,
@@ -241,6 +259,7 @@ class QuicServerConfig {
     this.connectionReceiveWindow = 16 << 20,
     this.idleTimeout = const Duration(seconds: 30),
     this.keepAlive = const Duration(seconds: 10),
+    this.handshakeTimeout = const Duration(seconds: 10),
   });
 
   final List<String> alpn;
@@ -258,6 +277,14 @@ class QuicServerConfig {
   final int connectionReceiveWindow;
   final Duration idleTimeout;
   final Duration keepAlive;
+
+  /// How long the handshake of an incoming session may take: one that is
+  /// not complete by then is abandoned and never delivered on
+  /// [QuicListener.sessions]. Zero for no deadline of its own: [idleTimeout]
+  /// alone bounds it then, and with that zero too a client that goes silent
+  /// halfway through its handshake holds its state until the listener
+  /// closes.
+  final Duration handshakeTimeout;
 }
 
 /// How a session ended.

@@ -11,6 +11,7 @@ Authors:
 //! Self test of the ABI, through the extern "C" functions as an embedder calls them: a
 //! doorbell, `sbq_poll`, handles and result codes. Each test has its own context.
 
+use std::net::SocketAddr;
 use std::sync::{Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -75,6 +76,17 @@ impl Harness {
     }
 
     fn server(&mut self, max_bidi: u64, window: u64, idle_ms: u64) -> (u64, u16, [u8; 32]) {
+        self.server_with(max_bidi, window, idle_ms, 0)
+    }
+
+    /// A listener on the loopback whose handshakes have `handshake_ms` (0: no deadline).
+    fn server_with(
+        &mut self,
+        max_bidi: u64,
+        window: u64,
+        idle_ms: u64,
+        handshake_ms: u64,
+    ) -> (u64, u16, [u8; 32]) {
         let (cert, key) = self_signed("localhost");
         let mut hash = [0u8; 32];
         unsafe { sbq_sha256(cert.as_ptr(), cert.len(), hash.as_mut_ptr()) };
@@ -91,6 +103,7 @@ impl Harness {
                 16 << 20,
                 idle_ms,
                 0,
+                handshake_ms,
             )
         };
         assert!(cfg > 0, "server config: {}", ctx::last_error());
@@ -105,6 +118,18 @@ impl Harness {
 
     /// Starts a connection; returns its handle (CONNECTED or CLOSED follows).
     fn dial(&mut self, port: u16, verify: i32, pins: &[[u8; 32]], idle_ms: u64) -> u64 {
+        self.dial_with(port, verify, pins, idle_ms, 0)
+    }
+
+    /// Starts a connection whose handshake has `handshake_ms` (0: no deadline).
+    fn dial_with(
+        &mut self,
+        port: u16,
+        verify: i32,
+        pins: &[[u8; 32]],
+        idle_ms: u64,
+        handshake_ms: u64,
+    ) -> u64 {
         let flat: Vec<u8> = pins.iter().flatten().copied().collect();
         let cfg = unsafe {
             sbq_client_config(
@@ -118,6 +143,7 @@ impl Harness {
                 16 << 20,
                 idle_ms,
                 0,
+                handshake_ms,
             )
         };
         assert!(cfg > 0, "client config: {}", ctx::last_error());
@@ -317,6 +343,7 @@ fn config_errors() {
             1,
             0,
             0,
+            0,
         )
     };
     assert_eq!(r, SBQ_ERR_ARG);
@@ -330,6 +357,7 @@ fn config_errors() {
             1,
             1,
             1,
+            0,
             0,
             0,
         )
@@ -348,6 +376,7 @@ fn config_errors() {
             1,
             0,
             0,
+            0,
         )
     };
     assert_eq!(r, SBQ_ERR_ARG);
@@ -362,6 +391,7 @@ fn config_errors() {
             1,
             1,
             1,
+            0,
             0,
             0,
         )
@@ -379,6 +409,7 @@ fn config_errors() {
             1,
             1,
             1,
+            0,
             0,
             0,
         )
@@ -736,6 +767,185 @@ fn close_codes_and_idle_timeout() {
     );
 }
 
+/// Waits (up to 10 s) for `cond`.
+fn until(what: &str, cond: impl Fn() -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !cond() {
+        assert!(Instant::now() < deadline, "timed out waiting for {what}");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[test]
+fn a_handshake_deadline_ends_a_dial_to_a_silent_peer() {
+    let mut h = Harness::new();
+    // A socket that is bound, so nothing reports the port unreachable, and never answers. With
+    // no idle timeout quinn bounds the handshake by nothing; the deadline does.
+    let silent = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let port = silent.local_addr().unwrap().port();
+    let started = Instant::now();
+    let bounded = h.dial_with(port, SBQ_VERIFY_NONE, &[], 0, 300);
+    let unbounded = h.dial_with(port, SBQ_VERIFY_NONE, &[], 0, 0);
+    let e = h.wait("deadline", |e| {
+        e.kind == SBQ_EV_CLOSED && e.handle == bounded
+    });
+    let elapsed = started.elapsed();
+    assert_eq!(e.a, SBQ_CLOSE_TIMED_OUT);
+    assert!(
+        elapsed >= Duration::from_millis(290) && elapsed < Duration::from_secs(2),
+        "{elapsed:?}"
+    );
+    assert_eq!(h.close_reason(bounded), "timed out");
+    // The connecting task has ended, and the release forgets the handle.
+    let obj = get(&CONNS, bounded).expect("in the table until released");
+    until("the connecting task", || {
+        lock(&obj.tasks).iter().all(|t| t.is_finished())
+    });
+    drop(obj);
+    assert_eq!(sbq_conn_release(bounded), 0);
+    assert!(get(&CONNS, bounded).is_none());
+    // The first flights did reach the socket.
+    silent.set_nonblocking(true).unwrap();
+    let mut buf = [0u8; 2048];
+    assert!(silent.recv_from(&mut buf).is_ok());
+    // Without a deadline nothing ends the other attempt; abandoning it does.
+    std::thread::sleep(Duration::from_millis(300));
+    h.pump();
+    assert!(
+        !h.backlog.iter().any(|e| e.handle == unbounded),
+        "{:?}",
+        h.backlog
+    );
+    assert_eq!(
+        unsafe { sbq_conn_close(unbounded, 0, std::ptr::null(), 0) },
+        0
+    );
+    let e = h.wait("abandoned", |e| {
+        e.kind == SBQ_EV_CLOSED && e.handle == unbounded
+    });
+    assert_eq!(e.a, SBQ_CLOSE_APP_LOCAL);
+    assert_eq!(sbq_conn_release(unbounded), 0);
+}
+
+#[test]
+fn a_stream_cannot_be_opened_on_a_connection_whose_handshake_failed() {
+    let mut h = Harness::new();
+    let silent = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let port = silent.local_addr().unwrap().port();
+    // During the handshake: not available yet.
+    let timed_out = h.dial_with(port, SBQ_VERIFY_NONE, &[], 0, 200);
+    let abandoned = h.dial_with(port, SBQ_VERIFY_NONE, &[], 0, 0);
+    assert_eq!(sbq_stream_open(timed_out), SBQ_ERR_STATE);
+    assert_eq!(sbq_stream_open(abandoned), SBQ_ERR_STATE);
+    // After CLOSED, as SBQ_EV_CLOSED says: the connection has ended, though it never had a
+    // `Connection`, whether the deadline or this side ended the handshake.
+    let e = h.wait("deadline", |e| {
+        e.kind == SBQ_EV_CLOSED && e.handle == timed_out
+    });
+    assert_eq!(e.a, SBQ_CLOSE_TIMED_OUT);
+    assert_eq!(sbq_stream_open(timed_out), SBQ_ERR_CONNECTION);
+    assert_eq!(
+        unsafe { sbq_conn_close(abandoned, 0, std::ptr::null(), 0) },
+        0
+    );
+    let e = h.wait("abandoned", |e| {
+        e.kind == SBQ_EV_CLOSED && e.handle == abandoned
+    });
+    assert_eq!(e.a, SBQ_CLOSE_APP_LOCAL);
+    assert_eq!(sbq_stream_open(abandoned), SBQ_ERR_CONNECTION);
+    for c in [timed_out, abandoned] {
+        assert_eq!(sbq_conn_release(c), 0);
+        assert_eq!(sbq_stream_open(c), SBQ_ERR_HANDLE);
+    }
+}
+
+/// A UDP relay that passes a client's first flight to a server (what the client sends before the
+/// server's first answer) and nothing after it, in either direction: a client that starts a
+/// handshake and goes silent, as the server sees it.
+struct FirstFlight {
+    port: u16,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl FirstFlight {
+    fn to(server_port: u16) -> Self {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_millis(10)))
+            .unwrap();
+        let port = socket.local_addr().unwrap().port();
+        let server: SocketAddr = ([127, 0, 0, 1], server_port).into();
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let stopping = stop.clone();
+        let thread = std::thread::spawn(move || {
+            let mut buf = [0u8; 2048];
+            let mut answered = false;
+            while !stopping.load(Ordering::Relaxed) {
+                let Ok((n, from)) = socket.recv_from(&mut buf) else {
+                    continue;
+                };
+                if from == server {
+                    answered = true;
+                } else if !answered {
+                    let _ = socket.send_to(&buf[..n], server);
+                }
+            }
+        });
+        FirstFlight {
+            port,
+            stop,
+            thread: Some(thread),
+        }
+    }
+}
+
+impl Drop for FirstFlight {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
+}
+
+#[test]
+fn a_listener_drops_a_handshake_that_goes_silent() {
+    // A failed incoming handshake posts no event, so the listener's state is read inside the
+    // crate: quinn's count of the endpoint's connections.
+    let mut h = Harness::new();
+    let (bounded, bounded_port, _) = h.server_with(16, 1 << 20, 0, 300);
+    let (unbounded, unbounded_port, _) = h.server_with(16, 1 << 20, 0, 0);
+    let open = |l: u64| get(&LISTENERS, l).unwrap().endpoint.open_connections();
+    let to_bounded = FirstFlight::to(bounded_port);
+    let to_unbounded = FirstFlight::to(unbounded_port);
+    // No idle timeout on either side, so that none is negotiated.
+    let c1 = h.dial_with(to_bounded.port, SBQ_VERIFY_NONE, &[], 0, 0);
+    let c2 = h.dial_with(to_unbounded.port, SBQ_VERIFY_NONE, &[], 0, 0);
+    until("both handshakes under way", || {
+        open(bounded) == 1 && open(unbounded) == 1
+    });
+    // The deadline abandons the first one, which quinn forgets once its close has drained (three
+    // probe timeouts); nothing bounds the other.
+    until("the bounded handshake dropped", || open(bounded) == 0);
+    assert_eq!(open(unbounded), 1);
+    h.pump();
+    assert!(
+        !h.backlog.iter().any(|e| e.kind == SBQ_EV_INCOMING),
+        "{:?}",
+        h.backlog
+    );
+    for c in [c1, c2] {
+        assert_eq!(unsafe { sbq_conn_close(c, 0, std::ptr::null(), 0) }, 0);
+        h.wait("abandoned", |e| e.kind == SBQ_EV_CLOSED && e.handle == c);
+        assert_eq!(sbq_conn_release(c), 0);
+    }
+    // Closing the listener abandons the handshake it still holds.
+    assert_eq!(sbq_listener_close(unbounded), 0);
+    drop((to_bounded, to_unbounded));
+}
+
 #[test]
 fn stream_limit_and_backpressure() {
     let mut h = Harness::new();
@@ -828,6 +1038,7 @@ fn dial_falls_back_to_the_other_family() {
             conn_window: 16 << 20,
             idle_ms: 30_000,
             keep_alive_ms: 0,
+            handshake_ms: 0,
         },
     };
     let cc = config::client_config(&params, Default::default()).unwrap();
@@ -837,7 +1048,7 @@ fn dial_falls_back_to_the_other_family() {
         format!("127.0.0.1:{port}").parse().unwrap(),
     ];
     let started = Instant::now();
-    let conn = ctx::rt().block_on(conn::dial_addrs(cc, &addrs, "localhost"));
+    let conn = ctx::rt().block_on(conn::dial_addrs(cc, &addrs, "localhost", None));
     assert!(conn.is_ok(), "dial failed");
     assert!(started.elapsed() < Duration::from_secs(5));
     assert_eq!(conn.ok().unwrap().remote_address(), addrs[1]);

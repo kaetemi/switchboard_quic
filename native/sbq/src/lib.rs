@@ -37,13 +37,13 @@ mod tests;
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::sync::Arc;
 
-use config::{ClientParams, ConfigObj, Limits, Verify};
+use config::{ClientParams, ConfigObj, Limits, ServerParams, Verify};
 use ctx::{get, lock, set_error, CONFIGS, CONNS, CTXS, LISTENERS, STREAMS};
 
 pub use ctx::{SbqDoorbell, SbqEvent};
 
 /// Version of this ABI; the Dart layer refuses a library with another.
-pub const SBQ_ABI_VERSION: u32 = 2;
+pub const SBQ_ABI_VERSION: u32 = 3;
 
 /// Success.
 pub const SBQ_OK: i64 = 0;
@@ -98,7 +98,8 @@ pub const SBQ_EV_FINISHED_ACKED: i32 = 9;
 pub const SBQ_CLOSE_APP_REMOTE: i64 = 1;
 /// This side closed the connection (`sbq_conn_close`); code and reason are the ones given.
 pub const SBQ_CLOSE_APP_LOCAL: i64 = 2;
-/// The idle timeout expired (or the handshake timed out).
+/// The idle timeout expired, or the handshake did not complete within its deadline (the
+/// configuration's `handshake_ms`, else the idle timeout).
 pub const SBQ_CLOSE_TIMED_OUT: i64 = 3;
 /// This side's stack detected a transport error; b = the transport error code.
 pub const SBQ_CLOSE_TRANSPORT_LOCAL: i64 = 4;
@@ -300,6 +301,7 @@ fn limits(
     conn_window: u64,
     idle_ms: u64,
     keep_alive_ms: u64,
+    handshake_ms: u64,
 ) -> Limits {
     Limits {
         max_bidi,
@@ -307,14 +309,18 @@ fn limits(
         conn_window,
         idle_ms,
         keep_alive_ms,
+        handshake_ms,
     }
 }
 
 /// Creates a client configuration. `alpn` is the ALPN list in wire form (each token preceded by
 /// its length byte); `verify` one of `SBQ_VERIFY_*`; `pins` `pin_count` SHA-256 hashes of 32
 /// bytes each (`SBQ_VERIFY_PINNED`); `max_bidi` the bidirectional streams the server may open at
-/// once; windows in bytes; times in milliseconds, 0 for none. 0-RTT is never used. Returns the
-/// configuration handle (free it with `sbq_config_free`) or an error.
+/// once; windows in bytes; times in milliseconds, 0 for none. `handshake_ms` bounds each
+/// handshake attempt of a connect (one per address tried): CLOSED with `SBQ_CLOSE_TIMED_OUT`
+/// follows when none completed in time; with 0 the idle timeout alone bounds the handshake, and
+/// with both 0 nothing does. 0-RTT is never used. Returns the configuration handle (free it with
+/// `sbq_config_free`) or an error.
 #[no_mangle]
 pub unsafe extern "C" fn sbq_client_config(
     alpn: *const u8,
@@ -327,6 +333,7 @@ pub unsafe extern "C" fn sbq_client_config(
     conn_window: u64,
     idle_ms: u64,
     keep_alive_ms: u64,
+    handshake_ms: u64,
 ) -> i64 {
     let alpn = match config::parse_alpn(bytes(alpn, alpn_len)) {
         Ok(a) => a,
@@ -360,7 +367,14 @@ pub unsafe extern "C" fn sbq_client_config(
     let params = ClientParams {
         alpn,
         verify,
-        limits: limits(max_bidi, stream_window, conn_window, idle_ms, keep_alive_ms),
+        limits: limits(
+            max_bidi,
+            stream_window,
+            conn_window,
+            idle_ms,
+            keep_alive_ms,
+            handshake_ms,
+        ),
     };
     // Validate now, so that a bad configuration fails here and not in the connect task.
     if let Err(e) = config::client_config(&params, Arc::default()) {
@@ -374,7 +388,10 @@ pub unsafe extern "C" fn sbq_client_config(
 /// Creates a server configuration: ALPN list in wire form, the certificate DER (optionally
 /// followed by the DER certificates of its chain), the private key DER (PKCS#8, SEC1 or
 /// PKCS#1), and limits as for `sbq_client_config` (`max_bidi`: streams the client may open at
-/// once). TLS 1.3 only, no client authentication, no 0-RTT.
+/// once). `handshake_ms` bounds the handshake of each connection the listener accepts: one not
+/// complete by then is abandoned (closed) and never announced; 0 leaves it to the idle timeout,
+/// and with both 0 a client that goes silent mid-handshake is kept until the listener closes.
+/// TLS 1.3 only, no client authentication, no 0-RTT.
 #[no_mangle]
 pub unsafe extern "C" fn sbq_server_config(
     alpn: *const u8,
@@ -388,16 +405,28 @@ pub unsafe extern "C" fn sbq_server_config(
     conn_window: u64,
     idle_ms: u64,
     keep_alive_ms: u64,
+    handshake_ms: u64,
 ) -> i64 {
     let alpn = match config::parse_alpn(bytes(alpn, alpn_len)) {
         Ok(a) => a,
         Err(e) => return fail(SBQ_ERR_ARG, e),
     };
-    let l = limits(max_bidi, stream_window, conn_window, idle_ms, keep_alive_ms);
+    let l = limits(
+        max_bidi,
+        stream_window,
+        conn_window,
+        idle_ms,
+        keep_alive_ms,
+        handshake_ms,
+    );
     match config::server_config(alpn, bytes(cert, cert_len), bytes(key, key_len), &l) {
-        Ok(sc) => {
+        Ok(config) => {
             let h = ctx::next_handle();
-            lock(&CONFIGS).insert(h, Arc::new(ConfigObj::Server(sc)));
+            let params = ServerParams {
+                config,
+                handshake: l.handshake(),
+            };
+            lock(&CONFIGS).insert(h, Arc::new(ConfigObj::Server(params)));
             h as i64
         }
         Err(e) => fail(SBQ_ERR_TLS, e),
@@ -429,7 +458,7 @@ pub unsafe extern "C" fn sbq_listen(
     let Some(cfg) = get(&CONFIGS, config) else {
         return fail(SBQ_ERR_HANDLE, "unknown configuration");
     };
-    let ConfigObj::Server(sc) = &*cfg else {
+    let ConfigObj::Server(sp) = &*cfg else {
         return fail(SBQ_ERR_ARG, "not a server configuration");
     };
     let Some(host) = text(host, host_len) else {
@@ -446,7 +475,7 @@ pub unsafe extern "C" fn sbq_listen(
             None => return fail(SBQ_ERR_IO, format!("cannot resolve {host}")),
         },
     };
-    match conn::listen(&ctx, sc.clone(), addr) {
+    match conn::listen(&ctx, sp.config.clone(), sp.handshake, addr) {
         Ok(h) => h as i64,
         Err(e) => fail(SBQ_ERR_IO, e),
     }
@@ -478,7 +507,9 @@ pub extern "C" fn sbq_listener_close(listener: u64) -> i32 {
 
 /// Connects to `host` (UTF-8 name or address, resolved in the runtime) and `port`, sending
 /// `server_name` (UTF-8) for SNI and verification, with a client configuration. Returns the
-/// connection handle at once; CONNECTED or CLOSED follows.
+/// connection handle at once; CONNECTED or CLOSED follows (`SBQ_CLOSE_TIMED_OUT` once the
+/// configuration's handshake deadline passed, or its idle timeout). The attempt is abandoned with
+/// `sbq_conn_close` or `sbq_conn_release`.
 #[no_mangle]
 pub unsafe extern "C" fn sbq_connect(
     ctx_id: u64,
@@ -690,7 +721,9 @@ pub unsafe extern "C" fn sbq_conn_stats(conn: u64, out: *mut SbqStats) -> i32 {
 
 /// Opens a bidirectional stream: returns its handle if the peer's stream limit allows it now,
 /// otherwise `SBQ_WOULD_BLOCK` and an OPENED event carries the stream once it does (one event
-/// per blocked call). Nothing reaches the peer before the first write.
+/// per blocked call). Nothing reaches the peer before the first write. `SBQ_ERR_STATE` during
+/// the handshake; `SBQ_ERR_CONNECTION` once the connection has ended, also when its handshake
+/// never completed.
 #[no_mangle]
 pub extern "C" fn sbq_stream_open(conn: u64) -> i64 {
     stream::open(conn)

@@ -622,9 +622,13 @@ void main() {
         idle: idle,
         keepAlive: Duration.zero,
       );
-      final binding = QuicSwitchboardBinding(provider, idleTimeout: idle);
-      // No keep-alive of the binding's own ([fast]): nothing is sent once
-      // the request is answered.
+      final binding = QuicSwitchboardBinding(
+        provider,
+        idleTimeout: idle,
+        keepAlive: Duration.zero,
+      );
+      // No keep-alive, neither the stack's nor the control PING ([fast]):
+      // nothing is sent once the request is answered.
       final client = node(bindings: [binding]);
       final talk = await client.openTalkAt(
         listener.endpoint,
@@ -645,6 +649,34 @@ void main() {
       );
       final end = await connection.session.done.timeout(limit);
       expect(end.lost, isTrue);
+    });
+
+    test('the stack keep-alive, a third of the idle timeout, holds a quiet '
+        'connection open without the control PING', () async {
+      final server = node();
+      server.registerService(echo, echoService);
+      const idle = Duration(milliseconds: 800);
+      final listener = await listen(
+        server,
+        idle: idle,
+        keepAlive: Duration.zero,
+      );
+      // The control PING is off ([fast]); the binding's stack keep-alive is
+      // not.
+      final binding = QuicSwitchboardBinding(provider, idleTimeout: idle);
+      final client = node(bindings: [binding]);
+      final talk = await client.openTalkAt(
+        listener.endpoint,
+        ChannelAddress(type: echo),
+      );
+      await talk.request('ECHO', bytes('x')).timeout(limit);
+      await Future<void>.delayed(idle * 3);
+      final connection = binding.dialled.single;
+      expect(connection.isOpen, isTrue);
+      expect(
+        text((await talk.request('ECHO', bytes('still'))).payload),
+        'still',
+      );
     });
   });
 
