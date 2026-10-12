@@ -57,6 +57,9 @@ struct Inner {
     /// The stream header still to be written ahead of the data (a WebTransport stream this side
     /// opened; empty otherwise).
     prefix: Vec<u8>,
+    /// The stream's WebTransport session ended: its directions were reset and stopped with
+    /// WT_SESSION_GONE, and reads and writes fail as on an ended connection.
+    gone: bool,
 }
 
 pub struct StreamObj {
@@ -130,6 +133,7 @@ impl StreamObj {
     pub fn session_gone(&self) {
         let code = VarInt::from_u64(wt::err::WT_SESSION_GONE).expect("in range");
         let mut g = lock(&self.inner);
+        g.gone = true;
         if matches!(g.send_state, SendState::Open | SendState::Finished) {
             if let Some(send) = g.send.as_mut() {
                 let _ = send.reset(code);
@@ -188,6 +192,9 @@ impl StreamObj {
         if g.send.is_none() {
             return SBQ_ERR_STATE;
         }
+        if g.gone {
+            return SBQ_ERR_CONNECTION;
+        }
         match g.send_state {
             SendState::Open => {}
             SendState::Stopped(c) => return self.code_out(c),
@@ -212,6 +219,9 @@ impl StreamObj {
             return SBQ_ERR_ARG;
         }
         let mut g = lock(&self.inner);
+        if g.gone {
+            return SBQ_ERR_CONNECTION;
+        }
         match g.recv_state {
             RecvState::Open => {}
             RecvState::Fin => return SBQ_FIN,
@@ -242,6 +252,9 @@ impl StreamObj {
     /// or quinn has forgotten the direction after its last byte was read).
     pub fn poll_reset(&self) -> i64 {
         let mut g = lock(&self.inner);
+        if g.gone {
+            return SBQ_ERR_CONNECTION;
+        }
         match g.recv_state {
             RecvState::Open => {}
             RecvState::Fin => return SBQ_FIN,
@@ -272,13 +285,16 @@ impl StreamObj {
         if g.send.is_none() {
             return SBQ_ERR_STATE;
         }
+        if g.gone {
+            return SBQ_ERR_CONNECTION;
+        }
         match g.send_state {
             // quinn's finish reports a STOP_SENDING that raced in as Ok and leaves the code to
             // the stopped() task above, so only "already ended" can be seen here.
             SendState::Open => {
                 match self.flush_prefix(&mut g) {
                     Prefix::Done => {}
-                    Prefix::Blocked => return SBQ_WOULD_BLOCK,
+                    Prefix::Blocked => return SBQ_RETRY,
                     Prefix::Failed(r) => return r,
                 }
                 match g.send.as_mut().expect("checked").finish() {
@@ -388,6 +404,7 @@ pub fn insert(conn: &Arc<ConnObj>, s: NewStream, announce: Option<i32>) -> Resul
             send_state: SendState::Open,
             recv_state: RecvState::Open,
             prefix: s.prefix,
+            gone: false,
         }),
         read_waker: waker(SBQ_EV_READABLE),
         write_waker: waker(SBQ_EV_WRITABLE),

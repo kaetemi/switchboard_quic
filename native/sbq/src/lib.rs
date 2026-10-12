@@ -65,7 +65,7 @@ pub const SBQ_WOULD_BLOCK: i64 = 0;
 pub const SBQ_FIN: i64 = -1;
 /// The stream direction was finished, reset or stopped by this side already.
 pub const SBQ_ERR_CLOSED: i64 = -2;
-/// The connection has ended.
+/// The connection has ended (for a stream of a WebTransport session: or the session).
 pub const SBQ_ERR_CONNECTION: i64 = -3;
 /// Unknown (or released) handle.
 pub const SBQ_ERR_HANDLE: i64 = -4;
@@ -82,6 +82,9 @@ pub const SBQ_ERR_INIT: i64 = -9;
 /// The peer reset (read) or stopped (write) a WebTransport stream with a code outside the
 /// WebTransport application range: the direction ended without an application code.
 pub const SBQ_NO_CODE: i64 = -10;
+/// `sbq_stream_finish` on a WebTransport stream whose header could not be written yet (no
+/// credit): nothing was done; call again after the WRITABLE that follows.
+pub const SBQ_RETRY: i64 = -11;
 /// Results at or below `-SBQ_CODE_BASE` carry an application error code.
 pub const SBQ_CODE_BASE: i64 = 16;
 
@@ -1020,7 +1023,7 @@ pub extern "C" fn sbq_stream_poll_reset(stream: u64) -> i64 {
 
 /// Finishes the send direction (FIN after everything written). FINISHED_ACKED follows once the
 /// peer acknowledged every byte. Returns `SBQ_OK`, the code of a STOP_SENDING received, or an
-/// error; on a WebTransport stream whose header could not be written yet, `SBQ_WOULD_BLOCK`
+/// error; on a WebTransport stream whose header could not be written yet, `SBQ_RETRY`
 /// (WRITABLE follows; call again).
 #[no_mangle]
 pub extern "C" fn sbq_stream_finish(stream: u64) -> i64 {

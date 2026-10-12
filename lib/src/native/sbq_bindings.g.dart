@@ -452,7 +452,7 @@ external int sbq_stream_poll_reset(int stream);
 
 /// Finishes the send direction (FIN after everything written). FINISHED_ACKED follows once the
 /// peer acknowledged every byte. Returns `SBQ_OK`, the code of a STOP_SENDING received, or an
-/// error; on a WebTransport stream whose header could not be written yet, `SBQ_WOULD_BLOCK`
+/// error; on a WebTransport stream whose header could not be written yet, `SBQ_RETRY`
 /// (WRITABLE follows; call again).
 @ffi.Native<ffi.Int64 Function(ffi.Uint64)>(isLeaf: true)
 external int sbq_stream_finish(int stream);
@@ -562,6 +562,8 @@ const int SBQ_ERR_STATE = -8;
 const int SBQ_ERR_INIT = -9;
 
 const int SBQ_NO_CODE = -10;
+
+const int SBQ_RETRY = -11;
 
 const int SBQ_CODE_BASE = 16;
 

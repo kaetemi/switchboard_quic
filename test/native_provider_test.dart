@@ -9,7 +9,9 @@ Authors:
 */
 
 // The native provider end to end over loopback: both sides in this isolate,
-// the shim's runtime underneath.
+// the shim's runtime underneath. The cases of the contract run twice, over
+// raw QUIC and over WebTransport sessions (HTTP/3 in the shim); the cases
+// particular to either follow.
 
 @TestOn('vm')
 library;
@@ -24,10 +26,29 @@ import 'package:async/async.dart';
 import 'package:switchboard_quic/switchboard_quic_native.dart';
 import 'package:test/test.dart';
 
-const _exporterLabel = 'EXPORTER-Channel-Binding';
-
 late NativeQuicProvider provider;
 late NativeCertificate cert;
+
+/// The two kinds of session the provider runs.
+enum Mode {
+  raw('raw QUIC'),
+  webTransport('WebTransport');
+
+  const Mode(this.label);
+  final String label;
+
+  bool get wt => this == Mode.webTransport;
+
+  /// The label the binding asks for: RFC 9266's on raw QUIC, the
+  /// application's over WebTransport (where the provider derives the rest).
+  String get exporterLabel =>
+      wt ? 'switchboard-ident' : 'EXPORTER-Channel-Binding';
+
+  /// The largest stream and close code.
+  int get maxCode => wt ? 0xFFFFFFFF : (1 << 62) - 1;
+
+  String get scheme => wt ? 'https' : 'quic';
+}
 
 QuicServerConfig serverConfig({
   int maxStreams = 128,
@@ -49,6 +70,7 @@ QuicServerConfig serverConfig({
 );
 
 QuicClientConfig clientConfig({
+  List<String> alpn = const [quicAlpn],
   List<Uint8List> pins = const [],
   bool verify = false,
   int window = 1 << 20,
@@ -56,7 +78,7 @@ QuicClientConfig clientConfig({
   Duration keepAlive = const Duration(seconds: 10),
   Duration handshake = const Duration(seconds: 10),
 }) => QuicClientConfig(
-  alpn: const [quicAlpn],
+  alpn: alpn,
   serverCertificateHashes: pins,
   verifyCertificate: verify,
   streamReceiveWindow: window,
@@ -65,24 +87,40 @@ QuicClientConfig clientConfig({
   handshakeTimeout: handshake,
 );
 
-/// A listener and its accepted sessions, closed after the test.
+/// A listener and its accepted sessions, closed after the test: raw QUIC, or
+/// WebTransport on the path `/sb`.
 class Server {
-  Server._(this.listener) : sessions = StreamQueue(listener.sessions);
+  Server._(this.listener, this.mode)
+    : sessions = StreamQueue(listener.sessions);
 
-  static Future<Server> start([QuicServerConfig? config]) async {
-    final listener = await provider.listen(
-      '127.0.0.1',
-      0,
-      config ?? serverConfig(),
-    );
-    final server = Server._(listener);
+  static Future<Server> start(
+    Mode mode, [
+    QuicServerConfig? config,
+    Iterable<String>? allowedOrigins,
+    List<String> protocols = const ['switchboard'],
+  ]) async {
+    final QuicListener listener = mode.wt
+        ? await provider.listenWebTransport(
+            '127.0.0.1',
+            0,
+            config ?? serverConfig(),
+            path: '/sb',
+            allowedOrigins: allowedOrigins,
+            protocols: protocols,
+          )
+        : await provider.listen('127.0.0.1', 0, config ?? serverConfig());
+    final server = Server._(listener, mode);
     addTearDown(server.close);
     return server;
   }
 
-  final NativeQuicListener listener;
+  final QuicListener listener;
+  final Mode mode;
   final StreamQueue<QuicSession> sessions;
   final _accepted = <QuicSession>[];
+
+  Uri get endpoint => listener.endpoint;
+  int get port => endpoint.port;
 
   Future<QuicSession> accept() async {
     final s = await sessions.next;
@@ -113,7 +151,7 @@ class Pair {
   static Future<Pair> connect(Server server, [QuicClientConfig? config]) async {
     final accepted = server.accept();
     final client = await provider.connect(
-      server.listener.endpoint,
+      server.endpoint,
       config ?? clientConfig(),
     );
     final pair = Pair(client, await accepted);
@@ -146,6 +184,9 @@ Future<bool> completesWithin(Future<Object?> f, Duration d) => f
     .then((_) => true, onError: (_) => true)
     .timeout(d, onTimeout: () => false);
 
+Matcher throwsKind(QuicExceptionKind kind) =>
+    throwsA(isA<QuicException>().having((e) => e.kind, 'kind', kind));
+
 /// Connects from a new isolate, echoes a message through one stream, closes
 /// with 9; the isolate has to exit by itself afterwards.
 Future<String> clientInIsolate(Uri endpoint) => Isolate.run(() async {
@@ -170,7 +211,7 @@ void main() {
 
   tearDownAll(NativeQuicProvider.shutdown);
 
-  group('certificates and handshake', () {
+  group('certificates and configurations', () {
     test('self-signed certificate', () {
       expect(cert.certificateDer[0], 0x30);
       expect(cert.privateKeyDer, isNotEmpty);
@@ -183,95 +224,38 @@ void main() {
       expect(other.sha256, isNot(cert.sha256));
     });
 
-    test('unverified client: handshake, protocol, remote', () async {
-      final server = await Server.start();
-      final p = await Pair.connect(server);
-      expect(p.client.isInitiator, isTrue);
-      expect(p.server.isInitiator, isFalse);
-      expect(p.client.protocol, quicAlpn);
-      expect(p.server.protocol, quicAlpn);
-      expect(p.client.remote, '127.0.0.1:${server.listener.port}');
-      expect(p.server.remote, startsWith('127.0.0.1:'));
-      expect(p.client.peerCertificateHash, cert.sha256);
-      expect(p.server.peerCertificateHash, isNull);
-      expect(p.client.maxIncomingStreams, 128);
-      expect(server.listener.endpoint.scheme, 'quic');
-      final stats = (p.client as NativeQuicSession).stats!;
-      expect(stats.udpTxBytes, greaterThan(0));
-    });
-
-    test('pinned client: the right hash connects', () async {
-      final server = await Server.start();
-      final other = NativeQuicProvider.generateSelfSigned('localhost');
-      final p = await Pair.connect(
-        server,
-        clientConfig(pins: [other.sha256, cert.sha256]),
-      );
-      expect(p.client.peerCertificateHash, cert.sha256);
-    });
-
-    test('pinned client: a wrong hash is rejected', () async {
-      final server = await Server.start();
-      final other = NativeQuicProvider.generateSelfSigned('localhost');
-      await expectLater(
-        provider.connect(
-          server.listener.endpoint,
-          clientConfig(pins: [other.sha256]),
-        ),
-        throwsA(
-          isA<QuicException>().having(
-            (e) => e.kind,
-            'kind',
-            QuicExceptionKind.certificateRejected,
-          ),
-        ),
-      );
-    });
-
-    test('platform verification rejects a self-signed certificate', () async {
-      final server = await Server.start();
-      await expectLater(
-        provider.connect(server.listener.endpoint, clientConfig(verify: true)),
-        throwsA(
-          isA<QuicException>().having(
-            (e) => e.kind,
-            'kind',
-            QuicExceptionKind.certificateRejected,
-          ),
-        ),
-      );
-    });
-
     test('unsupported schemes and unreachable endpoints', () async {
       await expectLater(
-        provider.connect(
-          Uri.parse('https://127.0.0.1:4433/sb'),
+        provider.connect(Uri.parse('wss://127.0.0.1:4433/sb'), clientConfig()),
+        throwsKind(QuicExceptionKind.unsupportedScheme),
+      );
+      await expectLater(
+        provider.connectWebTransport(
+          Uri.parse('quic://127.0.0.1:4433'),
           clientConfig(),
         ),
-        throwsA(
-          isA<QuicException>().having(
-            (e) => e.kind,
-            'kind',
-            QuicExceptionKind.unsupportedScheme,
-          ),
-        ),
+        throwsKind(QuicExceptionKind.unsupportedScheme),
       );
       await expectLater(
         provider.connect(Uri.parse('quic://127.0.0.1'), clientConfig()),
         throwsA(isA<QuicException>()),
       );
+      for (final endpoint in ['quic://127.0.0.1:9', 'https://127.0.0.1:9/sb']) {
+        await expectLater(
+          provider.connect(
+            Uri.parse(endpoint),
+            clientConfig(idle: const Duration(milliseconds: 300)),
+          ),
+          throwsKind(QuicExceptionKind.unreachable),
+        );
+      }
+      // WebTransport fields are printable ASCII.
       await expectLater(
         provider.connect(
-          Uri.parse('quic://127.0.0.1:9'),
-          clientConfig(idle: const Duration(milliseconds: 300)),
+          Uri.parse('https://127.0.0.1:9/sb'),
+          clientConfig(alpn: const ['é']),
         ),
-        throwsA(
-          isA<QuicException>().having(
-            (e) => e.kind,
-            'kind',
-            QuicExceptionKind.unreachable,
-          ),
-        ),
+        throwsArgumentError,
       );
     });
 
@@ -291,45 +275,45 @@ void main() {
           }
         }
       });
-      final watch = Stopwatch()..start();
-      await expectLater(
-        provider.connect(
-          Uri.parse('quic://127.0.0.1:${silent.port}'),
-          clientConfig(
-            idle: Duration.zero,
-            keepAlive: Duration.zero,
-            handshake: const Duration(milliseconds: 300),
+      for (final scheme in ['quic', 'https']) {
+        final watch = Stopwatch()..start();
+        await expectLater(
+          provider.connect(
+            Uri.parse('$scheme://127.0.0.1:${silent.port}/sb'),
+            clientConfig(
+              idle: Duration.zero,
+              keepAlive: Duration.zero,
+              handshake: const Duration(milliseconds: 300),
+            ),
           ),
-        ),
-        throwsA(
-          isA<QuicException>().having(
-            (e) => e.kind,
-            'kind',
-            QuicExceptionKind.unreachable,
-          ),
-        ),
-      );
-      expect(
-        watch.elapsed,
-        greaterThanOrEqualTo(const Duration(milliseconds: 290)),
-      );
-      expect(watch.elapsed, lessThan(const Duration(seconds: 2)));
+          throwsKind(QuicExceptionKind.unreachable),
+        );
+        expect(
+          watch.elapsed,
+          greaterThanOrEqualTo(const Duration(milliseconds: 290)),
+        );
+        expect(watch.elapsed, lessThan(const Duration(seconds: 2)));
+      }
       expect(received, greaterThan(0));
     });
 
     test('a negative duration in a configuration is an ArgumentError, and a '
         'deadline under a millisecond is still a deadline', () async {
       const negative = Duration(microseconds: -1);
-      final nowhere = Uri.parse('quic://127.0.0.1:9');
-      for (final config in [
-        clientConfig(idle: negative),
-        clientConfig(keepAlive: negative),
-        clientConfig(handshake: negative),
+      for (final nowhere in [
+        Uri.parse('quic://127.0.0.1:9'),
+        Uri.parse('https://127.0.0.1:9/sb'),
       ]) {
-        await expectLater(
-          provider.connect(nowhere, config),
-          throwsArgumentError,
-        );
+        for (final config in [
+          clientConfig(idle: negative),
+          clientConfig(keepAlive: negative),
+          clientConfig(handshake: negative),
+        ]) {
+          await expectLater(
+            provider.connect(nowhere, config),
+            throwsArgumentError,
+          );
+        }
       }
       for (final config in [
         serverConfig(idle: negative),
@@ -340,7 +324,15 @@ void main() {
           provider.listen('127.0.0.1', 0, config),
           throwsArgumentError,
         );
+        await expectLater(
+          provider.listenWebTransport('127.0.0.1', 0, config, path: '/sb'),
+          throwsArgumentError,
+        );
       }
+      await expectLater(
+        provider.listenWebTransport('127.0.0.1', 0, serverConfig(), path: 'sb'),
+        throwsArgumentError,
+      );
       // Rounded up to a millisecond, not down to none: without an idle
       // timeout nothing else would end this connect.
       final silent = await RawDatagramSocket.bind(
@@ -359,72 +351,288 @@ void main() {
               ),
             )
             .timeout(const Duration(seconds: 2)),
-        throwsA(
-          isA<QuicException>().having(
-            (e) => e.kind,
-            'kind',
-            QuicExceptionKind.unreachable,
-          ),
+        throwsKind(QuicExceptionKind.unreachable),
+      );
+    });
+  });
+
+  for (final mode in Mode.values) {
+    group(mode.label, () => contract(mode));
+  }
+
+  group('raw QUIC only', () {
+    test('no unidirectional streams and no draining signal', () async {
+      final server = await Server.start(Mode.raw);
+      final p = await Pair.connect(server);
+      final serverUni = p.server.incomingUnidirectionalStreams.toList();
+      final clientUni = p.client.incomingUnidirectionalStreams.toList();
+      var draining = false;
+      unawaited(p.server.draining.then((_) => draining = true));
+      unawaited(p.client.draining.then((_) => draining = true));
+      // drain() does nothing on raw QUIC.
+      (p.client as NativeQuicSession).drain();
+      // The binding's traffic goes on as usual meanwhile.
+      final cs = await p.client.openStream();
+      await cs.write(bytes('x'));
+      await cs.finish();
+      expect(await readAll(await p.serverStreams.next), bytes('x'));
+      await p.client.close(0, '');
+      await p.server.done;
+      // Both are done with the session, having delivered nothing.
+      expect(await clientUni.timeout(const Duration(seconds: 5)), isEmpty);
+      expect(await serverUni.timeout(const Duration(seconds: 5)), isEmpty);
+      await Future<void>.delayed(Duration.zero);
+      expect(draining, isFalse);
+    });
+  });
+
+  group('WebTransport only', () {
+    test('the request: path, origin, protocols, draft', () async {
+      final server = await Server.start(Mode.webTransport);
+      expect(server.endpoint.toString(), 'https://127.0.0.1:${server.port}/sb');
+      final accepted = server.accept();
+      final client = await provider.connectWebTransport(
+        Uri.parse('https://127.0.0.1:${server.port}/sb?room=1#ignored'),
+        clientConfig(alpn: const ['other', 'switchboard']),
+        origin: 'https://app.example',
+      );
+      addTearDown(() => client.close(0, ''));
+      final session = await accepted as NativeQuicSession;
+      expect(session.isWebTransport, isTrue);
+      expect(session.requestPath, '/sb?room=1');
+      expect(session.requestOrigin, 'https://app.example');
+      expect(session.requestAuthority, '127.0.0.1:${server.port}');
+      expect(session.requestProtocols, ['other', 'switchboard']);
+      // This provider's client sends the draft-02 header too.
+      expect(session.requestDraft, 2);
+      // The first offered protocol the listener serves, in the client's order.
+      expect(client.protocol, 'switchboard');
+      expect(session.protocol, 'switchboard');
+      expect((client as NativeQuicSession).requestPath, isNull);
+    });
+
+    test('refusals: another path 404, an origin not allowed 403, a protocol '
+        'not served 400', () async {
+      final server = await Server.start(Mode.webTransport, null, [
+        'https://app.example',
+      ]);
+      final listener = server.listener as NativeWebTransportListener;
+      Future<void> refused(
+        String path,
+        int status, {
+        String? origin,
+        List<String> alpn = const [quicAlpn],
+      }) => expectLater(
+        provider.connectWebTransport(
+          Uri.parse('https://127.0.0.1:${server.port}$path'),
+          clientConfig(alpn: alpn),
+          origin: origin,
         ),
+        throwsA(
+          isA<QuicException>()
+              .having((e) => e.kind, 'kind', QuicExceptionKind.refused)
+              .having((e) => e.message, 'message', contains('$status')),
+        ),
+      );
+      await refused('/elsewhere', 404);
+      await refused('/sb/', 404);
+      await refused('/sb', 403, origin: 'https://evil.example');
+      await refused('/sb', 400, alpn: const ['other']);
+      expect(listener.answered, {404: 2, 403: 1, 400: 1});
+      // An allowed origin, and no origin at all (not a browser), pass.
+      for (final origin in ['https://app.example', null]) {
+        final accepted = server.accept();
+        final client = await provider.connectWebTransport(
+          server.endpoint,
+          clientConfig(),
+          origin: origin,
+        );
+        await accepted;
+        await client.close(0, '');
+      }
+      expect(listener.answered[200], 2);
+    });
+
+    test('no protocol offered: accepted without one', () async {
+      final server = await Server.start(Mode.webTransport);
+      final p = await Pair.connect(server, clientConfig(alpn: const []));
+      expect(p.client.protocol, isNull);
+      expect(p.server.protocol, isNull);
+      expect((p.server as NativeQuicSession).requestProtocols, isEmpty);
+    });
+
+    test('draining both ways, and the session goes on', () async {
+      final server = await Server.start(Mode.webTransport);
+      final p = await Pair.connect(server);
+      var serverDraining = false;
+      unawaited(p.server.draining.then((_) => serverDraining = true));
+      (p.client as NativeQuicSession).drain();
+      await p.server.draining.timeout(const Duration(seconds: 5));
+      expect(serverDraining, isTrue);
+      (p.server as NativeQuicSession).drain();
+      await p.client.draining.timeout(const Duration(seconds: 5));
+      final cs = await p.client.openStream();
+      await cs.write(bytes('still'));
+      await cs.finish();
+      expect(await readAll(await p.serverStreams.next), bytes('still'));
+    });
+
+    test('codes beyond a u32 are argument errors; the largest goes through, '
+        'and close codes are WebTransport codes', () async {
+      final server = await Server.start(Mode.webTransport);
+      final p = await Pair.connect(server);
+      final cs = await p.client.openStream();
+      await cs.write(bytes('x'));
+      final ss = await p.serverStreams.next;
+      expect(() => cs.reset(0x100000000), throwsArgumentError);
+      expect(() => ss.stop(0x100000000), throwsArgumentError);
+      expect(() => p.client.close(0x100000000, ''), throwsArgumentError);
+      cs.reset(0xFFFFFFFF);
+      await expectLater(
+        readAll(ss),
+        throwsA(
+          isA<QuicStreamReset>().having((e) => e.code, 'code', 0xFFFFFFFF),
+        ),
+      );
+      await p.server.close(0xFFFFFFFF, 'the largest');
+      final end = await p.client.done;
+      expect(
+        (end.code, end.reason, end.byPeer),
+        (0xFFFFFFFF, 'the largest', true),
+      );
+    });
+
+    test('the closed listener accepts no new session', () async {
+      final server = await Server.start(Mode.webTransport);
+      final p = await Pair.connect(server);
+      await server.listener.close();
+      await expectLater(
+        provider.connect(
+          server.endpoint,
+          clientConfig(handshake: const Duration(seconds: 2)),
+        ),
+        throwsA(isA<QuicException>()),
+      );
+      // The open session is left to its owners.
+      final cs = await p.client.openStream();
+      await cs.write(bytes('open'));
+      await cs.finish();
+      expect(await readAll(await p.serverStreams.next), bytes('open'));
+    });
+  });
+}
+
+/// The cases of the provider contract, over [mode].
+void contract(Mode mode) {
+  final label = mode.exporterLabel;
+
+  group('handshake', () {
+    test('unverified client: handshake, protocol, remote', () async {
+      final server = await Server.start(mode);
+      final p = await Pair.connect(server);
+      expect(p.client.isInitiator, isTrue);
+      expect(p.server.isInitiator, isFalse);
+      expect(p.client.protocol, quicAlpn);
+      expect(p.server.protocol, quicAlpn);
+      expect(p.client.remote, '127.0.0.1:${server.port}');
+      expect(p.server.remote, startsWith('127.0.0.1:'));
+      expect(p.client.peerCertificateHash, cert.sha256);
+      expect(p.server.peerCertificateHash, isNull);
+      expect(p.client.maxIncomingStreams, 128);
+      expect(server.endpoint.scheme, mode.scheme);
+      expect((p.client as NativeQuicSession).isWebTransport, mode.wt);
+      final stats = (p.client as NativeQuicSession).stats!;
+      expect(stats.udpTxBytes, greaterThan(0));
+    });
+
+    test('pinned client: the right hash connects', () async {
+      final server = await Server.start(mode);
+      final other = NativeQuicProvider.generateSelfSigned('localhost');
+      final p = await Pair.connect(
+        server,
+        clientConfig(pins: [other.sha256, cert.sha256]),
+      );
+      expect(p.client.peerCertificateHash, cert.sha256);
+    });
+
+    test('pinned client: a wrong hash is rejected', () async {
+      final server = await Server.start(mode);
+      final other = NativeQuicProvider.generateSelfSigned('localhost');
+      await expectLater(
+        provider.connect(server.endpoint, clientConfig(pins: [other.sha256])),
+        throwsKind(QuicExceptionKind.certificateRejected),
+      );
+    });
+
+    test('platform verification rejects a self-signed certificate', () async {
+      final server = await Server.start(mode);
+      await expectLater(
+        provider.connect(server.endpoint, clientConfig(verify: true)),
+        throwsKind(QuicExceptionKind.certificateRejected),
       );
     });
 
     test('IPv6 loopback', () async {
-      final NativeQuicListener listener;
+      final QuicListener listener;
       try {
-        listener = await provider.listen('::1', 0, serverConfig());
+        listener = mode.wt
+            ? await provider.listenWebTransport(
+                '::1',
+                0,
+                serverConfig(),
+                path: '/sb',
+              )
+            : await provider.listen('::1', 0, serverConfig());
       } on QuicException catch (e) {
         markTestSkipped('no IPv6 loopback: $e');
         return;
       }
       addTearDown(listener.close);
-      expect(listener.endpoint.toString(), startsWith('quic://[::1]:'));
+      expect(
+        listener.endpoint.toString(),
+        startsWith('${mode.scheme}://[::1]:'),
+      );
       final accepted = listener.sessions.first;
       final client = await provider.connect(listener.endpoint, clientConfig());
       addTearDown(() => client.close(0, ''));
       final server = await accepted;
       addTearDown(() => server.close(0, ''));
-      expect(client.remote, '[::1]:${listener.port}');
+      expect(client.remote, '[::1]:${listener.endpoint.port}');
       expect(server.remote, startsWith('[::1]:'));
     });
 
-    test(
-      'exporter: equal on both ends, different across connections',
-      () async {
-        final server = await Server.start();
-        final p1 = await Pair.connect(server);
-        final p2 = await Pair.connect(server);
-        Future<Uint8List> ex(
-          QuicSession s, [
-          String label = _exporterLabel,
-        ]) async => (await s.exportKeyingMaterial(label, Uint8List(0), 32))!;
-        final c1 = await ex(p1.client), s1 = await ex(p1.server);
-        final c2 = await ex(p2.client), s2 = await ex(p2.server);
-        expect(c1, hasLength(32));
-        expect(c1, s1);
-        expect(c2, s2);
-        expect(c1, isNot(c2));
-        expect(await ex(p1.client, 'other label'), isNot(c1));
-        final ctx = await p1.client.exportKeyingMaterial(
-          _exporterLabel,
-          Uint8List.fromList([1, 2, 3]),
-          32,
-        );
-        expect(ctx, isNot(c1));
-        // More than the exporter can produce (255 hash lengths).
-        await expectLater(
-          p1.client.exportKeyingMaterial(_exporterLabel, Uint8List(0), 1 << 16),
-          throwsArgumentError,
-        );
-      },
-    );
+    test('exporter: equal on both ends, different across sessions', () async {
+      final server = await Server.start(mode);
+      final p1 = await Pair.connect(server);
+      final p2 = await Pair.connect(server);
+      Future<Uint8List> ex(QuicSession s, [String l = '']) async => (await s
+          .exportKeyingMaterial(l.isEmpty ? label : l, Uint8List(0), 32))!;
+      final c1 = await ex(p1.client), s1 = await ex(p1.server);
+      final c2 = await ex(p2.client), s2 = await ex(p2.server);
+      expect(c1, hasLength(32));
+      expect(c1, s1);
+      expect(c2, s2);
+      expect(c1, isNot(c2));
+      expect(await ex(p1.client, 'other label'), isNot(c1));
+      final ctx = await p1.client.exportKeyingMaterial(
+        label,
+        Uint8List.fromList([1, 2, 3]),
+        32,
+      );
+      expect(ctx, isNot(c1));
+      // More than the exporter can produce (255 hash lengths).
+      await expectLater(
+        p1.client.exportKeyingMaterial(label, Uint8List(0), 1 << 16),
+        throwsArgumentError,
+      );
+    });
   });
 
   group('streams', () {
     late Server server;
     late Pair p;
     setUp(() async {
-      server = await Server.start();
+      server = await Server.start(mode);
       p = await Pair.connect(server);
     });
 
@@ -473,6 +681,13 @@ void main() {
         expect(await readAll(ss), bytes('fin'));
       },
     );
+
+    test('a stream with nothing but FIN', () async {
+      final cs = await p.client.openStream();
+      await cs.finish();
+      final ss = await p.serverStreams.next;
+      expect(await readAll(ss), isEmpty);
+    });
 
     test('writes take views and unmodifiable lists', () async {
       final cs = await p.client.openStream();
@@ -627,8 +842,8 @@ void main() {
       },
     );
 
-    test('codes beyond QUIC\'s range are argument errors', () async {
-      const max = (1 << 62) - 1;
+    test('codes beyond the range are argument errors', () async {
+      final max = mode.maxCode;
       final cs = await p.client.openStream();
       await cs.write(bytes('x'));
       final ss = await p.serverStreams.next;
@@ -687,10 +902,26 @@ void main() {
         'kind',
         QuicExceptionKind.sessionEnded,
       );
-      await expectLater(read, throwsA(sessionEnded));
-      await expectLater(stopped, throwsA(sessionEnded));
-      await expectLater(ss.resetReceived, throwsA(sessionEnded));
+      // Over WebTransport the closing side resets and stops the session's
+      // streams with WT_SESSION_GONE, which may reach the peer before the
+      // close itself: a reset or STOP_SENDING without an application code.
+      final ended = mode.wt
+          ? anyOf(
+              sessionEnded,
+              isA<QuicStreamReset>().having((e) => e.code, 'code', isNull),
+              isA<QuicStreamStopped>().having((e) => e.code, 'code', isNull),
+            )
+          : sessionEnded;
+      await expectLater(read, throwsA(ended));
+      await expectLater(stopped, throwsA(ended));
+      // A reset without a code completes resetReceived with null.
+      final reset = await ss.resetReceived.then<Object?>(
+        (code) => code,
+        onError: (Object e) => e,
+      );
+      expect(reset, mode.wt ? anyOf(isNull, sessionEnded) : sessionEnded);
       await expectLater(cs.resetReceived, throwsA(sessionEnded));
+      await p.server.done;
       await expectLater(p.server.openStream(), throwsA(sessionEnded));
       await expectLater(ss.write(bytes('x')), throwsA(sessionEnded));
       await expectLater(p.client.openStream(), throwsA(sessionEnded));
@@ -753,6 +984,7 @@ void main() {
       bool Function(double) ok,
     ) async {
       final server = await Server.start(
+        mode,
         serverConfig(window: 8 << 20, connectionWindow: 32 << 20),
       );
       var v = 0.0;
@@ -760,7 +992,7 @@ void main() {
         v = await lead(server, first, second);
         // ignore: avoid_print
         print(
-          'priority class $second ahead of class $first by '
+          '${mode.label}: priority class $second ahead of class $first by '
           '${(v * 100).toStringAsFixed(1)}% of the transfer',
         );
         if (ok(v)) break;
@@ -782,7 +1014,7 @@ void main() {
   });
 
   test('stream limit: openStream waits until a stream closes', () async {
-    final server = await Server.start(serverConfig(maxStreams: 2));
+    final server = await Server.start(mode, serverConfig(maxStreams: 2));
     final p = await Pair.connect(server);
     final s1 = await p.client.openStream();
     final s2 = await p.client.openStream();
@@ -793,10 +1025,16 @@ void main() {
       await completesWithin(third, const Duration(milliseconds: 300)),
       isFalse,
     );
-    // End the first stream in both directions: the peer grants a new one.
+    // End the first stream in both directions: the peer grants a new one. (The
+    // streams of a WebTransport session may arrive out of their order: each
+    // one's header is read on its own.)
     await s1.finish();
-    final r1 = await p.serverStreams.next;
-    expect(await readAll(r1), bytes('1'));
+    final a = await p.serverStreams.next;
+    final b = await p.serverStreams.next;
+    final firstOfA = await a.read(1);
+    final r1 = firstOfA![0] == 0x31 ? a : b;
+    if (identical(r1, b)) expect(await b.read(1), bytes('1'));
+    expect(await readAll(r1), isEmpty);
     await r1.finish();
     final s3 = await third.timeout(const Duration(seconds: 5));
     await s3.write(bytes('3'));
@@ -811,31 +1049,9 @@ void main() {
     await fourth.timeout(const Duration(seconds: 5));
   });
 
-  test('raw QUIC: no unidirectional streams and no draining signal', () async {
-    final server = await Server.start();
-    final p = await Pair.connect(server);
-    final serverUni = p.server.incomingUnidirectionalStreams.toList();
-    final clientUni = p.client.incomingUnidirectionalStreams.toList();
-    var draining = false;
-    unawaited(p.server.draining.then((_) => draining = true));
-    unawaited(p.client.draining.then((_) => draining = true));
-    // The binding's traffic goes on as usual meanwhile.
-    final cs = await p.client.openStream();
-    await cs.write(bytes('x'));
-    await cs.finish();
-    expect(await readAll(await p.serverStreams.next), bytes('x'));
-    await p.client.close(0, '');
-    await p.server.done;
-    // Both are done with the session, having delivered nothing.
-    expect(await clientUni.timeout(const Duration(seconds: 5)), isEmpty);
-    expect(await serverUni.timeout(const Duration(seconds: 5)), isEmpty);
-    await Future<void>.delayed(Duration.zero);
-    expect(draining, isFalse);
-  });
-
   group('session end', () {
     test('close with code and reason is seen by the peer', () async {
-      final server = await Server.start();
+      final server = await Server.start(mode);
       final p = await Pair.connect(server);
       final reason = 'bad record ${'é' * 600}';
       await p.client.close(42, reason);
@@ -855,7 +1071,7 @@ void main() {
     });
 
     test('the server closes', () async {
-      final server = await Server.start();
+      final server = await Server.start(mode);
       final p = await Pair.connect(server);
       await p.server.close(33, 'going away');
       final end = await p.client.done;
@@ -865,6 +1081,7 @@ void main() {
     test('lost on idle timeout', () async {
       const idle = Duration(milliseconds: 300);
       final server = await Server.start(
+        mode,
         serverConfig(idle: idle, keepAlive: Duration.zero),
       );
       final p = await Pair.connect(
@@ -882,19 +1099,13 @@ void main() {
     });
 
     test('the exporter fails once the session has ended', () async {
-      final server = await Server.start();
+      final server = await Server.start(mode);
       final p = await Pair.connect(server);
       await p.client.close(0, '');
       await p.client.done;
       await expectLater(
-        p.client.exportKeyingMaterial(_exporterLabel, Uint8List(0), 32),
-        throwsA(
-          isA<QuicException>().having(
-            (e) => e.kind,
-            'kind',
-            QuicExceptionKind.sessionEnded,
-          ),
-        ),
+        p.client.exportKeyingMaterial(label, Uint8List(0), 32),
+        throwsKind(QuicExceptionKind.sessionEnded),
       );
     });
 
@@ -902,6 +1113,7 @@ void main() {
       const idle = Duration(milliseconds: 400);
       const keepAlive = Duration(milliseconds: 100);
       final server = await Server.start(
+        mode,
         serverConfig(idle: idle, keepAlive: keepAlive),
       );
       final p = await Pair.connect(
@@ -917,7 +1129,7 @@ void main() {
   });
 
   test('256 streams concurrently', () async {
-    final server = await Server.start(serverConfig(maxStreams: 300));
+    final server = await Server.start(mode, serverConfig(maxStreams: 300));
     final p = await Pair.connect(server);
     final echo = () async {
       final tasks = <Future<void>>[];
@@ -947,7 +1159,7 @@ void main() {
   }, timeout: const Timeout(Duration(seconds: 60)));
 
   test('64 MiB through one stream', () async {
-    final server = await Server.start();
+    final server = await Server.start(mode);
     final p = await Pair.connect(server);
     const total = 64 << 20;
     final chunk = pattern(256 << 10);
@@ -972,21 +1184,19 @@ void main() {
     final mbs = total / sw.elapsedMicroseconds;
     // ignore: avoid_print
     print(
-      'native provider throughput: 64 MiB in ${sw.elapsedMilliseconds} ms = '
-      '${mbs.toStringAsFixed(0)} MB/s (one stream, 1 MiB window, JIT)',
+      'native provider throughput (${mode.label}): 64 MiB in '
+      '${sw.elapsedMilliseconds} ms = ${mbs.toStringAsFixed(0)} MB/s (one '
+      'stream, 1 MiB window, JIT)',
     );
   }, timeout: const Timeout(Duration(seconds: 60)));
 
   test('events while Dart is inside shim calls do not deadlock: 200 '
       'iterations of connect, open, write, read, close', () async {
-    final server = await Server.start();
+    final server = await Server.start(mode);
     final data = pattern(64 << 10);
     for (var i = 0; i < 200; i++) {
       final accepted = server.accept();
-      final client = await provider.connect(
-        server.listener.endpoint,
-        clientConfig(),
-      );
+      final client = await provider.connect(server.endpoint, clientConfig());
       final peer = await accepted;
       final echo = peer.incomingStreams.first.then((s) async {
         final got = await readAll(s);
@@ -1007,8 +1217,8 @@ void main() {
   test(
     'another isolate has a context of its own, and exits when done',
     () async {
-      final server = await Server.start();
-      final endpoint = server.listener.endpoint;
+      final server = await Server.start(mode);
+      final endpoint = server.endpoint;
       final echoed = () async {
         final session = await server.accept();
         final s = await session.incomingStreams.first;
@@ -1026,7 +1236,7 @@ void main() {
   );
 
   test('shutdown ends every session of the isolate', () async {
-    final server = await Server.start();
+    final server = await Server.start(mode);
     final p = await Pair.connect(server);
     final cs = await p.client.openStream();
     final read = expectLater(cs.read(10), throwsA(isA<QuicException>()));
@@ -1036,7 +1246,7 @@ void main() {
     expect(end.reason, 'shutdown');
     await read;
     // The provider starts again on next use.
-    final again = await Server.start();
+    final again = await Server.start(mode);
     final q = await Pair.connect(again);
     expect(q.client.protocol, quicAlpn);
   });

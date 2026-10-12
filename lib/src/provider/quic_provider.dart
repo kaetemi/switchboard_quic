@@ -14,8 +14,9 @@ Authors:
 /// The binding (records, channels, the control stream, `HELLO`, identity;
 /// wiki page "Polyverse Switchboard QUIC and WebTransport Binding") is written
 /// once against these interfaces. Two providers implement them: the native
-/// one over quinn through FFI (`quic://` raw QUIC, and WebTransport once the
-/// HTTP/3 layer exists) and the web one over the browser's WebTransport API.
+/// one over quinn through FFI (`quic://` raw QUIC and `https://`
+/// WebTransport over its own HTTP/3 layer) and the web one over the
+/// browser's WebTransport API.
 /// Nothing here knows about Switchboard; it is the smallest QUIC surface the
 /// binding needs, in the vocabulary of RFC 9000 and the W3C WebTransport API.
 ///
@@ -33,13 +34,16 @@ import 'dart:async';
 import 'dart:typed_data';
 
 /// Opens sessions to endpoints. The native provider dials `quic://host:port`
-/// (and later `https://host:port/path` for WebTransport); the web provider
-/// dials `https://` only.
+/// and `https://host:port/path` (WebTransport); the web provider dials
+/// `https://` only.
 abstract interface class QuicConnector {
   /// Connects to [endpoint] with [config]. Fails with a [QuicException]
-  /// (`unreachable`, `handshakeFailed`, `unsupportedScheme`, ...); a
-  /// handshake that runs past [QuicClientConfig.handshakeTimeout] fails
-  /// with `unreachable`.
+  /// (`unreachable`, `handshakeFailed`, `unsupportedScheme`, `refused`,
+  /// ...); a handshake that runs past [QuicClientConfig.handshakeTimeout]
+  /// fails with `unreachable`. A WebTransport session is established by the
+  /// server's 2xx response: another response fails with `refused` where the
+  /// stack tells (the native provider puts the HTTP status in the message;
+  /// a browser reports a refusal like any other failure).
   ///
   /// The attempt cannot be cancelled. A caller that stops waiting (a
   /// timeout of its own) closes the session the future still yields, and
@@ -67,7 +71,8 @@ abstract interface class QuicSession {
   bool get isInitiator;
 
   /// The negotiated ALPN (`switchboard` for raw QUIC) or the WebTransport
-  /// protocol value; null when unknown.
+  /// protocol the server selected (`WT-Protocol`); null when unknown, or
+  /// when the server selected none.
   String? get protocol;
 
   /// The peer's address for logs.
@@ -145,7 +150,8 @@ abstract interface class QuicStream {
   Future<Uint8List?> read(int max);
 
   /// Completes on the peer's RESET_STREAM, even while no [read] is
-  /// pending, with its application code (null when none was delivered).
+  /// pending, with its application code (null when none was delivered: a
+  /// WebTransport reset with an HTTP/3 code outside the WebTransport range).
   /// A paused reader must still be able to observe an abort. FIN does not
   /// complete this future: unread bytes may contain an application close.
   /// Fails with `sessionEnded` when the session ends first.
@@ -167,7 +173,10 @@ abstract interface class QuicStream {
 
   /// Aborts this side's direction with [code] (`RESET_STREAM`), also after
   /// [finish]; data not yet delivered is discarded, and writes still queued
-  /// fail with a [StateError]. A no-op once the direction has ended.
+  /// fail with a [StateError]. A no-op once the direction has ended. A code
+  /// is a QUIC application code on raw QUIC (0 to 2^62 - 1) and a
+  /// WebTransport application code (0 to 2^32 - 1) over WebTransport; one
+  /// outside the range is an [ArgumentError].
   void reset(int code);
 
   /// Asks the peer to stop sending with [code] (`STOP_SENDING`). This
@@ -212,7 +221,8 @@ class QuicClientConfig {
   });
 
   /// ALPN tokens to offer, in order (`switchboard` for raw QUIC); for
-  /// WebTransport, the protocol values to offer instead.
+  /// WebTransport, the protocol values to offer in `WT-Available-Protocols`
+  /// instead (printable ASCII; the provider offers the ALPN `h3` itself).
   final List<String> alpn;
 
   /// SHA-256 hashes of acceptable server certificates (DER). Empty with
@@ -262,6 +272,8 @@ class QuicServerConfig {
     this.handshakeTimeout = const Duration(seconds: 10),
   });
 
+  /// The ALPN tokens served. A WebTransport listener serves `h3` whatever
+  /// this says (the native provider's `listenWebTransport`).
   final List<String> alpn;
 
   /// The certificate, DER; the native provider also takes the DER
@@ -317,6 +329,10 @@ enum QuicExceptionKind {
   unreachable,
   handshakeFailed,
   certificateRejected,
+
+  /// The server answered a WebTransport request with a status other than
+  /// 2xx.
+  refused,
   sessionEnded,
   streamLimit,
   internal,

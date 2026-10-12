@@ -375,7 +375,8 @@ fn close_with_code_and_reason_both_ways() {
     let got = reason_of(s);
     assert!(got.len() <= 1024 && reason.starts_with(&got) && got.starts_with("bad record é"));
     assert_eq!(sbq_stream_open(c), SBQ_ERR_CONNECTION);
-    // Its streams were reset with WT_SESSION_GONE, which carries no application code.
+    // Its streams were reset with WT_SESSION_GONE, which carries no application code, if that
+    // arrived first; then they ended with the session.
     let mut b = [0u8; 8];
     let r = loop {
         let r = unsafe { sbq_stream_read(ss, b.as_mut_ptr(), 8) };
@@ -384,7 +385,7 @@ fn close_with_code_and_reason_both_ways() {
         }
         h.sleep();
     };
-    assert!(r == SBQ_ERR_CLOSED || r == SBQ_NO_CODE, "{r}");
+    assert!(r == SBQ_ERR_CONNECTION || r == SBQ_NO_CODE, "{r}");
     let quic = quic_of(c);
     until("the QUIC connection closed", || {
         quic.close_reason().is_some()
@@ -1144,4 +1145,44 @@ fn shutdown_ends_sessions_and_their_connections() {
     until("the QUIC connection closed", || {
         quic.close_reason().is_some()
     });
+}
+
+#[test]
+fn the_stream_limit_of_a_session() {
+    // 2 streams for the client's channels (and one for its CONNECT stream): a third waits until
+    // one of them ended both ways.
+    let mut h = Harness::new();
+    let (l, port) = h.wt_server_with(5_000, 2);
+    let (c, s) = h.wt_pair(l, port);
+    let s1 = sbq_stream_open(c) as u64;
+    let s2 = sbq_stream_open(c) as u64;
+    assert!(s1 > 0 && s2 > 0);
+    h.write_all(s1, b"1");
+    h.write_all(s2, b"2");
+    assert_eq!(sbq_stream_open(c), SBQ_WOULD_BLOCK);
+    assert_eq!(sbq_stream_finish(s1), 0);
+    // The session's streams may be announced out of their order: each one's header is read on
+    // its own.
+    let (a, b) = (h.stream_of(s), h.stream_of(s));
+    let mut first = [0u8; 1];
+    let mut byte = |x: u64| loop {
+        let n = unsafe { sbq_stream_read(x, first.as_mut_ptr(), 1) };
+        if n == 1 {
+            return first[0];
+        }
+        assert_eq!(n, SBQ_WOULD_BLOCK);
+        h.wait("readable", |e| e.kind == SBQ_EV_READABLE && e.handle == x);
+    };
+    let r1 = if byte(a) == b'1' { a } else { b };
+    if r1 == b {
+        byte(b);
+    }
+    assert_eq!(h.read_all(r1), Ok(Vec::new()));
+    assert_eq!(sbq_stream_finish(r1), 0);
+    assert_eq!(h.read_all(s1), Ok(Vec::new()));
+    let e = h.wait("opened", |e| e.kind == SBQ_EV_OPENED && e.a == c as i64);
+    h.write_all(e.handle, b"3");
+    assert_eq!(sbq_stream_finish(e.handle), 0);
+    let r3 = h.stream_of(s);
+    assert_eq!(h.read_all(r3), Ok(b"3".to_vec()));
 }

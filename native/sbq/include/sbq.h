@@ -55,6 +55,10 @@ Authors:
 // WebTransport application range: the direction ended without an application code.
 #define SBQ_NO_CODE -10
 
+// `sbq_stream_finish` on a WebTransport stream whose header could not be written yet (no
+// credit): nothing was done; call again after the WRITABLE that follows.
+#define SBQ_RETRY -11
+
 // Results at or below `-SBQ_CODE_BASE` carry an application error code.
 #define SBQ_CODE_BASE 16
 
@@ -466,7 +470,7 @@ int64_t sbq_stream_poll_reset(uint64_t stream);
 
 // Finishes the send direction (FIN after everything written). FINISHED_ACKED follows once the
 // peer acknowledged every byte. Returns `SBQ_OK`, the code of a STOP_SENDING received, or an
-// error; on a WebTransport stream whose header could not be written yet, `SBQ_WOULD_BLOCK`
+// error; on a WebTransport stream whose header could not be written yet, `SBQ_RETRY`
 // (WRITABLE follows; call again).
 int64_t sbq_stream_finish(uint64_t stream);
 
