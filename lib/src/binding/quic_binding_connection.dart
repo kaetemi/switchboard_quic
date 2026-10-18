@@ -1152,8 +1152,17 @@ class QuicBindingConnection extends BindingConnection {
           .completer
           .future;
 
-  _PendingPing _startPing(MuxControlMessage message) {
-    final pending = _PendingPing(Uint8List.fromList(message.payload));
+  /// Sends [message], a `PING`, and registers it with the pending ones:
+  /// with [MuxConnection.maxPendingPings] of them [counted] already, the
+  /// oldest pending ones fail until it fits. The `GOAWAY` barrier's `PING`
+  /// is not [counted]: it must not evict an application's `PING`, nor make
+  /// one go sooner (binding page, "GOAWAY and connection close"), and it
+  /// fails like any other once it is the oldest when one is evicted.
+  _PendingPing _startPing(MuxControlMessage message, {bool counted = true}) {
+    final pending = _PendingPing(
+      Uint8List.fromList(message.payload),
+      counted: counted,
+    );
     if (_closing) {
       pending.completer.completeError(
         SwitchboardException.of(
@@ -1163,16 +1172,20 @@ class QuicBindingConnection extends BindingConnection {
       );
       return pending;
     }
-    if (_pings.length >= MuxConnection.maxPendingPings) {
-      _pings
-          .removeAt(0)
-          .completer
-          .completeError(
-            SwitchboardException.of(
-              StatusCode.deadlineExceeded,
-              'no PONG before ${MuxConnection.maxPendingPings} later PINGs',
-            ),
-          );
+    if (counted) {
+      var pendingCounted = _pings.where((other) => other.counted).length;
+      while (pendingCounted >= MuxConnection.maxPendingPings) {
+        final oldest = _pings.removeAt(0);
+        if (oldest.counted) {
+          pendingCounted--;
+        }
+        oldest.completer.completeError(
+          SwitchboardException.of(
+            StatusCode.deadlineExceeded,
+            'no PONG before ${MuxConnection.maxPendingPings} later PINGs',
+          ),
+        );
+      }
     }
     _pings.add(pending);
     _sendControl(message);
@@ -1224,8 +1237,12 @@ class QuicBindingConnection extends BindingConnection {
   ///   connection, ends the wait too, and so does
   ///   [MuxOptions.closeConfirmTimeout] after the `GOAWAY` (none when
   ///   zero); a `PONG` after that is ignored. A `GOAWAY` from the peer
-  ///   alone does not end it: the peer is still there. A failed barrier
-  ///   PING also ends the wait, as when too many later PINGs evict it.
+  ///   alone does not end it: the peer is still there. The `PING`'s own
+  ///   failure ends it too: an ordinary `PING` of [ping]'s bookkeeping, it
+  ///   fails like any other once it is the oldest when a later `PING`
+  ///   evicts, but it does not count toward
+  ///   [MuxConnection.maxPendingPings] itself, so that it evicts no
+  ///   application `PING`.
   ///
   /// Both run at once, so the barrier normally costs nothing. Calling it
   /// again sends nothing more and waits for the same. Never fails.
@@ -1251,7 +1268,10 @@ class QuicBindingConnection extends BindingConnection {
   /// the connection's end), the connection ended, or
   /// [MuxOptions.closeConfirmTimeout] passed. Never fails.
   Future<void> _pingBarrier() async {
-    final pending = _startPing(MuxControlMessage.ping(_nextPingPayload()));
+    final pending = _startPing(
+      MuxControlMessage.ping(_nextPingPayload()),
+      counted: false,
+    );
     // Ordinary ping bookkeeping fails the PING on every connection end.
     final answered = pending.completer.future.then<void>(
       (_) {},
@@ -1950,11 +1970,14 @@ class QuicBindingConnection extends BindingConnection {
 }
 
 class _PendingPing {
-  _PendingPing(this.payload) {
+  _PendingPing(this.payload, {required this.counted}) {
     completer.future.ignore();
   }
 
   final Uint8List payload;
+  // Whether it counts toward MuxConnection.maxPendingPings: every PING but
+  // the GOAWAY barrier's.
+  final bool counted;
   final Completer<Duration> completer = Completer<Duration>();
   final Stopwatch stopwatch = Stopwatch()..start();
 }

@@ -13,16 +13,20 @@ Authors:
 // a self-signed certificate, a pinned client, an echo in both directions with
 // FIN, the exporter on both ends, an application close seen by the peer, and
 // 64 MiB through one stream; then the binding over the provider: two
-// connections with exporter-bound HELLOs, a channel echoing a subframe, the
-// close of the connection seen as a GOAWAY; then the same over a WebTransport
-// session (HTTP/3 in the shim): the protocol selected, an echo, the
-// session's exporter equal at both ends, a reset code, the close code and
-// reason, and the binding over the session. Exits non-zero on any failure.
+// connections with exporter-bound HELLOs, a channel echoing a subframe, a
+// GOAWAY without channels read before the close (the PING barrier); then the
+// same over a WebTransport session (HTTP/3 in the shim): the protocol
+// selected, an echo, the session's exporter equal at both ends, a reset
+// code, the close code and reason, and the binding over the session, whose
+// GOAWAY with a channel still open ends the far side's channel GOING_AWAY
+// (holding a reset without a code that overtakes the close). Exits non-zero
+// on any failure.
 
 import 'dart:async';
 import 'dart:io';
 import 'dart:typed_data';
 
+import 'package:switchboard/core.dart' show MuxOptions, Status, StatusCode;
 import 'package:switchboard_quic/core.dart' show QuicBindingConnection;
 import 'package:switchboard_quic/switchboard_quic_native.dart';
 
@@ -139,9 +143,11 @@ Future<void> main() async {
   await request.cancel();
   await _hellos(initiator, acceptor);
   check(initiator.exporterBound && acceptor.exporterBound, 'HELLO EXPORTER');
-  await initiator.close();
-  check((await acceptor.peerGoAwayStatus).code == 33, 'binding close');
-  await acceptor.done;
+  // The GOAWAY's reason reaches the peer, not only the close's code 0.
+  final goingAway = Status.of(StatusCode.goingAway, 'smoke');
+  await initiator.goAway(goingAway);
+  check(await acceptor.peerGoAwayStatus == goingAway, 'binding GOAWAY');
+  check(await acceptor.done == goingAway, 'binding close');
   await sessions.cancel();
   await listener.close();
   print('native smoke: binding OK');
@@ -224,6 +230,7 @@ Future<void> _webTransport(
   );
   final initiator = await QuicBindingConnection.start(
     dialled,
+    options: const MuxOptions(goAwayGrace: Duration(milliseconds: 300)),
     isWebTransport: true,
   );
   final acceptor = await accepting;
@@ -248,12 +255,22 @@ Future<void> _webTransport(
     initiator.exporterBound && acceptor.exporterBound,
     'WebTransport HELLO EXPORTER',
   );
-  await initiator.close();
+  // A channel left open: the GOAWAY's grace passes and the session closes
+  // over it, and the acceptor's end of it ends as the connection does.
+  final open = initiator.open(Uint8List.fromList([1]))..stream.listen((_) {});
+  await open.send(Uint8List(1));
+  check(await incoming.moveNext(), 'WebTransport channel left open');
+  final left = incoming.current..stream.listen((_) {});
+  await initiator.goAway();
   check(
     (await acceptor.peerGoAwayStatus).code == 33,
+    'WebTransport binding GOAWAY',
+  );
+  check(
+    (await acceptor.done).code == 33 && (await left.done).code == 33,
     'WebTransport binding close',
   );
-  await acceptor.done;
+  check((await open.done).code == 33, 'WebTransport channel');
   await sessions.cancel();
   await listener.close();
   print('native smoke: WebTransport OK');
