@@ -244,6 +244,9 @@ class QuicBindingConnection extends BindingConnection {
   int _pingCounter = 0;
   bool _closing = false;
   bool _goAwaySent = false;
+  // The PING barrier after this side's GOAWAY: completes once the record is
+  // known to be read, the connection ended, or the bound passed.
+  Future<void>? _goAwayBarrier;
   Status? _ownGoAway;
   Status? _peerGoAway;
   Status? _peerGoAwayReceived;
@@ -1043,7 +1046,9 @@ class QuicBindingConnection extends BindingConnection {
     if (idle != null && !idle.isCompleted) {
       idle.complete();
     }
-    if (_peerGoAway != null) {
+    if (_peerGoAway != null && !_goAwaySent) {
+      // A side that sent a GOAWAY of its own closes from [_goAwayWait],
+      // once its PING barrier is passed as well.
       _log.fine('$this: idle after the peer\'s GOAWAY, closing');
       unawaited(close());
     }
@@ -1190,6 +1195,26 @@ class QuicBindingConnection extends BindingConnection {
     }
   }
 
+  /// Sends `GOAWAY` with [status], and a `PING` right after it on the
+  /// control stream; refuses the peer's new channels (except a `_bulk`
+  /// channel for one that is open) and opens none; then [close]s once
+  /// both:
+  ///
+  /// * the channels are done (and the bulk payloads held for the drain),
+  ///   or [MuxOptions.goAwayGrace] passed;
+  /// * the `PING` barrier is passed (binding page, "GOAWAY and connection
+  ///   close"): the `GOAWAY` travels on the control stream, which stays
+  ///   open, so the acknowledgement [close] waits for does not cover it.
+  ///   The `PONG` of that `PING` says the peer read the record; the peer's
+  ///   own close (a peer with no channels left closes on reading it, and
+  ///   its `PONG` may be lost with the close), or any other end of the
+  ///   connection, ends the wait too, and so does
+  ///   [MuxOptions.closeConfirmTimeout] after the `GOAWAY` (none when
+  ///   zero); a `PONG` after that is ignored. A `GOAWAY` from the peer
+  ///   alone does not end it: the peer is still there.
+  ///
+  /// Both run at once, so the barrier normally costs nothing. Calling it
+  /// again sends nothing more and waits for the same. Never fails.
   @override
   Future<void> goAway([Status status = const Status(33)]) {
     checkMuxStatus(status);
@@ -1201,8 +1226,30 @@ class QuicBindingConnection extends BindingConnection {
       _ownGoAway = status;
       _log.fine('$this: sending GOAWAY $status');
       _sendControl(MuxControlMessage.goAway(statusForWire(status)));
+      _goAwayBarrier = _pingBarrier();
     }
     return _goAwayWait();
+  }
+
+  /// A `PING` sent now through [ping]: completes once its `PONG` arrived,
+  /// the `PING` failed (at once when the connection is closing, or with
+  /// the connection's end), the connection ended, or
+  /// [MuxOptions.closeConfirmTimeout] passed. Never fails.
+  Future<void> _pingBarrier() {
+    final answered = Future.any<void>([
+      ping().then<void>((_) {}, onError: (Object _) {}),
+      _done.future.then<void>((_) {}),
+    ]);
+    final bound = options.closeConfirmTimeout;
+    if (bound <= Duration.zero) {
+      return answered;
+    }
+    return answered.timeout(
+      bound,
+      onTimeout: () {
+        _log.fine('$this: no PONG after GOAWAY within $bound, closing');
+      },
+    );
   }
 
   Future<void> _goAwayWait() async {
@@ -1220,15 +1267,18 @@ class QuicBindingConnection extends BindingConnection {
         },
       );
     }
+    // The barrier ran meanwhile, from the GOAWAY on.
+    await _goAwayBarrier;
     await close();
   }
 
-  /// Closes the session: an application close with code 0 (or the status
-  /// of this side's GOAWAY when it was not `GOING_AWAY`), once what this
-  /// side finished writing on its streams has been acknowledged, within
-  /// [MuxOptions.keepAliveTimeout]. The channels still open end with
-  /// `CONNECTION_LOST`, or the GOAWAY status if either side sent one.
-  /// Never throws.
+  /// Closes the session now: an application close with code 0 (or the
+  /// status of this side's GOAWAY when it was not `GOING_AWAY`), once what
+  /// this side finished writing on its streams has been acknowledged,
+  /// within [MuxOptions.keepAliveTimeout]. It sends no `GOAWAY` and waits
+  /// for no `PONG`, also after a [goAway], whose wait it ends. The
+  /// channels still open end with `CONNECTION_LOST`, or the GOAWAY status
+  /// if either side sent one. Never throws.
   @override
   Future<void> close() {
     final own = _ownGoAway;
@@ -1259,9 +1309,12 @@ class QuicBindingConnection extends BindingConnection {
   void _protocolError(String reason) =>
       _fail(Status.of(StatusCode.protocolError, reason));
 
-  /// How long a reset or `STOP_SENDING` without an application code on the
-  /// control stream of a WebTransport session waits for the session's end
-  /// before it counts as a protocol error.
+  /// How long a reset or `STOP_SENDING` without an application code over a
+  /// WebTransport session (the `WT_SESSION_GONE` of a peer ending the
+  /// session, which can arrive before the session's close) waits for the
+  /// session's end: on the control stream before it counts as a protocol
+  /// error, on a channel before it counts as the peer's close, `UNKNOWN`
+  /// ([QuicChannel], binding page "Closing"). One grace for both.
   static const Duration webTransportSessionGoneGrace = Duration(seconds: 2);
 
   /// The peer reset or stopped the control stream, which is a protocol

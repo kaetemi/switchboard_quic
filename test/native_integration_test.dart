@@ -180,6 +180,46 @@ String rate(int bytes, Duration elapsed) {
       '${mbs.toStringAsFixed(0)} MB/s';
 }
 
+/// A native listener of the [current] mode on the loopback without a node,
+/// closed after the test, and a function that dials it and returns the
+/// next pair of bindings, the dialler's and the listener's, once each has
+/// the other's HELLO.
+Future<Future<(QuicBindingConnection, QuicBindingConnection)> Function()>
+bindingPairs() async {
+  final config = QuicServerConfig(
+    alpn: const [switchboardAlpn],
+    certificateDer: cert.certificateDer,
+    privateKeyDer: cert.privateKeyDer,
+  );
+  final QuicListener quic = current.wt
+      ? await provider.listenWebTransport('127.0.0.1', 0, config, path: '/sb')
+      : await provider.listen('127.0.0.1', 0, config);
+  addTearDown(quic.close);
+  final sessions = StreamIterator(quic.sessions);
+  return () async {
+    final dialling = connectQuicBinding(
+      provider,
+      quic.endpoint,
+      options: fast,
+      identityRules: QuicIdentityRules.none,
+      verifyCertificate: false,
+    );
+    expect(await sessions.moveNext().timeout(limit), isTrue);
+    final acceptor = await QuicBindingConnection.start(
+      sessions.current,
+      options: fast,
+      isWebTransport: current.wt,
+    );
+    addTearDown(acceptor.close);
+    final initiator = await dialling.timeout(limit);
+    addTearDown(initiator.close);
+    await until(
+      () => initiator.peerHello != null && acceptor.peerHello != null,
+    );
+    return (initiator, acceptor);
+  };
+}
+
 void main() {
   setUpAll(() async {
     provider = NativeQuicProvider();
@@ -648,6 +688,67 @@ void cases() {
         await connection.done.timeout(limit),
         hasCode(StatusCode.goingAway),
       );
+    });
+
+    test('GOAWAY with no channel open, sixteen times, from either side: the '
+        'peer reads the record before the close', () async {
+      // Without channels the GOAWAY's sender closes once the PONG of the
+      // PING it sent right after the record is back (or the peer's own
+      // close arrived): the session's close cannot overtake the record. The
+      // reason tells the record from the close, which says only code 0; a
+      // peer that lost both would read CONNECTION_LOST.
+      final pairs = await bindingPairs();
+      for (var round = 0; round < 16; round++) {
+        final (initiator, acceptor) = await pairs();
+        final (sender, receiver) = round.isEven
+            ? (initiator, acceptor)
+            : (acceptor, initiator);
+        final status = Status.of(StatusCode.goingAway, 'round $round');
+        await sender.goAway(status).timeout(limit);
+        expect(
+          await receiver.peerGoAwayStatus.timeout(limit),
+          status,
+          reason: 'round $round',
+        );
+        expect(await receiver.done.timeout(limit), status);
+        expect(await sender.done.timeout(limit), hasCode(StatusCode.goingAway));
+      }
+    });
+
+    test('a close with channels open, sixty-four times, from either side: '
+        'the far side\'s channels end GOING_AWAY, never UNKNOWN', () async {
+      // Over WebTransport the closing side's stack resets the session's
+      // streams without an application code (WT_SESSION_GONE), which the far
+      // side can read before the session's close; its channels hold such a
+      // reset for the close.
+      final pairs = await bindingPairs();
+      for (var round = 0; round < 64; round++) {
+        final (initiator, acceptor) = await pairs();
+        final (closer, far) = round.isEven
+            ? (initiator, acceptor)
+            : (acceptor, initiator);
+        final farChannels = <MuxChannel>[];
+        far.incoming.listen((channel) {
+          channel.stream.listen((_) {});
+          farChannels.add(channel);
+        });
+        closer.incoming.listen((channel) => channel.stream.listen((_) {}));
+        final opened = far.open(Uint8List(0))..stream.listen((_) {});
+        farChannels.add(opened);
+        final theirs = closer.open(Uint8List(0))..stream.listen((_) {});
+        await until(() => farChannels.length == 2);
+        await opened.send(bytes('x'));
+        await theirs.send(bytes('y'));
+        await closer.close().timeout(limit);
+        for (final channel in farChannels) {
+          expect(
+            await channel.done.timeout(limit),
+            hasCode(StatusCode.goingAway),
+            reason: 'round $round',
+          );
+        }
+        expect(await far.done.timeout(limit), hasCode(StatusCode.goingAway));
+      }
     });
 
     test('the idle timeout ends the channels with CONNECTION_LOST', () async {

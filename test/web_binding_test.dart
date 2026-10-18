@@ -12,8 +12,9 @@ Authors:
 // every test skips): QuicBindingConnection through connectQuicBinding (HELLO,
 // a channel, Talk through the node's service, a nonce-bound IDENT accepted
 // by a listener with QuicIdentityRules.none, the node's GOAWAY, a close from
-// the browser), and ReconnectingClient.connections over it (a request, the
-// node closing the connection, the reconnect, the node's GOAWAY).
+// the browser, the node's close with channels open), and
+// ReconnectingClient.connections over it (a request, the node closing the
+// connection, the reconnect, the node's GOAWAY).
 
 @TestOn('browser')
 library;
@@ -151,6 +152,34 @@ void main() {
     expect(connection.isOpen, isFalse);
     final seen = await s.reported(id, (e) => e['event'] == 'connection done');
     expect(seen['code'], StatusCode.goingAway.code);
+  });
+
+  test('the node closes the connection with channels open, eight times: '
+      'they end as the connection does, GOING_AWAY, never UNKNOWN', () async {
+    final s = await server();
+    if (s == null) return;
+    for (var round = 0; round < 8; round++) {
+      final connection = await dialNode(s);
+      final talk = talkTo(connection, echo);
+      final reply = await talk.request('ECHO', bytes('x')).timeout(limit);
+      expect(text(reply.payload), 'x');
+      final asking = talkTo(connection, control);
+      await asking.send('CLOSE', Uint8List(0));
+      expect(
+        (await connection.done.timeout(limit)).known,
+        StatusCode.goingAway,
+      );
+      // The node's stack resets the session's streams without an
+      // application code (WT_SESSION_GONE), which the browser may read
+      // before the session's close: the channels hold it for the close.
+      for (final channel in [talk.raw, asking.raw]) {
+        expect(
+          (await (channel as MuxChannel).done.timeout(limit)).known,
+          StatusCode.goingAway,
+          reason: 'round $round',
+        );
+      }
+    }
   });
 
   group('ReconnectingClient.connections', () {

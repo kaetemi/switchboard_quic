@@ -4,6 +4,7 @@ Microservice Network Architecture
 Copyright (C) 2018-2026  Jan BOON (Kaetemi)
 Authors:
   Jan Boon <jan.boon@kaetemi.be>
+  Claude Opus 5.5 <noreply@anthropic.com>
   GPT-6 Astra <noreply@openai.com>
 */
 
@@ -191,6 +192,11 @@ void reviewCases() {
         if (sentGoAway) {
           unawaited(connection.goAway());
           await raw.nextControlOf(MuxControlType.goAway.code);
+          // The PING right after the GOAWAY, answered as a peer does: the
+          // close then waits only for the drain.
+          final ping = await raw.nextControl();
+          expect(ping.knownType, MuxControlType.ping);
+          await raw.sendControl(MuxControlMessage.pong(ping.payload));
         } else {
           await raw.sendControl(
             MuxControlMessage.goAway(Status.of(StatusCode.goingAway)),

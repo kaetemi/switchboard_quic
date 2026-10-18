@@ -11,8 +11,9 @@ Authors:
 // QuicBindingConnection and QuicChannel over the memory provider: channel
 // ids, records, the close handshake (CLOSE records, resets, STOP_SENDING,
 // the confirmation timeout), flow control, priorities, openAfter, GOAWAY
-// and the ends of the connection, keep-alive, the resource limits of the
-// binding page, and identification at the connection level.
+// and the ends of the connection, the PING barrier after GOAWAY, resets and
+// STOP_SENDING without a code over WebTransport, keep-alive, the resource
+// limits of the binding page, and identification at the connection level.
 
 import 'dart:async';
 import 'dart:typed_data';
@@ -32,6 +33,85 @@ void collect(QuicBindingConnection connection, List<MuxChannel> into) =>
 /// The channel [connection] delivers next.
 Future<MuxChannel> nextChannel(QuicBindingConnection connection) =>
     connection.incoming.first.timeout(limit);
+
+/// [connection]'s end of the memory stream the raw peer holds as [stream].
+MemoryQuicStream bindingEnd(
+  QuicBindingConnection connection,
+  QuicStream stream,
+) {
+  final ordinal = (stream as MemoryQuicStream).info.ordinal;
+  return (connection.session as MemoryQuicSession).streams.firstWhere(
+    (s) => s.info.ordinal == ordinal,
+  );
+}
+
+/// A channel a raw peer opened on an acceptor binding, delivered and
+/// listened to.
+class OpenedChannel {
+  OpenedChannel._(this.connection, this.raw, this.stream, this.channel) {
+    channel.stream.listen(received.add, onDone: incomingDone.complete);
+  }
+
+  /// Channel [id], opened by the raw peer of a new acceptor binding over a
+  /// memory session flagged WebTransport ([isWebTransport]), with [data]
+  /// after its OPEN record.
+  static Future<OpenedChannel> start({
+    List<int> data = const [],
+    bool isWebTransport = true,
+    int id = 2,
+  }) async {
+    final (connection, raw) = await bindingAndRaw(
+      isWebTransport: isWebTransport,
+    );
+    return _open(
+      connection,
+      raw,
+      StreamIterator(connection.incoming),
+      id,
+      data,
+    );
+  }
+
+  static Future<OpenedChannel> _open(
+    QuicBindingConnection connection,
+    RawPeer raw,
+    StreamIterator<MuxChannel> incoming,
+    int id,
+    List<int> data,
+  ) async {
+    final stream = await raw.openRaw([
+      ...encodeOpenRecord(id, const []),
+      ...data,
+    ]);
+    expect(await incoming.moveNext().timeout(limit), isTrue);
+    return OpenedChannel._(connection, raw, stream, incoming.current)
+      .._incoming = incoming;
+  }
+
+  final QuicBindingConnection connection;
+  final RawPeer raw;
+
+  /// The raw peer's end of the channel's stream.
+  final QuicStream stream;
+  final MuxChannel channel;
+  final List<Uint8List> received = [];
+  final Completer<void> incomingDone = Completer<void>();
+  late final StreamIterator<MuxChannel> _incoming;
+
+  MemoryQuicStream get rawStream => stream as MemoryQuicStream;
+
+  /// Channel [id] of the same raw peer, on the same connection.
+  Future<OpenedChannel> another(int id) =>
+      _open(connection, raw, _incoming, id, const []);
+}
+
+/// Whether [future] has completed, checked after the current microtasks.
+Future<bool> completed(Future<Object?> future) async {
+  var done = false;
+  future.then((_) => done = true, onError: (Object _) => done = true).ignore();
+  await Future<void>.delayed(Duration.zero);
+  return done;
+}
 
 late CredentialIssuer authority;
 late HolderKey holder;
@@ -810,6 +890,365 @@ void main() {
       await a.close();
       // The confirming CLOSE arrived before the session closed.
       expect(await remoteDone.timeout(limit), Status.ok);
+    });
+  });
+
+  group('the PING barrier after GOAWAY', () {
+    test('with no channel open, the session closes only once the PONG of '
+        'the PING sent right after the GOAWAY record is back', () async {
+      final (connection, raw) = await bindingAndRaw();
+      final going = connection.goAway();
+      await raw.nextControlOf(MuxControlType.goAway.code);
+      final ping = await raw.nextControl();
+      expect(ping.knownType, MuxControlType.ping);
+      // Well past the GOAWAY grace: the drain is done, the PONG withheld.
+      await settle(400);
+      expect(raw.session.ended, isFalse);
+      expect(await completed(going), isFalse);
+      expect(await completed(connection.done), isFalse);
+      await raw.sendControl(MuxControlMessage.pong(ping.payload));
+      await going.timeout(limit);
+      final end = await raw.end;
+      expect((end.code, end.byPeer, end.lost), (0, true, false));
+      expect(
+        await connection.done.timeout(limit),
+        hasCode(StatusCode.goingAway),
+      );
+    });
+
+    test('the peer\'s own close ends the wait', () async {
+      final (connection, raw) = await bindingAndRaw();
+      final going = connection.goAway(Status.of(StatusCode.unavailable, 'x'));
+      await raw.nextControlOf(MuxControlType.ping.code);
+      await settle(300);
+      expect(await completed(going), isFalse);
+      final watch = Stopwatch()..start();
+      await raw.session.close(0, '');
+      await going.timeout(limit);
+      // Long before the bound (closeConfirmTimeout, 5 s here).
+      expect(watch.elapsed, lessThan(const Duration(seconds: 2)));
+      expect(
+        await connection.done.timeout(limit),
+        hasCode(StatusCode.goingAway),
+      );
+    });
+
+    test('the bound, closeConfirmTimeout from the GOAWAY, ends the wait; '
+        'a lost session too', () async {
+      const bound = Duration(milliseconds: 400);
+      final (connection, raw) = await bindingAndRaw(
+        options: fast.copyWith(closeConfirmTimeout: bound),
+      );
+      final watch = Stopwatch()..start();
+      final going = connection.goAway();
+      await raw.nextControlOf(MuxControlType.ping.code);
+      await going.timeout(limit);
+      expect(
+        watch.elapsed,
+        greaterThanOrEqualTo(bound - const Duration(milliseconds: 20)),
+      );
+      final end = await raw.end;
+      expect((end.code, end.byPeer), (0, true));
+      // The end of the connection, lost or closed, ends it at once.
+      final (other, otherRaw) = await bindingAndRaw();
+      final otherGoing = other.goAway();
+      await otherRaw.nextControlOf(MuxControlType.ping.code);
+      otherRaw.session.lose();
+      await otherGoing.timeout(const Duration(seconds: 2));
+      expect(await other.done.timeout(limit), hasCode(StatusCode.goingAway));
+    });
+
+    test('a failure close, and close() with or without a GOAWAY before it, '
+        'do not wait for a PONG', () async {
+      // A protocol error after the GOAWAY: closed at once with its status.
+      final (failing, failingRaw) = await bindingAndRaw();
+      final going = failing.goAway();
+      await failingRaw.nextControlOf(MuxControlType.ping.code);
+      await failingRaw.sendControl(
+        MuxControlMessage(MuxControlType.limits.code, Uint8List(12)),
+      );
+      expect((await failingRaw.end).code, StatusCode.protocolError.code);
+      await going.timeout(const Duration(seconds: 1));
+      // close() after a GOAWAY closes now.
+      final (closing, closingRaw) = await bindingAndRaw();
+      final closingGoing = closing.goAway();
+      await closingRaw.nextControlOf(MuxControlType.ping.code);
+      await closing.close().timeout(const Duration(seconds: 1));
+      await closingGoing.timeout(const Duration(seconds: 1));
+      expect((await closingRaw.end).code, 0);
+      // close() alone sends no GOAWAY and waits for nothing.
+      final (plain, plainRaw) = await bindingAndRaw();
+      await plain.close().timeout(const Duration(seconds: 1));
+      expect((await plainRaw.end).code, 0);
+    });
+
+    test('with a channel open, the close waits for the drain and the '
+        'barrier together; the grace still applies', () async {
+      final (connection, raw) = await bindingAndRaw(
+        options: fast.copyWith(goAwayGrace: const Duration(seconds: 5)),
+      );
+      final arriving = nextChannel(connection);
+      final stream = await raw.openRaw(encodeOpenRecord(2, const []));
+      final channel = await arriving;
+      channel.stream.listen((_) {});
+      final going = connection.goAway();
+      await raw.nextControlOf(MuxControlType.goAway.code);
+      final ping = await raw.nextControl();
+      // The PONG first: the open channel keeps the session.
+      await raw.sendControl(MuxControlMessage.pong(ping.payload));
+      await settle(200);
+      expect(raw.session.ended, isFalse);
+      await stream.write(encodeCloseRecord(Status.ok));
+      await stream.finish();
+      await going.timeout(limit);
+      expect(await channel.done.timeout(limit), Status.ok);
+      expect((await raw.end).code, 0);
+
+      // The channel first: the withheld PONG keeps the session.
+      final (second, secondRaw) = await bindingAndRaw(
+        options: fast.copyWith(goAwayGrace: const Duration(seconds: 5)),
+      );
+      final secondArriving = nextChannel(second);
+      final secondStream = await secondRaw.openRaw(
+        encodeOpenRecord(2, const []),
+      );
+      final secondChannel = await secondArriving;
+      secondChannel.stream.listen((_) {});
+      final secondGoing = second.goAway();
+      await secondRaw.nextControlOf(MuxControlType.goAway.code);
+      final secondPing = await secondRaw.nextControl();
+      await secondStream.write(encodeCloseRecord(Status.ok));
+      await secondStream.finish();
+      expect(await secondChannel.done.timeout(limit), Status.ok);
+      await settle(300);
+      expect(secondRaw.session.ended, isFalse);
+      await secondRaw.sendControl(MuxControlMessage.pong(secondPing.payload));
+      await secondGoing.timeout(limit);
+      expect((await secondRaw.end).code, 0);
+
+      // The grace (200 ms) passes with the channel still open, the PONG
+      // back: the session closes all the same.
+      final (third, thirdRaw) = await bindingAndRaw();
+      final thirdArriving = nextChannel(third);
+      await thirdRaw.openRaw(encodeOpenRecord(2, const []));
+      final thirdChannel = await thirdArriving;
+      thirdChannel.stream.listen((_) {});
+      final thirdGoing = third.goAway();
+      await thirdRaw.nextControlOf(MuxControlType.goAway.code);
+      final thirdPing = await thirdRaw.nextControl();
+      await thirdRaw.sendControl(MuxControlMessage.pong(thirdPing.payload));
+      await thirdGoing.timeout(limit);
+      expect((await thirdRaw.end).code, 0);
+      expect(
+        await thirdChannel.done.timeout(limit),
+        hasCode(StatusCode.goingAway),
+      );
+    });
+
+    test('a side that sent GOAWAY and reads the peer\'s with no channel left '
+        'closes only once its PONG is back as well', () async {
+      final (connection, raw) = await bindingAndRaw();
+      final going = connection.goAway();
+      await raw.nextControlOf(MuxControlType.goAway.code);
+      final ping = await raw.nextControl();
+      await raw.sendControl(
+        MuxControlMessage.goAway(Status.of(StatusCode.goingAway)),
+      );
+      await until(() => connection.peerGoingAway);
+      await settle(300);
+      expect(raw.session.ended, isFalse);
+      await raw.sendControl(MuxControlMessage.pong(ping.payload));
+      await going.timeout(limit);
+      expect((await raw.end).code, 0);
+    });
+
+    test('between two bindings the PONG is back at once', () async {
+      final (a, b) = await connectionPair();
+      final watch = Stopwatch()..start();
+      await a.goAway(Status.of(StatusCode.goingAway, 'bye')).timeout(limit);
+      expect(watch.elapsed, lessThan(const Duration(seconds: 2)));
+      expect(
+        await b.peerGoAwayStatus.timeout(limit),
+        Status.of(StatusCode.goingAway, 'bye'),
+      );
+      expect(
+        await b.done.timeout(limit),
+        Status.of(StatusCode.goingAway, 'bye'),
+      );
+    });
+  });
+
+  group('resets and STOP_SENDING without a code over WebTransport', () {
+    test('a reset is held: nothing more is delivered, a partial record is '
+        'discarded, nothing is sent; the session\'s graceful close within the '
+        'grace ends the channel GOING_AWAY', () async {
+      final c = await OpenedChannel.start(
+        data: [
+          ...encodeDataRecord(bytes('whole')),
+          ...hexBytes('05 00 00 00 01 02'),
+        ],
+      );
+      await until(() => c.received.isNotEmpty);
+      c.rawStream.resetWithoutCode();
+      await c.incomingDone.future.timeout(limit);
+      await settle(200);
+      expect(await completed(c.channel.done), isFalse);
+      expect(c.channel.state, MuxChannelState.open);
+      expect(c.channel.receiveWindow, 0);
+      final local = bindingEnd(c.connection, c.stream);
+      void sentNothing() {
+        expect(local.finished, isFalse);
+        expect(local.resets, isEmpty);
+        expect(local.stops, isEmpty);
+      }
+
+      sentNothing();
+      await c.raw.session.close(0, '');
+      expect(
+        await c.channel.done.timeout(limit),
+        hasCode(StatusCode.goingAway),
+      );
+      expect(c.received.map(text), ['whole']);
+      sentNothing();
+    });
+
+    test('any other end of the session within the grace ends a held channel '
+        'as the connection\'s other channels end, never UNKNOWN', () async {
+      // A close with another status.
+      final c = await OpenedChannel.start();
+      final other = await c.another(4);
+      c.rawStream.resetWithoutCode();
+      await settle(100);
+      await c.raw.session.close(StatusCode.unavailable.code, 'upgrade');
+      final held = await c.channel.done.timeout(limit);
+      expect(held, await other.channel.done.timeout(limit));
+      expect(held.known, StatusCode.goingAway);
+      // A lost session.
+      final lost = await OpenedChannel.start();
+      lost.rawStream.resetWithoutCode();
+      await settle(100);
+      lost.raw.session.lose();
+      expect(
+        await lost.channel.done.timeout(limit),
+        hasCode(StatusCode.connectionLost),
+      );
+      // This side's own close.
+      final closed = await OpenedChannel.start();
+      closed.rawStream.resetWithoutCode();
+      await settle(100);
+      await closed.connection.close();
+      expect(
+        await closed.channel.done.timeout(limit),
+        hasCode(StatusCode.connectionLost),
+      );
+    });
+
+    test('with no session end within the grace, a held reset is the peer\'s '
+        'close, UNKNOWN, and this side closes in turn', () async {
+      final c = await OpenedChannel.start();
+      final watch = Stopwatch()..start();
+      c.rawStream.resetWithoutCode();
+      final status = await c.channel.done.timeout(limit);
+      expect(status.known, StatusCode.unknown);
+      expect(
+        watch.elapsed,
+        greaterThanOrEqualTo(
+          QuicBindingConnection.webTransportSessionGoneGrace -
+              const Duration(milliseconds: 50),
+        ),
+      );
+      final (records, end) = await RawPeer.drain(c.stream);
+      expect(records.single.command, QuicRecordCommand.close);
+      expect(records.single.body, isEmpty);
+      expect(end, 'fin');
+    });
+
+    test('this side\'s own close waits for the outcome too', () async {
+      final c = await OpenedChannel.start();
+      c.rawStream.resetWithoutCode();
+      await settle(50);
+      final closing = c.channel.close();
+      // Its CLOSE record and FIN go, as they would anyway; the channel
+      // ends with the session.
+      final (records, end) = await RawPeer.drain(c.stream);
+      expect(records.single.command, QuicRecordCommand.close);
+      expect(end, 'fin');
+      await settle(100);
+      expect(await completed(closing), isFalse);
+      await c.raw.session.close(0, '');
+      await closing.timeout(limit);
+      expect(await c.channel.done, hasCode(StatusCode.goingAway));
+    });
+
+    test('a STOP_SENDING is held too: nothing more is read, nothing sent in '
+        'answer; the session\'s close ends the channel GOING_AWAY', () async {
+      final c = await OpenedChannel.start();
+      c.rawStream.stopWithoutCode();
+      await settle(50);
+      await c.stream.write(encodeDataRecord(bytes('late')));
+      await settle(200);
+      expect(c.received, isEmpty);
+      expect(await completed(c.channel.done), isFalse);
+      final local = bindingEnd(c.connection, c.stream);
+      expect(local.resets, isEmpty);
+      expect(local.stops, isEmpty);
+      await c.raw.session.close(0, '');
+      expect(
+        await c.channel.done.timeout(limit),
+        hasCode(StatusCode.goingAway),
+      );
+      expect(c.received, isEmpty);
+    });
+
+    test('with no session end within the grace, a held STOP_SENDING is the '
+        'peer\'s close as any: UNKNOWN, and reading resumes', () async {
+      final c = await OpenedChannel.start();
+      final watch = Stopwatch()..start();
+      c.rawStream.stopWithoutCode();
+      await settle(50);
+      await c.stream.write(encodeDataRecord(bytes('late')));
+      await until(() => c.received.isNotEmpty);
+      expect(
+        watch.elapsed,
+        greaterThanOrEqualTo(
+          QuicBindingConnection.webTransportSessionGoneGrace -
+              const Duration(milliseconds: 50),
+        ),
+      );
+      expect(c.received.map(text), ['late']);
+      expect(c.channel.canSend, isFalse);
+      await c.stream.write(encodeCloseRecord(Status.ok));
+      await c.stream.finish();
+      expect((await c.channel.done.timeout(limit)).known, StatusCode.unknown);
+    });
+
+    test('a reset without a code after this side\'s STOP_SENDING is its '
+        'confirmation: not held', () async {
+      final c = await OpenedChannel.start();
+      final watch = Stopwatch()..start();
+      final closing = c.channel.close(Status.of(StatusCode.cancelled, 'no'));
+      // Before the STOP_SENDING reaches the peer, whose stack then does not
+      // answer it with a reset of its own.
+      c.rawStream.resetWithoutCode();
+      await closing.timeout(limit);
+      expect(watch.elapsed, lessThan(const Duration(seconds: 1)));
+      expect(await c.channel.done, Status.of(StatusCode.cancelled, 'no'));
+    });
+
+    test('a reset with a code is not held; over raw QUIC (whose resets '
+        'always carry one) neither is one without', () async {
+      final coded = await OpenedChannel.start();
+      coded.stream.reset(StatusCode.permissionDenied.code);
+      expect(
+        await coded.channel.done.timeout(const Duration(seconds: 1)),
+        Status.of(StatusCode.permissionDenied),
+      );
+      final raw = await OpenedChannel.start(isWebTransport: false);
+      raw.rawStream.resetWithoutCode();
+      expect(
+        (await raw.channel.done.timeout(const Duration(seconds: 1))).known,
+        StatusCode.unknown,
+      );
     });
   });
 

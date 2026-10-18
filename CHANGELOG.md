@@ -295,3 +295,44 @@ Authors:
   itself, so that a failing listener is a failure; and
   `refusals_carry_their_status` gives its listener 2 s instead of 300 ms
   (it timed out under qemu), still below the client's 5 s.
+* Two races at the end of a session, found by the TypeScript port's
+  interop runs and fixed in both implementations as the binding page now
+  specifies ("GOAWAY and connection close", "Closing", "Errors", "Status
+  codes on streams and connections", "Ordering"):
+  * The `GOAWAY` record travels on the control stream, which stays open,
+    so the acknowledgement a graceful close waits for did not cover it:
+    with no channel open, `goAway()` closed at once, and the session's
+    close could overtake the record (the peer read the close's code 0
+    instead of the `GOAWAY`'s status, and `CONNECTION_LOST` where the close
+    was lost too). `goAway()` now sends a `PING` right after the record
+    and closes once the channels are done (or `goAwayGrace` passed) and
+    the `PING` barrier is passed: its `PONG` arrived, the peer's close or
+    any other end of the connection came, or `MuxOptions.closeConfirmTimeout`
+    passed since the `GOAWAY` (none when zero; a later `PONG` is ignored).
+    Both run at once. A failure close and `close()` wait for no `PONG`; a
+    side that sent `GOAWAY` and is idle after the peer's `GOAWAY` closes
+    through the same barrier.
+  * Over WebTransport, a channel that reads a reset or `STOP_SENDING`
+    without an application code (the `WT_SESSION_GONE` with which a peer
+    ending its session resets and stops its streams, which can arrive
+    before the session's close) no longer ends `UNKNOWN` at once: it holds
+    it for `QuicBindingConnection.webTransportSessionGoneGrace` (2 s, now
+    the one constant of the control stream's grace and the channels'),
+    delivers nothing more (a reset ends the incoming direction and
+    discards a partial record, a `STOP_SENDING` pauses reading) and sends
+    nothing in answer (no close in turn). The session's end within the
+    grace ends the channel as the connection's channels end (`GOING_AWAY`
+    after a graceful close, the connection's end status otherwise); after
+    it, the hold is the peer's close, `UNKNOWN`, taken as any reset or
+    `STOP_SENDING`. A reset after this side's `STOP_SENDING` is its
+    confirmation, and is not held; raw QUIC is unchanged.
+  * Tests: over the memory provider, where both races are deterministic
+    (the PONG withheld, the peer's close, the bound, a failure close, the
+    drain and the barrier together, a `GOAWAY` from both sides; held
+    resets and `STOP_SENDING`s ending with the session's close, another
+    end, or after the grace, the confirmation not held, raw QUIC
+    unchanged); over the native provider, rounds from either side of a
+    `GOAWAY` without channels and of a close with channels open, in both
+    modes (the first failed over both on the previous code, mostly in its
+    first rounds, the second about once in forty WebTransport rounds); in
+    the browser, the node's close with channels open.

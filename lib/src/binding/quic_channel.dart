@@ -32,6 +32,15 @@ part of 'quic_binding_connection.dart';
 ///   `STOP_SENDING` `DEADLINE_EXCEEDED`, resets this side's direction if
 ///   its CLOSE record is still queued behind data (an `OK` close becoming
 ///   `DEADLINE_EXCEEDED`), and ends the channel with its first status.
+/// * Over WebTransport, a reset or `STOP_SENDING` without an application
+///   code (the `WT_SESSION_GONE` of a peer ending the session, which can
+///   arrive before the session's close) is held for the session's end, for
+///   [QuicBindingConnection.webTransportSessionGoneGrace]: nothing more is
+///   delivered meanwhile (after a reset the incoming direction has ended)
+///   and nothing is sent in answer. The session's end within it ends the
+///   channel as the connection's channels end; only once it passed is it
+///   the peer's close, `UNKNOWN`. A reset after this side's `STOP_SENDING`
+///   is its confirmation, and is not held.
 /// * Flow control: the stack's stream window is the channel's window. The
 ///   binding reads the next record only once the layer above has taken
 ///   the previous one (the [stream]'s listener, or [consumed] under
@@ -123,6 +132,16 @@ class QuicChannel extends MuxChannel {
   bool _discarding = false;
   bool _incomingEnded = false;
 
+  // A reset or STOP_SENDING without an application code over WebTransport,
+  // held for the session's end: the timer runs while one is held.
+  Timer? _goneTimer;
+  // What is held: the peer's reset (its direction has ended), its
+  // STOP_SENDING.
+  bool _goneReset = false;
+  bool _goneStop = false;
+  // Wakes the read loop once the hold is decided.
+  Completer<void>? _goneDecided;
+
   // The contract ------------------------------------------------------------
 
   @override
@@ -163,7 +182,7 @@ class QuicChannel extends MuxChannel {
   /// ended.
   @override
   int get receiveWindow {
-    if (_peerEnded || _ended) {
+    if (_peerEnded || _ended || _goneReset) {
       return 0;
     }
     final window = connection.options.initialWindow + _readAhead - _unconsumed;
@@ -211,7 +230,7 @@ class QuicChannel extends MuxChannel {
     if (bytes <= 0) {
       throw ArgumentError.value(bytes, 'bytes', 'must be positive');
     }
-    if (_peerEnded || _ended) {
+    if (_peerEnded || _ended || _goneReset) {
       return;
     }
     if (connection.options.initialWindow + _readAhead + bytes > 0xFFFFFFFF) {
@@ -783,9 +802,18 @@ class QuicChannel extends MuxChannel {
 
   /// The peer's `STOP_SENDING`: its close, arriving early. This side
   /// stops sending at once, resetting its direction with the same code,
-  /// and keeps reading until the peer's direction ends.
+  /// and keeps reading until the peer's direction ends. Without a code over
+  /// WebTransport it is held for the session's end first ([_holdGone]).
   void _onStopSending(int? code) {
     if (connection._closing) return;
+    if (!_ended && _holdsGone(code)) {
+      _holdGone(reset: false);
+      return;
+    }
+    _stopSending(code);
+  }
+
+  void _stopSending(int? code) {
     final status = statusOfQuicErrorCode(code);
     if (_ended) {
       // Ended for this side already; what it still had to send goes no
@@ -830,8 +858,85 @@ class QuicChannel extends MuxChannel {
     _checkEnd();
   }
 
-  void _onPeerReset(int? code) => _peerReset(code);
+  /// The peer reset its direction: its close, by the code. Without a code
+  /// over WebTransport, and unless it confirms this side's `STOP_SENDING`,
+  /// it is held for the session's end first ([_holdGone]).
+  void _onPeerReset(int? code) {
+    if (_ended || _peerEnded || connection._closing) {
+      return;
+    }
+    if (!_stopSent && _holdsGone(code)) {
+      _holdGone(reset: true);
+      return;
+    }
+    _peerReset(code);
+  }
 
+  /// Whether a reset or `STOP_SENDING` with [code] may be the
+  /// `WT_SESSION_GONE` of a peer ending the session: one without an
+  /// application code over WebTransport. On raw QUIC a code is always
+  /// present.
+  bool _holdsGone(int? code) => code == null && connection.isWebTransport;
+
+  /// Holds a reset ([reset]) or `STOP_SENDING` without a code for the
+  /// session's end, for [QuicBindingConnection.webTransportSessionGoneGrace]
+  /// (binding page, "Closing"). Meanwhile nothing more is delivered (a
+  /// reset ends the incoming direction, discarding a partial record; a
+  /// `STOP_SENDING` pauses reading) and nothing is sent in answer: no
+  /// status is noted and the close in turn waits. The session's end within
+  /// the grace ends the channel as the connection's channels end
+  /// ([_connectionLost]); once the grace passed with the connection up, it
+  /// is the peer's close ([_onGoneTimeout]). Every end of the channel
+  /// cancels it ([_end]).
+  void _holdGone({required bool reset}) {
+    if (reset) {
+      if (_goneReset) {
+        return;
+      }
+      _goneReset = true;
+      _endIncoming();
+    } else {
+      _goneStop = true;
+    }
+    if (_goneTimer == null) {
+      _log.fine(
+        '$this: ${reset ? 'reset' : 'STOP_SENDING'} without a code, held '
+        'for the session\'s end',
+      );
+      _goneTimer = Timer(
+        QuicBindingConnection.webTransportSessionGoneGrace,
+        _onGoneTimeout,
+      );
+    }
+  }
+
+  /// The session outlived the grace: what was held is the peer's close,
+  /// `UNKNOWN` by its missing code, taken as any reset or `STOP_SENDING`.
+  void _onGoneTimeout() {
+    _goneTimer = null;
+    final reset = _goneReset;
+    final stop = _goneStop;
+    _goneStop = false;
+    _decideGone();
+    if (_ended || connection._closing) {
+      return;
+    }
+    if (stop) {
+      _stopSending(null);
+    }
+    if (reset) {
+      _peerReset(null);
+    }
+  }
+
+  void _decideGone() {
+    final decided = _goneDecided;
+    _goneDecided = null;
+    decided?.complete();
+  }
+
+  /// Taken as the peer's close: by [code], or, after this side's
+  /// `STOP_SENDING`, as its confirmation whatever the code.
   void _peerReset(int? code) {
     if (_ended || _peerEnded) {
       return;
@@ -944,6 +1049,9 @@ class QuicChannel extends MuxChannel {
       return;
     }
     _ended = true;
+    _goneTimer?.cancel();
+    _goneTimer = null;
+    _decideGone();
     _openTimer?.cancel();
     _openTimer = null;
     final opening = _openingResult;
@@ -980,7 +1088,12 @@ class QuicChannel extends MuxChannel {
           _unconsumed >= _readAhead) {
         await (_consumedSignal ??= Completer<void>()).future;
       }
-      if (_peerEnded || _stopSent || connection._closing) {
+      // A STOP_SENDING without a code is held for the session's end:
+      // nothing more is read until that is decided.
+      while (_goneTimer != null && !_goneReset && !_ended) {
+        await (_goneDecided ??= Completer<void>()).future;
+      }
+      if (_peerEnded || _stopSent || _goneReset || connection._closing) {
         return;
       }
       QuicRecord? record;
@@ -990,8 +1103,14 @@ class QuicChannel extends MuxChannel {
       } on Object catch (e) {
         failure = e;
       }
-      if (_stopSent || _peerEnded || connection._closing) {
-        // This side stopped reading meanwhile, or the connection ends.
+      // A record read while a STOP_SENDING came to be held waits for the
+      // decision; a failure (a reset, say) is taken now.
+      while (failure == null && _goneTimer != null && !_goneReset && !_ended) {
+        await (_goneDecided ??= Completer<void>()).future;
+      }
+      if (_stopSent || _peerEnded || _goneReset || connection._closing) {
+        // This side stopped reading meanwhile, the peer's reset is held, or
+        // the connection ends.
         return;
       }
       if (failure != null) {
