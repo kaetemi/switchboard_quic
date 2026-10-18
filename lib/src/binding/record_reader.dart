@@ -57,10 +57,17 @@ class RecordReader {
   /// inside a record is a [ProtocolException]. A reset fails with the
   /// provider's [QuicStreamReset] (the partial record is dropped), the end
   /// of the session with its [QuicException].
-  Future<QuicRecord?> next({required int limit}) async {
+  /// [read], when supplied, gates each provider read, including reads in
+  /// the middle of a record. A channel uses it to pause during a held
+  /// WebTransport STOP_SENDING without returning more receive credit.
+  Future<QuicRecord?> next({
+    required int limit,
+    Future<Uint8List?> Function(int max)? read,
+  }) async {
+    read ??= stream.read;
     var have = 0;
     while (have < quicRecordHeaderSize) {
-      final chunk = await stream.read(quicRecordHeaderSize - have);
+      final chunk = await read(quicRecordHeaderSize - have);
       if (chunk == null) {
         if (have == 0) {
           return null;
@@ -85,7 +92,7 @@ class RecordReader {
     if (length == 0) {
       return QuicRecord(command, Uint8List(0));
     }
-    final first = await _read(length);
+    final first = await _read(length, read);
     if (first.length == length) {
       return QuicRecord(command, first);
     }
@@ -94,7 +101,7 @@ class RecordReader {
     final body = BytesBuilder()..add(first);
     var filled = first.length;
     while (filled < length) {
-      final chunk = await _read(length - filled);
+      final chunk = await _read(length - filled, read);
       body.add(chunk);
       filled += chunk.length;
     }
@@ -102,9 +109,12 @@ class RecordReader {
   }
 
   /// Up to [wanted] bytes of a body; FIN is a protocol error.
-  Future<Uint8List> _read(int wanted) async {
+  Future<Uint8List> _read(
+    int wanted,
+    Future<Uint8List?> Function(int max) read,
+  ) async {
     final max = wanted < maxChunk ? wanted : maxChunk;
-    final chunk = await stream.read(max);
+    final chunk = await read(max);
     if (chunk == null) {
       throw ProtocolException('FIN inside a record');
     }
@@ -117,10 +127,12 @@ class RecordReader {
   /// Reads past a CLOSE record: completes at FIN or at a reset (the peer
   /// gave up on its direction after its close, which changes nothing).
   /// Anything else is a [ProtocolException].
-  Future<void> expectEnd() async {
+  /// [read] gates provider reads as in [next].
+  Future<void> expectEnd({Future<Uint8List?> Function(int max)? read}) async {
+    read ??= stream.read;
     try {
       while (true) {
-        final chunk = await stream.read(1);
+        final chunk = await read(1);
         if (chunk == null) {
           return;
         }

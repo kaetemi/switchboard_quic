@@ -244,6 +244,10 @@ class QuicBindingConnection extends BindingConnection {
   int _pingCounter = 0;
   bool _closing = false;
   bool _goAwaySent = false;
+  // The PING barrier after this side's GOAWAY: completes once the record is
+  // known to be read, the connection ended, or the bound passed.
+  Future<void>? _goAwayBarrier;
+  Future<void>? _goingAway;
   Status? _ownGoAway;
   Status? _peerGoAway;
   Status? _peerGoAwayReceived;
@@ -1043,7 +1047,9 @@ class QuicBindingConnection extends BindingConnection {
     if (idle != null && !idle.isCompleted) {
       idle.complete();
     }
-    if (_peerGoAway != null) {
+    if (_peerGoAway != null && !_goAwaySent) {
+      // A side that sent a GOAWAY of its own closes from [_goAwayWait],
+      // once its PING barrier is passed as well.
       _log.fine('$this: idle after the peer\'s GOAWAY, closing');
       unawaited(close());
     }
@@ -1141,42 +1147,67 @@ class QuicBindingConnection extends BindingConnection {
   // Ping, GOAWAY, close -------------------------------------------------------
 
   @override
-  Future<Duration> ping([Uint8List? payload]) {
-    final message = MuxControlMessage.ping(payload ?? _nextPingPayload());
+  Future<Duration> ping([Uint8List? payload]) =>
+      _startPing(MuxControlMessage.ping(payload ?? _nextPingPayload()))
+          .completer
+          .future;
+
+  /// Sends [message], a `PING`, and registers it with the pending ones:
+  /// with [MuxConnection.maxPendingPings] of them [counted] already, the
+  /// oldest pending ones fail until it fits. The `GOAWAY` barrier's `PING`
+  /// is not [counted]: it must not evict an application's `PING`, nor make
+  /// one go sooner (binding page, "GOAWAY and connection close"), and it
+  /// fails like any other once it is the oldest when one is evicted.
+  _PendingPing _startPing(MuxControlMessage message, {bool counted = true}) {
+    final pending = _PendingPing(
+      Uint8List.fromList(message.payload),
+      counted: counted,
+    );
     if (_closing) {
-      return Future.error(
+      pending.completer.completeError(
         SwitchboardException.of(
           StatusCode.failedPrecondition,
           'connection is closed',
         ),
       );
+      return pending;
     }
-    if (_pings.length >= MuxConnection.maxPendingPings) {
-      _pings
-          .removeAt(0)
-          .completer
-          .completeError(
-            SwitchboardException.of(
-              StatusCode.deadlineExceeded,
-              'no PONG before ${MuxConnection.maxPendingPings} later PINGs',
-            ),
-          );
+    if (counted) {
+      var pendingCounted = _pings.where((other) => other.counted).length;
+      while (pendingCounted >= MuxConnection.maxPendingPings) {
+        final oldest = _pings.removeAt(0);
+        if (oldest.counted) {
+          pendingCounted--;
+        }
+        oldest.completer.completeError(
+          SwitchboardException.of(
+            StatusCode.deadlineExceeded,
+            'no PONG before ${MuxConnection.maxPendingPings} later PINGs',
+          ),
+        );
+      }
     }
-    final pending = _PendingPing(Uint8List.fromList(message.payload));
     _pings.add(pending);
     _sendControl(message);
-    return pending.completer.future;
+    return pending;
   }
 
   Uint8List _nextPingPayload() {
-    final n = _pingCounter;
-    _pingCounter = (n + 1) & 0x7FFFFFFF;
-    return Uint8List.fromList([
-      n & 0xFF,
-      (n >> 8) & 0xFF,
-      (n >> 16) & 0xFF,
-      (n >> 24) & 0xFF,
-    ]);
+    while (true) {
+      final n = _pingCounter;
+      _pingCounter = (n + 1) & 0x7FFFFFFF;
+      final payload = Uint8List.fromList([
+        n & 0xFF,
+        (n >> 8) & 0xFF,
+        (n >> 16) & 0xFF,
+        (n >> 24) & 0xFF,
+      ]);
+      // An application's explicit payload may use the next counter value.
+      // In particular its PONG must not stand for the GOAWAY barrier's.
+      if (!_pings.any((pending) => _bytesEqual(pending.payload, payload))) {
+        return payload;
+      }
+    }
   }
 
   void _completePing(Uint8List payload) {
@@ -1190,6 +1221,31 @@ class QuicBindingConnection extends BindingConnection {
     }
   }
 
+  /// Sends `GOAWAY` with [status], and a `PING` right after it on the
+  /// control stream; refuses the peer's new channels (except a `_bulk`
+  /// channel for one that is open) and opens none; then [close]s once
+  /// both:
+  ///
+  /// * the channels are done (and the bulk payloads held for the drain),
+  ///   or [MuxOptions.goAwayGrace] passed;
+  /// * the `PING` barrier is passed (binding page, "GOAWAY and connection
+  ///   close"): the `GOAWAY` travels on the control stream, which stays
+  ///   open, so the acknowledgement [close] waits for does not cover it.
+  ///   The `PONG` of that `PING` says the peer read the record; the peer's
+  ///   own close (a peer with no channels left closes on reading it, and
+  ///   its `PONG` may be lost with the close), or any other end of the
+  ///   connection, ends the wait too, and so does
+  ///   [MuxOptions.closeConfirmTimeout] after the `GOAWAY` (none when
+  ///   zero); a `PONG` after that is ignored. A `GOAWAY` from the peer
+  ///   alone does not end it: the peer is still there. The `PING`'s own
+  ///   failure ends it too: an ordinary `PING` of [ping]'s bookkeeping, it
+  ///   fails like any other once it is the oldest when a later `PING`
+  ///   evicts, but it does not count toward
+  ///   [MuxConnection.maxPendingPings] itself, so that it evicts no
+  ///   application `PING`.
+  ///
+  /// Both run at once, so the barrier normally costs nothing. Calling it
+  /// again sends nothing more and waits for the same. Never fails.
   @override
   Future<void> goAway([Status status = const Status(33)]) {
     checkMuxStatus(status);
@@ -1201,18 +1257,63 @@ class QuicBindingConnection extends BindingConnection {
       _ownGoAway = status;
       _log.fine('$this: sending GOAWAY $status');
       _sendControl(MuxControlMessage.goAway(statusForWire(status)));
+      _goAwayBarrier = _pingBarrier();
     }
-    return _goAwayWait();
+    return _goingAway ??= _goAwayWait();
+  }
+
+  /// A `PING` sent now through the ordinary [ping] bookkeeping: completes
+  /// once its `PONG` arrived,
+  /// the `PING` failed (at once when the connection is closing, or with
+  /// the connection's end), the connection ended, or
+  /// [MuxOptions.closeConfirmTimeout] passed. Never fails.
+  Future<void> _pingBarrier() async {
+    final pending = _startPing(
+      MuxControlMessage.ping(_nextPingPayload()),
+      counted: false,
+    );
+    // Ordinary ping bookkeeping fails the PING on every connection end.
+    final answered = pending.completer.future.then<void>(
+      (_) {},
+      onError: (Object _) {},
+    );
+    final bound = options.closeConfirmTimeout;
+    try {
+      if (bound <= Duration.zero) {
+        await answered;
+      } else {
+        await answered.timeout(
+          bound,
+          onTimeout: () {
+            _log.fine('$this: no PONG after GOAWAY within $bound');
+          },
+        );
+      }
+    } finally {
+      // The drain may still run after the bound. Retire this PING now so
+      // a late PONG is ignored and it consumes no pending-ping slot.
+      if (_pings.remove(pending)) {
+        pending.completer.completeError(
+          SwitchboardException.of(StatusCode.deadlineExceeded),
+        );
+      }
+    }
   }
 
   Future<void> _goAwayWait() async {
+    final elapsed = Stopwatch()..start();
     // Let channel stream listeners register their pending bulk work.
     await Future<void>.delayed(Duration.zero);
+    await _goAwayBarrier;
+    // Work can arrive while the barrier waits, even after an earlier idle
+    // check. Inspect the current drain, with its original deadline.
+    final remaining = options.goAwayGrace - elapsed.elapsed;
     if ((_channels.isNotEmpty || hasDrainHolds || _pendingStreams.isNotEmpty) &&
-        !_closing) {
+        !_closing &&
+        remaining > Duration.zero) {
       final idle = _idle ??= Completer<void>();
       await idle.future.timeout(
-        options.goAwayGrace,
+        remaining,
         onTimeout: () {
           _log.fine(
             '$this: GOAWAY grace expired with ${_channels.length} channels',
@@ -1223,12 +1324,13 @@ class QuicBindingConnection extends BindingConnection {
     await close();
   }
 
-  /// Closes the session: an application close with code 0 (or the status
-  /// of this side's GOAWAY when it was not `GOING_AWAY`), once what this
-  /// side finished writing on its streams has been acknowledged, within
-  /// [MuxOptions.keepAliveTimeout]. The channels still open end with
-  /// `CONNECTION_LOST`, or the GOAWAY status if either side sent one.
-  /// Never throws.
+  /// Closes the session now: an application close with code 0 (or the
+  /// status of this side's GOAWAY when it was not `GOING_AWAY`), once what
+  /// this side finished writing on its streams has been acknowledged,
+  /// within [MuxOptions.keepAliveTimeout]. It sends no `GOAWAY` and waits
+  /// for no `PONG`, also after a [goAway], whose wait it ends. The
+  /// channels still open end with `CONNECTION_LOST`, or the GOAWAY status
+  /// if either side sent one. Never throws.
   @override
   Future<void> close() {
     final own = _ownGoAway;
@@ -1259,9 +1361,12 @@ class QuicBindingConnection extends BindingConnection {
   void _protocolError(String reason) =>
       _fail(Status.of(StatusCode.protocolError, reason));
 
-  /// How long a reset or `STOP_SENDING` without an application code on the
-  /// control stream of a WebTransport session waits for the session's end
-  /// before it counts as a protocol error.
+  /// How long a reset or `STOP_SENDING` without an application code over a
+  /// WebTransport session (the `WT_SESSION_GONE` of a peer ending the
+  /// session, which can arrive before the session's close) waits for the
+  /// session's end: on the control stream before it counts as a protocol
+  /// error, on a channel before it counts as the peer's close, `UNKNOWN`
+  /// ([QuicChannel], binding page "Closing"). One grace for both.
   static const Duration webTransportSessionGoneGrace = Duration(seconds: 2);
 
   /// The peer reset or stopped the control stream, which is a protocol
@@ -1865,11 +1970,14 @@ class QuicBindingConnection extends BindingConnection {
 }
 
 class _PendingPing {
-  _PendingPing(this.payload) {
+  _PendingPing(this.payload, {required this.counted}) {
     completer.future.ignore();
   }
 
   final Uint8List payload;
+  // Whether it counts toward MuxConnection.maxPendingPings: every PING but
+  // the GOAWAY barrier's.
+  final bool counted;
   final Completer<Duration> completer = Completer<Duration>();
   final Stopwatch stopwatch = Stopwatch()..start();
 }

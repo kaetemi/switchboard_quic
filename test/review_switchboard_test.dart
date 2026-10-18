@@ -25,6 +25,61 @@ import 'harness.dart';
 import 'memory_provider.dart';
 
 void main() {
+  test('a proxy waits for a held far side and forwards GOING_AWAY', () async {
+    final (front, raw) = await bindingAndRaw(isWebTransport: true);
+    final arriving = front.incoming.first;
+    final stream =
+        await raw.openRaw(encodeOpenRecord(2, const [])) as MemoryQuicStream;
+    final source = await arriving;
+    final (back, destination) = await connectionPair();
+    final receiving = destination.incoming.first;
+    final target = back.open(Uint8List(0));
+    final remote = await receiving;
+    remote.stream.listen((_) {});
+    final piping = pipeChannels(source, target);
+    stream.resetWithoutCode();
+    await settle(100);
+    expect(source.state, MuxChannelState.open);
+    expect(target.state, MuxChannelState.open);
+    expect(remote.state, MuxChannelState.open);
+    await raw.session.close(0, '');
+    await piping.timeout(limit);
+    expect(await remote.done.timeout(limit), hasCode(StatusCode.goingAway));
+    expect(back.isOpen, isTrue);
+  });
+
+  test(
+    'a channel in the identity hold ends with its WebTransport session',
+    () async {
+      final server = Switchboard(muxOptions: fast);
+      addTearDown(server.close);
+      var checked = false;
+      var dispatched = false;
+      final service = Name('held');
+      server.registerService(service, (_) => dispatched = true);
+      final (connection, raw) = await bindingAndRaw(isWebTransport: true);
+      await server.adopt(
+        connection,
+        policy: (address, connection) {
+          checked = true;
+          throw SwitchboardException.of(StatusCode.unauthenticated);
+        },
+      );
+      final stream = await raw.openRaw(
+        encodeOpenRecord(2, ChannelAddress(type: service).encode()),
+      ) as MemoryQuicStream;
+      await until(() => checked);
+      final channel = connection.channelWithId(2)!;
+      stream.resetWithoutCode();
+      await settle(100);
+      expect(channel.state, MuxChannelState.open);
+      expect(dispatched, isFalse);
+      await raw.session.close(0, '');
+      expect(await channel.done.timeout(limit), hasCode(StatusCode.goingAway));
+      expect(dispatched, isFalse);
+    },
+  );
+
   final echo = Name('echo');
   Switchboard node() {
     final server = Switchboard(muxOptions: fast);

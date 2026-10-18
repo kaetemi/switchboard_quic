@@ -295,3 +295,67 @@ Authors:
   itself, so that a failing listener is a failure; and
   `refusals_carry_their_status` gives its listener 2 s instead of 300 ms
   (it timed out under qemu), still below the client's 5 s.
+* Two races at the end of a session, found by the TypeScript port's
+  interop runs and fixed in both implementations as the binding page now
+  specifies ("GOAWAY and connection close", "Closing", "Errors", "Status
+  codes on streams and connections", "Ordering"):
+  * The `GOAWAY` record travels on the control stream, which stays open,
+    so the acknowledgement a graceful close waits for did not cover it:
+    with no channel open, `goAway()` closed at once, and the session's
+    close could overtake the record (the peer read the close's code 0
+    instead of the `GOAWAY`'s status, and `CONNECTION_LOST` where the close
+    was lost too). `goAway()` now sends a `PING` right after the record
+    and closes once the channels are done (or `goAwayGrace` passed) and
+    the `PING` barrier is passed: its `PONG` arrived, the `PING` failed,
+    the peer's close or any other end of the connection came, or
+    `MuxOptions.closeConfirmTimeout` passed since the `GOAWAY` (none when
+    zero; a later `PONG` is ignored). Both run at once, and work that
+    arrives while the barrier waits (a channel, an OPEN being read, a
+    drain hold) is drained too, within the same grace. The barrier's
+    `PING` is an ordinary one: its payload comes from the counter that
+    keep-alive uses, which now skips the payloads of pending `PING`s; it
+    fails as the oldest when later `PING`s evict one, and leaves the
+    pending `PING`s at once when its bound passes; it does not count
+    toward `MuxConnection.maxPendingPings`, so that it evicts no
+    application `PING`. A failure close and `close()` wait for no `PONG`;
+    repeated `goAway()` calls share one wait; a side that sent `GOAWAY`
+    and is idle after the peer's `GOAWAY` closes through the same barrier.
+  * Over WebTransport, a channel that reads a reset or `STOP_SENDING`
+    without an application code (the `WT_SESSION_GONE` with which a peer
+    ending its session resets and stops its streams, which can arrive
+    before the session's close) no longer ends `UNKNOWN` at once: it holds
+    it for `QuicBindingConnection.webTransportSessionGoneGrace` (2 s, now
+    the one constant of the control stream's grace and the channels'),
+    delivers nothing more and sends nothing in answer (no close in turn;
+    a close the application makes meanwhile is written as usual). A held
+    reset ends the incoming direction and discards the records not yet
+    delivered, a partial one included; a held `STOP_SENDING` pauses
+    delivery and every further read from the stack, within a record too.
+    The session's end within the grace ends the channel as the
+    connection's channels end (`GOING_AWAY` after a graceful close, the
+    connection's end status otherwise), dropping what the hold kept back;
+    after it, the hold is the peer's close, `UNKNOWN`, taken as any reset
+    or `STOP_SENDING` (after a `STOP_SENDING`, delivery and reading
+    resume). A close confirmation timeout that expires during the hold is
+    applied only once the session has outlived the grace. A reset after
+    this side's `STOP_SENDING` is its confirmation, and is not held; raw
+    QUIC is unchanged.
+  * Tests: over the memory provider, where both races are deterministic
+    (the `PONG` withheld, the peer's close, the bound, a failure close,
+    the drain and the barrier together, work arriving during the barrier,
+    a zero grace, a `GOAWAY` from both sides, keep-alive, the payloads and
+    the eviction of pending `PING`s; held resets and `STOP_SENDING`s
+    ending with the session's close, another end, or after the grace,
+    held data and credit, read, write and FIN failures, short and
+    unbounded confirmation timeouts, the confirmation not held, raw QUIC
+    unchanged, held Talk parents and bulk streams, a channel in the
+    identity hold, a proxied channel; no timer left behind by any end of
+    the barrier or of a hold); over the native provider, rounds from
+    either side of a `GOAWAY` without channels and of a close with
+    channels open, in both modes (the first failed over both on the
+    previous code, mostly in its first rounds, the second about once in
+    forty WebTransport rounds); in the browser, the node's close with
+    channels open; in `tool/native_smoke.dart`, which `tool/aot_smoke.sh`
+    builds, the bindings now end with a `GOAWAY`, without channels over
+    raw QUIC (its reason must reach the peer) and over a channel left open
+    over WebTransport (the far side's channel must end `GOING_AWAY`).
