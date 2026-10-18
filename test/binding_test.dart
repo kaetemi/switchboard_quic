@@ -8,7 +8,7 @@ Authors:
   GPT-6 Astra <noreply@openai.com>
 */
 
-// QuicBindingConnection and QuicChannel over the fake provider: channel
+// QuicBindingConnection and QuicChannel over the memory provider: channel
 // ids, records, the close handshake (CLOSE records, resets, STOP_SENDING,
 // the confirmation timeout), flow control, priorities, openAfter, GOAWAY
 // and the ends of the connection, keep-alive, the resource limits of the
@@ -21,8 +21,8 @@ import 'package:switchboard/core.dart';
 import 'package:switchboard_quic/core.dart';
 import 'package:test/test.dart';
 
-import 'fake_provider.dart';
 import 'harness.dart';
+import 'memory_provider.dart';
 import 'review_cases.dart';
 
 /// Every channel of [connection] delivered to [into].
@@ -427,7 +427,7 @@ void main() {
       // ends the channel here too, not this side's own timeout (5 s).
       final (connection, raw) = await bindingAndRaw(
         bindingIsInitiator: true,
-        rawEnd: const FakeEndConfig(streamWindow: 1000),
+        rawEnd: const MemoryQuicEndConfig(streamWindow: 1000),
       );
       final channel = connection.open(Uint8List(0));
       channel.stream.listen((_) {});
@@ -452,7 +452,7 @@ void main() {
         options: fast.copyWith(
           closeConfirmTimeout: const Duration(milliseconds: 150),
         ),
-        rawEnd: const FakeEndConfig(streamWindow: 1000),
+        rawEnd: const MemoryQuicEndConfig(streamWindow: 1000),
       );
       final channel = connection.open(Uint8List(0));
       final sending = channel.send(pattern(5000));
@@ -474,7 +474,7 @@ void main() {
           options: fast.copyWith(
             closeConfirmTimeout: const Duration(milliseconds: 150),
           ),
-          rawEnd: const FakeEndConfig(streamWindow: 1000),
+          rawEnd: const MemoryQuicEndConfig(streamWindow: 1000),
         );
         final channel = connection.open(Uint8List(0));
         unawaited(channel.send(pattern(5000)).catchError((Object _) {}));
@@ -604,7 +604,7 @@ void main() {
   group('openAfter', () {
     test('the child stream opens once what the parent was given before was '
         'taken, and may reach the peer first', () async {
-      final network = FakeQuicNetwork(
+      final network = MemoryQuicNetwork(
         delay: (info, {required fromInitiator}) =>
             Duration(milliseconds: info.ordinal == 1 ? 80 : 0),
       );
@@ -626,7 +626,7 @@ void main() {
         'opened: CANCELLED', () async {
       final (connection, raw) = await bindingAndRaw(
         bindingIsInitiator: true,
-        rawEnd: const FakeEndConfig(streamWindow: 1000),
+        rawEnd: const MemoryQuicEndConfig(streamWindow: 1000),
       );
       final parent = connection.open(Uint8List(0));
       unawaited(parent.send(pattern(5000)).catchError((Object _) {}));
@@ -776,7 +776,7 @@ void main() {
 
     test('close waits for the FIN of a channel still waiting for the peer\'s '
         'close', () async {
-      final network = FakeQuicNetwork(
+      final network = MemoryQuicNetwork(
         delay: (info, {required fromInitiator}) =>
             Duration(milliseconds: info.ordinal == 1 ? 60 : 0),
       );
@@ -794,7 +794,7 @@ void main() {
 
     test('close waits for the CLOSE records this side wrote to be '
         'acknowledged', () async {
-      final network = FakeQuicNetwork(
+      final network = MemoryQuicNetwork(
         delay: (info, {required fromInitiator}) =>
             Duration(milliseconds: info.ordinal == 1 ? 60 : 0),
       );
@@ -861,7 +861,7 @@ void main() {
         'the connection as the close says', () async {
       final (connection, raw) = await bindingAndRaw(isWebTransport: true);
       await until(() => connection.peerHello != null);
-      (raw.control! as FakeQuicStream).resetWithoutCode();
+      (raw.control! as MemoryQuicStream).resetWithoutCode();
       await settle(100);
       expect(connection.isOpen, isTrue);
       await raw.session.close(StatusCode.unavailable.code, 'upgrade');
@@ -882,7 +882,7 @@ void main() {
       final (connection, raw) = await bindingAndRaw(isWebTransport: true);
       await until(() => connection.peerHello != null);
       final watch = Stopwatch()..start();
-      (raw.control! as FakeQuicStream).stopWithoutCode();
+      (raw.control! as MemoryQuicStream).stopWithoutCode();
       expect(
         await connection.done.timeout(const Duration(seconds: 10)),
         hasCode(StatusCode.protocolError),
@@ -911,8 +911,8 @@ void main() {
         'backs up', () async {
       final (connection, raw) = await bindingAndRaw(
         quicOptions: const QuicBindingOptions(controlOutputMark: 200),
-        rawEnd: const FakeEndConfig(streamWindow: 2000),
-        bindingEnd: const FakeEndConfig(streamWindow: 4000),
+        rawEnd: const MemoryQuicEndConfig(streamWindow: 2000),
+        bindingEnd: const MemoryQuicEndConfig(streamWindow: 4000),
       );
       // The raw peer sends PINGs and reads nothing: PONGs fill its window,
       // then the binding's output queue, then the binding stops reading.
@@ -1001,7 +1001,7 @@ void main() {
         'control stream, within maxChannels', () async {
       final (a, b) = await connectionPair(
         initiator: fast.copyWith(maxChannels: 50),
-        acceptorEnd: const FakeEndConfig(maxStreams: 11),
+        acceptorEnd: const MemoryQuicEndConfig(maxStreams: 11),
       );
       await until(() => a.peerHello != null && b.peerHello != null);
       expect(a.peerMaxChannels, 10);
@@ -1012,7 +1012,7 @@ void main() {
         'RESOURCE_EXHAUSTED', () async {
       final (connection, _) = await bindingAndRaw(
         bindingIsInitiator: true,
-        rawEnd: const FakeEndConfig(maxStreams: 2),
+        rawEnd: const MemoryQuicEndConfig(maxStreams: 2),
         quicOptions: const QuicBindingOptions(
           openStreamTimeout: Duration(milliseconds: 100),
         ),
@@ -1052,7 +1052,7 @@ void main() {
 
   group('identity', () {
     /// The exporter of [session].
-    Future<Uint8List> exporterOf(FakeQuicSession session) async =>
+    Future<Uint8List> exporterOf(MemoryQuicSession session) async =>
         (await session.exportKeyingMaterial(
           rawQuicExporterLabel,
           Uint8List(0),
@@ -1082,7 +1082,7 @@ void main() {
     test('the exporter: RFC 9266\'s label on raw QUIC, the application '
         'label over WebTransport', () async {
       for (final webTransport in [false, true]) {
-        final (a, b) = FakeQuicSession.pair();
+        final (a, b) = MemoryQuicSession.pair();
         final starting = QuicBindingConnection.start(
           b,
           options: fast,
@@ -1105,7 +1105,7 @@ void main() {
       // A stack without one announces none.
       final (connection, raw) = await bindingAndRaw(
         bindingIsInitiator: true,
-        bindingEnd: const FakeEndConfig(exporter: false),
+        bindingEnd: const MemoryQuicEndConfig(exporter: false),
         rawHello: QuicHello(exporter: true),
       );
       expect(connection.hasExporter, isFalse);
@@ -1342,7 +1342,7 @@ void main() {
 
     test('an initiator awaiting the acceptor\'s identity without a verifier '
         'could never use the connection: it closes at once', () async {
-      final (a, _) = FakeQuicSession.pair();
+      final (a, _) = MemoryQuicSession.pair();
       final connection = await QuicBindingConnection.start(
         a,
         options: fast,

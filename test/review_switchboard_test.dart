@@ -21,8 +21,8 @@ import 'package:switchboard/switchboard.dart';
 import 'package:switchboard_quic/switchboard_quic.dart';
 import 'package:test/test.dart';
 
-import 'fake_provider.dart';
 import 'harness.dart';
+import 'memory_provider.dart';
 
 void main() {
   final echo = Name('echo');
@@ -68,10 +68,10 @@ void main() {
     'closing the listener during exporter setup prevents adoption',
     () async {
       final server = node();
-      final network = FakeQuicNetwork();
+      final network = MemoryQuicNetwork();
       final provider = network.listen(Uri.parse('quic://listener:4433'));
       final listener = await QuicSwitchboardListener.start(server, provider);
-      final (a, b) = FakeQuicSession.pair();
+      final (a, b) = MemoryQuicSession.pair();
       b.exporterGate = Completer<void>();
       provider.acceptSession(b);
       await until(() => b.exporterLabels.isNotEmpty);
@@ -123,7 +123,7 @@ void main() {
       final accepted = <QuicBindingConnection>[];
       final client = ReconnectingClient.connections(
         (options) async {
-          final (a, b) = FakeQuicSession.pair();
+          final (a, b) = MemoryQuicSession.pair();
           final remote = await QuicBindingConnection.start(b, options: fast);
           final local = await QuicBindingConnection.start(a, options: options);
           accepted.add(remote);
@@ -144,7 +144,7 @@ void main() {
         (await ready.single.request('ECHO', bytes('one'))).payload,
         bytes('one'),
       );
-      (accepted.single.session as FakeQuicSession).lose();
+      (accepted.single.session as MemoryQuicSession).lose();
       await until(() => ready.length == 2);
       expect(accepted, hasLength(2));
       expect(

@@ -22,8 +22,8 @@ import 'package:switchboard/core.dart';
 import 'package:switchboard_quic/core.dart';
 import 'package:test/test.dart';
 
-import 'fake_provider.dart';
 import 'harness.dart';
+import 'memory_provider.dart';
 
 /// C1 of the page "Polyverse Switchboard Test Vectors".
 const c1 =
@@ -585,8 +585,8 @@ void main() {
 
     test('both ends of a session derive the same exporter, two sessions '
         'different ones', () async {
-      final (a, b) = FakeQuicSession.pair();
-      final (c, _) = FakeQuicSession.pair();
+      final (a, b) = MemoryQuicSession.pair();
+      final (c, _) = MemoryQuicSession.pair();
       final x = await a.exportKeyingMaterial(
         rawQuicExporterLabel,
         Uint8List(0),

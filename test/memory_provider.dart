@@ -27,8 +27,8 @@ import 'dart:typed_data';
 import 'package:switchboard_quic/core.dart';
 
 /// What the delay of a stream direction is chosen by.
-class FakeStreamInfo {
-  FakeStreamInfo(this.ordinal, {required this.openedByInitiator});
+class MemoryQuicStreamInfo {
+  MemoryQuicStreamInfo(this.ordinal, {required this.openedByInitiator});
 
   /// The stream's place among the session's streams, in the order they
   /// were opened (by either side), from 0.
@@ -40,17 +40,17 @@ class FakeStreamInfo {
 
 /// The delivery delay of a stream's records, per direction:
 /// [fromInitiator] is the direction the initiator writes.
-typedef FakeDelay = Duration Function(
-  FakeStreamInfo stream, {
+typedef MemoryQuicDelay = Duration Function(
+  MemoryQuicStreamInfo stream, {
   required bool fromInitiator,
 });
 
-Duration noDelay(FakeStreamInfo stream, {required bool fromInitiator}) =>
+Duration noDelay(MemoryQuicStreamInfo stream, {required bool fromInitiator}) =>
     Duration.zero;
 
 /// One end's configuration: what it grants its peer, and what it can do.
-class FakeEndConfig {
-  const FakeEndConfig({
+class MemoryQuicEndConfig {
+  const MemoryQuicEndConfig({
     this.exporter = true,
     this.streamWindow = 64 * 1024,
     this.connectionWindow = 16 << 20,
@@ -73,12 +73,12 @@ class FakeEndConfig {
   /// The hash of this end's certificate (servers).
   final Uint8List? certificateHash;
 
-  FakeEndConfig copyWith({
+  MemoryQuicEndConfig copyWith({
     bool? exporter,
     int? streamWindow,
     int? connectionWindow,
     int? maxStreams,
-  }) => FakeEndConfig(
+  }) => MemoryQuicEndConfig(
     exporter: exporter ?? this.exporter,
     streamWindow: streamWindow ?? this.streamWindow,
     connectionWindow: connectionWindow ?? this.connectionWindow,
@@ -88,30 +88,30 @@ class FakeEndConfig {
 }
 
 /// Listeners by endpoint, and the connectors that reach them.
-class FakeQuicNetwork {
-  FakeQuicNetwork({this.delay = noDelay, this.closeDelay = Duration.zero});
+class MemoryQuicNetwork {
+  MemoryQuicNetwork({this.delay = noDelay, this.closeDelay = Duration.zero});
 
   /// The delay of the stream directions of every session.
-  FakeDelay delay;
+  MemoryQuicDelay delay;
 
   /// How long an application close takes to reach the peer.
   Duration closeDelay;
 
-  final Map<String, FakeQuicListener> _listeners = {};
+  final Map<String, MemoryQuicListener> _listeners = {};
 
   /// Every session pair created, initiator first.
-  final List<(FakeQuicSession, FakeQuicSession)> pairs = [];
+  final List<(MemoryQuicSession, MemoryQuicSession)> pairs = [];
 
   static String _key(Uri endpoint) =>
       '${endpoint.scheme.toLowerCase()}://${endpoint.host.toLowerCase()}:'
       '${endpoint.port}';
 
   /// A listener at [endpoint] whose sessions grant what [config] says.
-  FakeQuicListener listen(
+  MemoryQuicListener listen(
     Uri endpoint, {
-    FakeEndConfig config = const FakeEndConfig(),
+    MemoryQuicEndConfig config = const MemoryQuicEndConfig(),
   }) {
-    final listener = FakeQuicListener._(this, endpoint, config);
+    final listener = MemoryQuicListener._(this, endpoint, config);
     _listeners[_key(endpoint)] = listener;
     return listener;
   }
@@ -119,17 +119,17 @@ class FakeQuicNetwork {
   /// A connector whose sessions are configured by [config] beyond what
   /// [QuicClientConfig] says. It dials `quic` endpoints, and `https` ones
   /// with [webTransport].
-  FakeQuicConnector connector({
-    FakeEndConfig config = const FakeEndConfig(),
+  MemoryQuicConnector connector({
+    MemoryQuicEndConfig config = const MemoryQuicEndConfig(),
     bool webTransport = false,
-  }) => FakeQuicConnector._(this, config, webTransport);
+  }) => MemoryQuicConnector._(this, config, webTransport);
 }
 
-class FakeQuicConnector implements QuicConnector {
-  FakeQuicConnector._(this.network, this.config, this.webTransport);
+class MemoryQuicConnector implements QuicConnector {
+  MemoryQuicConnector._(this.network, this.config, this.webTransport);
 
-  final FakeQuicNetwork network;
-  final FakeEndConfig config;
+  final MemoryQuicNetwork network;
+  final MemoryQuicEndConfig config;
   final bool webTransport;
 
   /// The configurations the binding asked for, in order.
@@ -157,10 +157,10 @@ class FakeQuicConnector implements QuicConnector {
     if (scheme != 'quic' && !(webTransport && scheme == 'https')) {
       throw QuicException(
         QuicExceptionKind.unsupportedScheme,
-        'the fake provider does not dial $scheme',
+        'the memory provider does not dial $scheme',
       );
     }
-    final listener = network._listeners[FakeQuicNetwork._key(endpoint)];
+    final listener = network._listeners[MemoryQuicNetwork._key(endpoint)];
     if (listener == null || listener._closed) {
       throw QuicException(
         QuicExceptionKind.unreachable,
@@ -176,7 +176,7 @@ class FakeQuicConnector implements QuicConnector {
         'the certificate is not pinned',
       );
     }
-    final (client, server) = FakeQuicSession.pair(
+    final (client, server) = MemoryQuicSession.pair(
       network: network,
       initiator: this.config.copyWith(
         streamWindow: config.streamReceiveWindow,
@@ -191,11 +191,11 @@ class FakeQuicConnector implements QuicConnector {
   }
 }
 
-class FakeQuicListener implements QuicListener {
-  FakeQuicListener._(this.network, this.endpoint, this.config);
+class MemoryQuicListener implements QuicListener {
+  MemoryQuicListener._(this.network, this.endpoint, this.config);
 
-  final FakeQuicNetwork network;
-  final FakeEndConfig config;
+  final MemoryQuicNetwork network;
+  final MemoryQuicEndConfig config;
   final StreamController<QuicSession> _sessions = StreamController();
 
   void acceptSession(QuicSession session) => _sessions.add(session);
@@ -210,14 +210,14 @@ class FakeQuicListener implements QuicListener {
   @override
   Future<void> close() async {
     _closed = true;
-    network._listeners.remove(FakeQuicNetwork._key(endpoint));
+    network._listeners.remove(MemoryQuicNetwork._key(endpoint));
     await _sessions.close();
   }
 }
 
-/// One end of a fake session.
-class FakeQuicSession implements QuicSession {
-  FakeQuicSession._(
+/// One end of a memory session.
+class MemoryQuicSession implements QuicSession {
+  MemoryQuicSession._(
     this.network,
     this.isInitiator,
     this.config,
@@ -228,18 +228,24 @@ class FakeQuicSession implements QuicSession {
   }
 
   /// A connected pair: the initiator's end and the acceptor's.
-  static (FakeQuicSession, FakeQuicSession) pair({
-    FakeQuicNetwork? network,
-    FakeEndConfig initiator = const FakeEndConfig(),
-    FakeEndConfig acceptor = const FakeEndConfig(),
+  static (MemoryQuicSession, MemoryQuicSession) pair({
+    MemoryQuicNetwork? network,
+    MemoryQuicEndConfig initiator = const MemoryQuicEndConfig(),
+    MemoryQuicEndConfig acceptor = const MemoryQuicEndConfig(),
     Uint8List? certificateHash,
   }) {
-    final net = network ?? FakeQuicNetwork();
+    final net = network ?? MemoryQuicNetwork();
     final secret = Uint8List.fromList(
       List.generate(32, (_) => _random.nextInt(256)),
     );
-    final a = FakeQuicSession._(net, true, initiator, secret, certificateHash);
-    final b = FakeQuicSession._(net, false, acceptor, secret, null);
+    final a = MemoryQuicSession._(
+      net,
+      true,
+      initiator,
+      secret,
+      certificateHash,
+    );
+    final b = MemoryQuicSession._(net, false, acceptor, secret, null);
     a.peer = b;
     b.peer = a;
     net.pairs.add((a, b));
@@ -248,18 +254,18 @@ class FakeQuicSession implements QuicSession {
 
   static final Random _random = Random(1234);
 
-  final FakeQuicNetwork network;
+  final MemoryQuicNetwork network;
 
   @override
   final bool isInitiator;
 
   /// What this end grants its peer.
-  final FakeEndConfig config;
+  final MemoryQuicEndConfig config;
 
   final Uint8List _secret;
   final Uint8List? _certificateHash;
 
-  late final FakeQuicSession peer;
+  late final MemoryQuicSession peer;
   late final StreamController<QuicStream> _incoming;
   final Completer<void> _draining = Completer<void>();
   final StreamController<QuicReceiveStream> _unidirectional =
@@ -276,8 +282,8 @@ class FakeQuicSession implements QuicSession {
     if (!peer._draining.isCompleted) peer._draining.complete();
   }
 
-  FakeReceiveStream openUnidirectional() {
-    final stream = FakeReceiveStream();
+  MemoryQuicReceiveStream openUnidirectional() {
+    final stream = MemoryQuicReceiveStream();
     peer._unidirectional.add(stream);
     return stream;
   }
@@ -287,7 +293,7 @@ class FakeQuicSession implements QuicSession {
   final Set<_Direction> _blocked = {};
 
   /// Streams of this end, opened by either side, in order.
-  final List<FakeQuicStream> streams = [];
+  final List<MemoryQuicStream> streams = [];
 
   /// The ordinals of the streams the peer opened, in the order they
   /// became visible here.
@@ -308,7 +314,7 @@ class FakeQuicSession implements QuicSession {
   String? get protocol => 'switchboard';
 
   @override
-  String get remote => isInitiator ? 'fake acceptor' : 'fake initiator';
+  String get remote => isInitiator ? 'memory acceptor' : 'memory initiator';
 
   @override
   int? get maxIncomingStreams => config.maxStreams;
@@ -382,10 +388,13 @@ class FakeQuicSession implements QuicSession {
       }
     }
     _openStreams++;
-    final info = FakeStreamInfo(_nextOrdinal(), openedByInitiator: isInitiator);
+    final info = MemoryQuicStreamInfo(
+      _nextOrdinal(),
+      openedByInitiator: isInitiator,
+    );
     final shared = _Shared(this);
-    final local = FakeQuicStream._(this, info, locallyOpened: true);
-    final remote = FakeQuicStream._(peer, info, locallyOpened: false);
+    final local = MemoryQuicStream._(this, info, locallyOpened: true);
+    final remote = MemoryQuicStream._(peer, info, locallyOpened: false);
     final out = _Direction(this, peer, info, local, remote, shared);
     final back = _Direction(peer, this, info, remote, local, shared);
     local
@@ -406,7 +415,7 @@ class FakeQuicSession implements QuicSession {
 
   /// The peer's stream became visible to it (its first bytes, FIN or
   /// reset arrived).
-  void _announce(FakeQuicStream stream) {
+  void _announce(MemoryQuicStream stream) {
     if (stream._announced || ended) {
       return;
     }
@@ -474,7 +483,7 @@ class FakeQuicSession implements QuicSession {
 
   @override
   String toString() =>
-      'FakeQuicSession(${isInitiator ? 'initiator' : 'acceptor'})';
+      'MemoryQuicSession(${isInitiator ? 'initiator' : 'acceptor'})';
 }
 
 /// What the two directions of a stream share: the opener's stream credit
@@ -482,7 +491,7 @@ class FakeQuicSession implements QuicSession {
 class _Shared {
   _Shared(this.opener);
 
-  final FakeQuicSession opener;
+  final MemoryQuicSession opener;
   int closed = 0;
 
   void directionClosed() {
@@ -507,11 +516,11 @@ class _Direction {
   }
 
   final _Shared shared;
-  final FakeQuicSession from;
-  final FakeQuicSession to;
-  final FakeStreamInfo info;
-  final FakeQuicStream sender;
-  final FakeQuicStream receiver;
+  final MemoryQuicSession from;
+  final MemoryQuicSession to;
+  final MemoryQuicStreamInfo info;
+  final MemoryQuicStream sender;
+  final MemoryQuicStream receiver;
   final int window;
 
   static const QuicException _ended = QuicException(
@@ -919,12 +928,12 @@ class _Direction {
 }
 
 /// One end's view of a stream.
-class FakeQuicStream implements QuicStream {
-  FakeQuicStream._(this.session, this.info, {required this.locallyOpened})
+class MemoryQuicStream implements QuicStream {
+  MemoryQuicStream._(this.session, this.info, {required this.locallyOpened})
     : _announced = locallyOpened;
 
-  final FakeQuicSession session;
-  final FakeStreamInfo info;
+  final MemoryQuicSession session;
+  final MemoryQuicStreamInfo info;
   final bool locallyOpened;
   bool _announced;
   _Direction? _out;
@@ -990,7 +999,7 @@ class FakeQuicStream implements QuicStream {
 
   @override
   String toString() =>
-      'FakeQuicStream(#${info.ordinal}, '
+      'MemoryQuicStream(#${info.ordinal}, '
       '${locallyOpened ? 'local' : 'remote'})';
 }
 
@@ -1020,7 +1029,7 @@ String _truncate(String text, int max) {
 }
 
 /// A peer-created unidirectional receive direction.
-class FakeReceiveStream implements QuicReceiveStream {
+class MemoryQuicReceiveStream implements QuicReceiveStream {
   final Completer<int> stopped = Completer<int>();
   @override
   void stop(int code) {
