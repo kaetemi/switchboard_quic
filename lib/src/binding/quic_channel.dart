@@ -37,9 +37,12 @@ part of 'quic_binding_connection.dart';
 ///   arrive before the session's close) is held for the session's end, for
 ///   [QuicBindingConnection.webTransportSessionGoneGrace]: nothing more is
 ///   delivered meanwhile (after a reset the incoming direction has ended)
-///   and nothing is sent in answer. The session's end within it ends the
+///   and nothing is sent in answer. A reset discards queued records; a
+///   `STOP_SENDING` pauses their delivery and further provider reads,
+///   including reads within a record. The session's end within it ends the
 ///   channel as the connection's channels end; only once it passed is it
-///   the peer's close, `UNKNOWN`. A reset after this side's `STOP_SENDING`
+///   the peer's close, `UNKNOWN`. A pending confirmation timeout waits
+///   for that outcome too. A reset after this side's `STOP_SENDING`
 ///   is its confirmation, and is not held.
 /// * Flow control: the stack's stream window is the channel's window. The
 ///   binding reads the next record only once the layer above has taken
@@ -112,6 +115,7 @@ class QuicChannel extends MuxChannel {
   bool _sendEnded = false;
   bool _stopSent = false;
   Timer? _confirmTimer;
+  bool _confirmExpired = false;
   Timer? _openTimer;
   Completer<QuicStream?>? _openingResult;
   // Completes once this side's direction is acknowledged, or will never
@@ -738,6 +742,8 @@ class QuicChannel extends MuxChannel {
     }
     _stopSent = true;
     _stream?.stop(code);
+    _decideGone();
+    _signalConsumed();
   }
 
   /// Fails what waits to be sent, and never opens the channels of
@@ -894,7 +900,12 @@ class QuicChannel extends MuxChannel {
         return;
       }
       _goneReset = true;
+      // A reset may discard complete records too. Do not deliver a queued
+      // record after observing the codeless signal, even to a late listener.
+      _discard();
       _endIncoming();
+      _signalConsumed();
+      _decideGone();
     } else {
       _goneStop = true;
     }
@@ -918,6 +929,7 @@ class QuicChannel extends MuxChannel {
     final stop = _goneStop;
     _goneStop = false;
     _decideGone();
+    _scheduleDrain();
     if (_ended || connection._closing) {
       return;
     }
@@ -926,6 +938,10 @@ class QuicChannel extends MuxChannel {
     }
     if (reset) {
       _peerReset(null);
+    }
+    if (_confirmExpired) {
+      _confirmExpired = false;
+      _onConfirmTimeout();
     }
   }
 
@@ -960,7 +976,7 @@ class QuicChannel extends MuxChannel {
   /// the write of this side's CLOSE record behind what it sent.
   void _startConfirmTimer() {
     final timeout = connection.options.closeConfirmTimeout;
-    if (timeout <= Duration.zero || _confirmTimer != null) {
+    if (timeout <= Duration.zero || _confirmTimer != null || _confirmExpired) {
       return;
     }
     _confirmTimer = Timer(timeout, _onConfirmTimeout);
@@ -968,6 +984,13 @@ class QuicChannel extends MuxChannel {
 
   void _onConfirmTimeout() {
     _confirmTimer = null;
+    if (_goneTimer != null && !_stopSent) {
+      // The held signal may be the session's close. Do not turn a short
+      // confirmation timeout into a channel status before it is decided.
+      // If the session survives, apply the expired deadline immediately.
+      _confirmExpired = true;
+      return;
+    }
     final deadline = StatusCode.deadlineExceeded.code;
     if (_ended) {
       if (!_sendEnded) {
@@ -1008,7 +1031,11 @@ class QuicChannel extends MuxChannel {
   /// received (or stopped by this side's `STOP_SENDING`), this side's sent
   /// (or queued behind what it sent).
   void _checkEnd() {
-    if (!_ended && _sendEnded && _closeQueued && (_peerEnded || _stopSent)) {
+    if (!_ended &&
+        (_goneTimer == null || _stopSent) &&
+        _sendEnded &&
+        _closeQueued &&
+        (_peerEnded || _stopSent)) {
       _end();
     }
   }
@@ -1029,6 +1056,10 @@ class QuicChannel extends MuxChannel {
   }
 
   void _connectionLost(Status status) {
+    if (_goneTimer != null) {
+      // A held STOP_SENDING may have paused delivery with a record queued.
+      _discard();
+    }
     _noteStatus(status);
     _pendingClose = null;
     _sendEnded = true;
@@ -1049,6 +1080,7 @@ class QuicChannel extends MuxChannel {
       return;
     }
     _ended = true;
+    _confirmExpired = false;
     _goneTimer?.cancel();
     _goneTimer = null;
     _decideGone();
@@ -1078,19 +1110,40 @@ class QuicChannel extends MuxChannel {
 
   // Receiving -----------------------------------------------------------------
 
+  /// Pause between provider reads too: an already pending read may finish
+  /// during a hold, but must not pull the rest of its record from the stack.
+  Future<Uint8List?> _readChunk(int max) async {
+    while (_goneTimer != null && !_goneReset && !_ended && !_stopSent) {
+      await (_goneDecided ??= Completer<void>()).future;
+    }
+    // A CLOSE ends the channel before expectEnd has checked its FIN.
+    // Keep reading that FIN so the provider can release the stream credit.
+    if (connection._closing) {
+      throw const QuicException(
+        QuicExceptionKind.sessionEnded,
+        'channel ended',
+      );
+    }
+    if (_goneReset || _stopSent) {
+      throw const QuicStreamReset(null);
+    }
+    return _stream!.read(max);
+  }
+
   Future<void> _readLoop() async {
     final reader = _reader!;
     while (true) {
       while (!_ended &&
           !_peerEnded &&
           !_stopSent &&
+          !_goneReset &&
           _unconsumed > 0 &&
           _unconsumed >= _readAhead) {
         await (_consumedSignal ??= Completer<void>()).future;
       }
       // A STOP_SENDING without a code is held for the session's end:
       // nothing more is read until that is decided.
-      while (_goneTimer != null && !_goneReset && !_ended) {
+      while (_goneTimer != null && !_goneReset && !_ended && !_stopSent) {
         await (_goneDecided ??= Completer<void>()).future;
       }
       if (_peerEnded || _stopSent || _goneReset || connection._closing) {
@@ -1099,13 +1152,20 @@ class QuicChannel extends MuxChannel {
       QuicRecord? record;
       Object? failure;
       try {
-        record = await reader.next(limit: connection.recordLimit);
+        record = await reader.next(
+          limit: connection.recordLimit,
+          read: _readChunk,
+        );
       } on Object catch (e) {
         failure = e;
       }
       // A record read while a STOP_SENDING came to be held waits for the
       // decision; a failure (a reset, say) is taken now.
-      while (failure == null && _goneTimer != null && !_goneReset && !_ended) {
+      while (failure == null &&
+          _goneTimer != null &&
+          !_goneReset &&
+          !_ended &&
+          !_stopSent) {
         await (_goneDecided ??= Completer<void>()).future;
       }
       if (_stopSent || _peerEnded || _goneReset || connection._closing) {
@@ -1137,7 +1197,7 @@ class QuicChannel extends MuxChannel {
             return;
           }
           _onPeerCloseRecord(status);
-          final ending = reader.expectEnd();
+          final ending = reader.expectEnd(read: _readChunk);
           final timeout = connection.options.closeConfirmTimeout;
           // CLOSE ends the application channel, but its stream must not
           // keep a read and stream credit forever if FIN never follows.
@@ -1224,6 +1284,9 @@ class QuicChannel extends MuxChannel {
 
   void _drain() {
     _drainScheduled = false;
+    if (_goneTimer != null && !_goneReset) {
+      return;
+    }
     var delivered = false;
     while (_queue.isNotEmpty && _incoming.hasListener && !_incoming.isPaused) {
       final data = _queue.removeFirst();

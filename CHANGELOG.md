@@ -336,3 +336,15 @@ Authors:
     modes (the first failed over both on the previous code, mostly in its
     first rounds, the second about once in forty WebTransport rounds); in
     the browser, the node's close with channels open.
+  * Review fixes: the drain includes work that arrives while the barrier
+    waits, within the original grace; repeated `goAway()` calls share
+    that wait. Generated PING payloads avoid outstanding explicit
+    payloads, and a timed-out barrier releases its pending-PING entry
+    immediately, even while channels still drain. A held codeless reset
+    discards queued DATA, and a held STOP_SENDING pauses queued delivery
+    and every further provider read, including within a partial record;
+    the session's end discards that held data. A confirmation timeout
+    during the hold is applied only after the session outlives the grace.
+    Tests cover these cases,
+    credit, write/read/FIN failures, keep-alive, pending OPENs, and held
+    parent, bulk, identity and proxied channels.

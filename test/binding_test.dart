@@ -59,9 +59,11 @@ class OpenedChannel {
     List<int> data = const [],
     bool isWebTransport = true,
     int id = 2,
+    MuxOptions options = fast,
   }) async {
     final (connection, raw) = await bindingAndRaw(
       isWebTransport: isWebTransport,
+      options: options,
     );
     return _open(
       connection,
@@ -894,6 +896,141 @@ void main() {
   });
 
   group('the PING barrier after GOAWAY', () {
+    test(
+      'a second GOAWAY shares the wait and sends no second barrier',
+      () async {
+        final (connection, raw) = await bindingAndRaw(
+          options: fast.copyWith(closeConfirmTimeout: Duration.zero),
+        );
+        final going = connection.goAway();
+        final ping = await raw.nextControlOf(MuxControlType.ping.code);
+        expect(connection.goAway(), same(going));
+        final user = connection.ping(bytes('next'));
+        user.ignore();
+        expect((await raw.nextControl()).payload, bytes('next'));
+        await raw.sendControl(MuxControlMessage.pong(bytes('next')));
+        await user.timeout(limit);
+        expect(await completed(going), isFalse);
+        await raw.sendControl(MuxControlMessage.pong(ping.payload));
+        await going.timeout(limit);
+        await connection.goAway().timeout(limit);
+      },
+    );
+
+    test(
+      'keep-alive PONG is not the barrier; expiry ends an unbounded wait',
+      () async {
+        final (connection, raw) = await bindingAndRaw(
+          options: fast.copyWith(
+            closeConfirmTimeout: Duration.zero,
+            keepAliveInterval: const Duration(milliseconds: 100),
+            keepAliveTimeout: const Duration(seconds: 1),
+          ),
+        );
+        final going = connection.goAway();
+        final barrier = await raw.nextControlOf(MuxControlType.ping.code);
+        final probe = await raw.nextControlOf(MuxControlType.ping.code);
+        expect(probe.payload, isNot(barrier.payload));
+        await raw.sendControl(MuxControlMessage.pong(probe.payload));
+        await settle();
+        expect(await completed(going), isFalse);
+        await going.timeout(limit);
+        expect((await raw.end).code, StatusCode.deadlineExceeded.code);
+      },
+    );
+
+    test(
+      'a pending OPEN that arrives during the barrier is drained too',
+      () async {
+        final (connection, raw) = await bindingAndRaw(
+          options: fast.copyWith(goAwayGrace: const Duration(seconds: 5)),
+        );
+        final going = connection.goAway();
+        final ping = await raw.nextControlOf(MuxControlType.ping.code);
+        await settle();
+        final open = encodeOpenRecord(2, const []);
+        final stream = await raw.openRaw(open.sublist(0, 1));
+        await settle(50);
+        await raw.sendControl(MuxControlMessage.pong(ping.payload));
+        await settle(50);
+        expect(await completed(going), isFalse);
+        await stream.write(Uint8List.sublistView(open, 1));
+        final (records, _) = await RawPeer.drain(stream);
+        expect(
+          decodeCloseBody(records.single.body),
+          hasCode(StatusCode.goingAway),
+        );
+        await going.timeout(limit);
+      },
+    );
+
+    test(
+      'a drain hold added while the PONG is pending still delays close',
+      () async {
+        final (connection, raw) = await bindingAndRaw(
+          options: fast.copyWith(goAwayGrace: const Duration(seconds: 5)),
+        );
+        final going = connection.goAway();
+        final ping = await raw.nextControlOf(MuxControlType.ping.code);
+        await settle();
+        final hold = Completer<void>();
+        connection.retainForDrain(2, hold.future);
+        await raw.sendControl(MuxControlMessage.pong(ping.payload));
+        await settle(100);
+        expect(await completed(going), isFalse);
+        expect(raw.session.ended, isFalse);
+        hold.complete();
+        await going.timeout(limit);
+      },
+    );
+
+    test(
+      'the barrier payload differs from an outstanding explicit PING',
+      () async {
+        final (connection, raw) = await bindingAndRaw();
+        final user = connection.ping(Uint8List(4));
+        user.ignore();
+        final first = await raw.nextControlOf(MuxControlType.ping.code);
+        final going = connection.goAway();
+        final barrier = await raw.nextControlOf(MuxControlType.ping.code);
+        expect(barrier.payload, isNot(first.payload));
+        await raw.sendControl(MuxControlMessage.pong(first.payload));
+        await user.timeout(limit);
+        expect(await completed(going), isFalse);
+        await raw.sendControl(MuxControlMessage.pong(barrier.payload));
+        await going.timeout(limit);
+      },
+    );
+
+    test(
+      'an expired barrier leaves no pending PING while the drain continues',
+      () async {
+        final (connection, raw) = await bindingAndRaw(
+          options: fast.copyWith(
+            closeConfirmTimeout: const Duration(milliseconds: 100),
+            goAwayGrace: const Duration(seconds: 5),
+          ),
+        );
+        final hold = Completer<void>();
+        connection.retainForDrain(2, hold.future);
+        final user = connection.ping(bytes('user'));
+        user.ignore();
+        await raw.nextControlOf(MuxControlType.ping.code);
+        final going = connection.goAway();
+        final barrier = await raw.nextControlOf(MuxControlType.ping.code);
+        await settle(200);
+        for (var i = 0; i < MuxConnection.maxPendingPings - 1; i++) {
+          connection.ping(bytes('user $i')).ignore();
+        }
+        expect(await completed(user), isFalse);
+        await raw.sendControl(MuxControlMessage.pong(barrier.payload));
+        await raw.sendControl(MuxControlMessage.pong(bytes('user')));
+        await user.timeout(limit);
+        hold.complete();
+        await going.timeout(limit);
+      },
+    );
+
     test('with no channel open, the session closes only once the PONG of '
         'the PING sent right after the GOAWAY record is back', () async {
       final (connection, raw) = await bindingAndRaw();
@@ -1079,6 +1216,233 @@ void main() {
   });
 
   group('resets and STOP_SENDING without a code over WebTransport', () {
+    for (final reset in [true, false]) {
+      test('a short confirmation timeout waits for a held '
+          '${reset ? 'reset' : 'STOP_SENDING'}', () async {
+        final c = await OpenedChannel.start(
+          options: fast.copyWith(
+            closeConfirmTimeout: const Duration(milliseconds: 100),
+          ),
+        );
+        if (reset) {
+          c.rawStream.resetWithoutCode();
+        } else {
+          c.rawStream.stopWithoutCode();
+        }
+        await settle(50);
+        final closing = c.channel.close();
+        await settle(200);
+        expect(await completed(closing), isFalse);
+        final local = bindingEnd(c.connection, c.stream);
+        expect(local.stops, isEmpty);
+        expect(local.resets, isEmpty);
+        await c.raw.session.close(0, '');
+        await closing.timeout(limit);
+        expect(await c.channel.done, hasCode(StatusCode.goingAway));
+      });
+    }
+
+    test(
+      'an expired confirmation is applied once a STOP_SENDING hold expires',
+      () async {
+        final c = await OpenedChannel.start(
+          options: fast.copyWith(
+            closeConfirmTimeout: const Duration(milliseconds: 100),
+          ),
+        );
+        c.rawStream.stopWithoutCode();
+        await settle(50);
+        final watch = Stopwatch()..start();
+        await c.channel.close().timeout(limit);
+        expect(watch.elapsed, greaterThan(const Duration(seconds: 1)));
+        expect(await c.channel.done, hasCode(StatusCode.unknown));
+        expect(bindingEnd(c.connection, c.stream).stops, [
+          StatusCode.deadlineExceeded.code,
+        ]);
+      },
+    );
+
+    for (final heldParent in [true, false]) {
+      test('Talk waits for the session status with a held '
+          '${heldParent ? 'parent' : 'bulk stream'}', () async {
+        final (connection, raw) = await bindingAndRaw(isWebTransport: true);
+        final arrived = Completer<TalkChannel>();
+        connection.incoming.listen((channel) {
+          if (TalkBulkOpen.isBulk(ChannelAddress.decode(channel.openPayload))) {
+            TalkChannel.adoptBulk(channel);
+          } else {
+            arrived.complete(TalkChannel(channel));
+          }
+        });
+        final parent = await raw.openRaw(
+          encodeOpenRecord(2, ChannelAddress(type: Name('echo')).encode()),
+        ) as MemoryQuicStream;
+        final talk = await arrived.future.timeout(limit);
+        final response = talk.request('REQ', Uint8List(0));
+        response.ignore();
+        final request = await RecordReader(parent)
+            .next(limit: quicDefaultRecordLimit);
+        final requestId = TalkFrame.decode(request!.body).requestId;
+        await parent.write(
+          encodeDataRecord(
+            TalkFrame(
+              kind: TalkKind.message,
+              responseId: requestId,
+              payload: Uint8List(0),
+            ).withBulk(TalkBulkReference(1, length: 3)).encode(),
+          ),
+        );
+        final bulk = await raw.openRaw(
+          encodeOpenRecord(4, TalkBulkOpen(2, 1).encode()),
+        ) as MemoryQuicStream;
+        await until(() => connection.channelWithId(4) != null);
+        final held = connection.channelWithId(heldParent ? 2 : 4)!;
+        (heldParent ? parent : bulk).resetWithoutCode();
+        await settle(50);
+        expect(await completed(held.done), isFalse);
+        expect(await completed(response), isFalse);
+        await raw.session.close(0, '');
+        expect(await held.done.timeout(limit), hasCode(StatusCode.goingAway));
+        await expectLater(response, throwsCode(StatusCode.goingAway));
+      });
+    }
+
+    test(
+      'STOP_SENDING pauses provider reads inside a record until the grace',
+      () async {
+        final (connection, raw) = await bindingAndRaw(
+          isWebTransport: true,
+          bindingEnd: const MemoryQuicEndConfig(streamWindow: 32),
+        );
+        final arriving = nextChannel(connection);
+        final stream = await raw.openRaw(
+          encodeOpenRecord(2, const []),
+        ) as MemoryQuicStream;
+        final channel = await arriving;
+        final received = <Uint8List>[];
+        channel.stream.listen(received.add);
+        stream.stopWithoutCode();
+        await settle(50);
+        final writing = stream.write(encodeDataRecord(Uint8List(128)));
+        writing.ignore();
+        await settle(100);
+        expect(await completed(writing), isFalse);
+        expect(received, isEmpty);
+        await writing.timeout(limit);
+        await until(() => received.isNotEmpty);
+        expect(received.single, hasLength(128));
+        await stream.write(encodeCloseRecord(Status.ok));
+        await stream.finish();
+        expect(await channel.done.timeout(limit), hasCode(StatusCode.unknown));
+      },
+    );
+
+    test(
+      'a held reset after STOP_SENDING releases a paused record and credit',
+      () async {
+        final c = await OpenedChannel.start();
+        c.channel.manualCredit = true;
+        await c.stream.write(encodeDataRecord(bytes('first')));
+        await until(() => c.channel.heldBytes > 0);
+        c.rawStream.stopWithoutCode();
+        await settle(50);
+        c.channel.consumed(5);
+        await c.stream.write(encodeDataRecord(bytes('discarded')));
+        await settle(50);
+        c.rawStream.resetWithoutCode();
+        await c.incomingDone.future.timeout(limit);
+        expect(c.received.map(text), ['first']);
+        expect(c.channel.receiveWindow, 0);
+        c.channel.grant(0xFFFFFFFF);
+        expect(c.channel.receiveWindow, 0);
+        await c.raw.session.close(0, '');
+        expect(
+          await c.channel.done.timeout(limit),
+          hasCode(StatusCode.goingAway),
+        );
+        expect(c.channel.heldBytes, 0);
+      },
+    );
+
+    for (final path in ['read', 'write', 'FIN']) {
+      test('a codeless $path failure is held until the session ends', () async {
+        final c = await OpenedChannel.start();
+        final local = bindingEnd(c.connection, c.stream);
+        await settle();
+        switch (path) {
+          case 'read':
+            local.failRead(const QuicStreamReset(null));
+          case 'write':
+            local.writeFailure = const QuicStreamStopped(null);
+            await expectLater(
+              c.channel.send(bytes('x')),
+              throwsCode(StatusCode.failedPrecondition),
+            );
+          case 'FIN':
+            local.finishFailure = const QuicStreamStopped(null);
+            c.channel.close().ignore();
+        }
+        await settle(50);
+        expect(await completed(c.channel.done), isFalse);
+        expect(local.resets, isEmpty);
+        expect(local.stops, isEmpty);
+        await c.raw.session.close(0, '');
+        expect(
+          await c.channel.done.timeout(limit),
+          hasCode(StatusCode.goingAway),
+        );
+      });
+    }
+
+    test(
+      'an application failure close during a hold keeps its own status',
+      () async {
+        final c = await OpenedChannel.start();
+        c.rawStream.resetWithoutCode();
+        await c.incomingDone.future.timeout(limit);
+        final status = Status.of(StatusCode.cancelled, 'local');
+        await c.channel.close(status).timeout(limit);
+        expect(await c.channel.done, status);
+        expect(c.connection.isOpen, isTrue);
+        // The cancelled hold must not subsequently send UNKNOWN or end the session.
+        await settle(2100);
+        expect(await c.channel.done, status);
+        expect(bindingEnd(c.connection, c.stream).resets, isEmpty);
+        expect(c.connection.isOpen, isTrue);
+      },
+    );
+
+    for (final reset in [true, false]) {
+      test('buffered DATA is not delivered during a held '
+          '${reset ? 'reset' : 'STOP_SENDING'}', () async {
+        final (connection, raw) = await bindingAndRaw(isWebTransport: true);
+        final arriving = nextChannel(connection);
+        final stream = await raw.openRaw([
+          ...encodeOpenRecord(2, const []),
+          ...encodeDataRecord(bytes('buffered')),
+        ]) as MemoryQuicStream;
+        final channel = await arriving;
+        await until(() => channel.bufferedBytes > 0);
+        if (reset) {
+          stream.resetWithoutCode();
+        } else {
+          stream.stopWithoutCode();
+        }
+        await settle(50);
+        final received = <Uint8List>[];
+        channel.stream.listen(received.add);
+        await settle(50);
+        expect(received, isEmpty);
+        expect(await completed(channel.done), isFalse);
+        await raw.session.close(0, '');
+        expect(
+          await channel.done.timeout(limit),
+          hasCode(StatusCode.goingAway),
+        );
+        expect(received, isEmpty);
+      });
+    }
+
     test('a reset is held: nothing more is delivered, a partial record is '
         'discarded, nothing is sent; the session\'s graceful close within the '
         'grace ends the channel GOING_AWAY', () async {

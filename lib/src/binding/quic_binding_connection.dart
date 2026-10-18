@@ -247,6 +247,7 @@ class QuicBindingConnection extends BindingConnection {
   // The PING barrier after this side's GOAWAY: completes once the record is
   // known to be read, the connection ended, or the bound passed.
   Future<void>? _goAwayBarrier;
+  Future<void>? _goingAway;
   Status? _ownGoAway;
   Status? _peerGoAway;
   Status? _peerGoAwayReceived;
@@ -1146,15 +1147,21 @@ class QuicBindingConnection extends BindingConnection {
   // Ping, GOAWAY, close -------------------------------------------------------
 
   @override
-  Future<Duration> ping([Uint8List? payload]) {
-    final message = MuxControlMessage.ping(payload ?? _nextPingPayload());
+  Future<Duration> ping([Uint8List? payload]) =>
+      _startPing(MuxControlMessage.ping(payload ?? _nextPingPayload()))
+          .completer
+          .future;
+
+  _PendingPing _startPing(MuxControlMessage message) {
+    final pending = _PendingPing(Uint8List.fromList(message.payload));
     if (_closing) {
-      return Future.error(
+      pending.completer.completeError(
         SwitchboardException.of(
           StatusCode.failedPrecondition,
           'connection is closed',
         ),
       );
+      return pending;
     }
     if (_pings.length >= MuxConnection.maxPendingPings) {
       _pings
@@ -1167,21 +1174,27 @@ class QuicBindingConnection extends BindingConnection {
             ),
           );
     }
-    final pending = _PendingPing(Uint8List.fromList(message.payload));
     _pings.add(pending);
     _sendControl(message);
-    return pending.completer.future;
+    return pending;
   }
 
   Uint8List _nextPingPayload() {
-    final n = _pingCounter;
-    _pingCounter = (n + 1) & 0x7FFFFFFF;
-    return Uint8List.fromList([
-      n & 0xFF,
-      (n >> 8) & 0xFF,
-      (n >> 16) & 0xFF,
-      (n >> 24) & 0xFF,
-    ]);
+    while (true) {
+      final n = _pingCounter;
+      _pingCounter = (n + 1) & 0x7FFFFFFF;
+      final payload = Uint8List.fromList([
+        n & 0xFF,
+        (n >> 8) & 0xFF,
+        (n >> 16) & 0xFF,
+        (n >> 24) & 0xFF,
+      ]);
+      // An application's explicit payload may use the next counter value.
+      // In particular its PONG must not stand for the GOAWAY barrier's.
+      if (!_pings.any((pending) => _bytesEqual(pending.payload, payload))) {
+        return payload;
+      }
+    }
   }
 
   void _completePing(Uint8List payload) {
@@ -1211,7 +1224,8 @@ class QuicBindingConnection extends BindingConnection {
   ///   connection, ends the wait too, and so does
   ///   [MuxOptions.closeConfirmTimeout] after the `GOAWAY` (none when
   ///   zero); a `PONG` after that is ignored. A `GOAWAY` from the peer
-  ///   alone does not end it: the peer is still there.
+  ///   alone does not end it: the peer is still there. A failed barrier
+  ///   PING also ends the wait, as when too many later PINGs evict it.
   ///
   /// Both run at once, so the barrier normally costs nothing. Calling it
   /// again sends nothing more and waits for the same. Never fails.
@@ -1228,38 +1242,58 @@ class QuicBindingConnection extends BindingConnection {
       _sendControl(MuxControlMessage.goAway(statusForWire(status)));
       _goAwayBarrier = _pingBarrier();
     }
-    return _goAwayWait();
+    return _goingAway ??= _goAwayWait();
   }
 
-  /// A `PING` sent now through [ping]: completes once its `PONG` arrived,
+  /// A `PING` sent now through the ordinary [ping] bookkeeping: completes
+  /// once its `PONG` arrived,
   /// the `PING` failed (at once when the connection is closing, or with
   /// the connection's end), the connection ended, or
   /// [MuxOptions.closeConfirmTimeout] passed. Never fails.
-  Future<void> _pingBarrier() {
-    final answered = Future.any<void>([
-      ping().then<void>((_) {}, onError: (Object _) {}),
-      _done.future.then<void>((_) {}),
-    ]);
-    final bound = options.closeConfirmTimeout;
-    if (bound <= Duration.zero) {
-      return answered;
-    }
-    return answered.timeout(
-      bound,
-      onTimeout: () {
-        _log.fine('$this: no PONG after GOAWAY within $bound, closing');
-      },
+  Future<void> _pingBarrier() async {
+    final pending = _startPing(MuxControlMessage.ping(_nextPingPayload()));
+    // Ordinary ping bookkeeping fails the PING on every connection end.
+    final answered = pending.completer.future.then<void>(
+      (_) {},
+      onError: (Object _) {},
     );
+    final bound = options.closeConfirmTimeout;
+    try {
+      if (bound <= Duration.zero) {
+        await answered;
+      } else {
+        await answered.timeout(
+          bound,
+          onTimeout: () {
+            _log.fine('$this: no PONG after GOAWAY within $bound');
+          },
+        );
+      }
+    } finally {
+      // The drain may still run after the bound. Retire this PING now so
+      // a late PONG is ignored and it consumes no pending-ping slot.
+      if (_pings.remove(pending)) {
+        pending.completer.completeError(
+          SwitchboardException.of(StatusCode.deadlineExceeded),
+        );
+      }
+    }
   }
 
   Future<void> _goAwayWait() async {
+    final elapsed = Stopwatch()..start();
     // Let channel stream listeners register their pending bulk work.
     await Future<void>.delayed(Duration.zero);
+    await _goAwayBarrier;
+    // Work can arrive while the barrier waits, even after an earlier idle
+    // check. Inspect the current drain, with its original deadline.
+    final remaining = options.goAwayGrace - elapsed.elapsed;
     if ((_channels.isNotEmpty || hasDrainHolds || _pendingStreams.isNotEmpty) &&
-        !_closing) {
+        !_closing &&
+        remaining > Duration.zero) {
       final idle = _idle ??= Completer<void>();
       await idle.future.timeout(
-        options.goAwayGrace,
+        remaining,
         onTimeout: () {
           _log.fine(
             '$this: GOAWAY grace expired with ${_channels.length} channels',
@@ -1267,8 +1301,6 @@ class QuicBindingConnection extends BindingConnection {
         },
       );
     }
-    // The barrier ran meanwhile, from the GOAWAY on.
-    await _goAwayBarrier;
     await close();
   }
 
