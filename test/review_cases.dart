@@ -14,8 +14,8 @@ import 'package:switchboard/core.dart';
 import 'package:switchboard_quic/core.dart';
 import 'package:test/test.dart';
 
-import 'fake_provider.dart';
 import 'harness.dart';
+import 'memory_provider.dart';
 
 void reviewCases() {
   group('review regressions', () {
@@ -53,7 +53,7 @@ void reviewCases() {
       'control reset is observed while control reading is throttled',
       () async {
         final (connection, raw) = await bindingAndRaw(
-          rawEnd: const FakeEndConfig(streamWindow: 32),
+          rawEnd: const MemoryQuicEndConfig(streamWindow: 32),
           quicOptions: const QuicBindingOptions(controlOutputMark: 128),
         );
         await raw.sendControl(MuxControlMessage.ping(Uint8List(125)));
@@ -94,7 +94,7 @@ void reviewCases() {
       final channel = connection.open(Uint8List(0));
       final stream = await raw.nextStream();
       await channel.whenWritable;
-      (stream as FakeQuicStream).stopWithoutCode();
+      (stream as MemoryQuicStream).stopWithoutCode();
       await until(() => !channel.canSend);
       await stream.write(
         encodeCloseRecord(Status.of(StatusCode.unknown, 'stopped')),
@@ -109,7 +109,7 @@ void reviewCases() {
     test('no-code STOP_SENDING on control is a protocol error', () async {
       final (connection, raw) = await bindingAndRaw();
       await until(() => connection.peerHello != null);
-      (raw.control! as FakeQuicStream).stopWithoutCode();
+      (raw.control! as MemoryQuicStream).stopWithoutCode();
       expect(
         await connection.done.timeout(limit),
         hasCode(StatusCode.protocolError),
@@ -117,7 +117,7 @@ void reviewCases() {
     });
 
     test('failed exporter is not silently negotiated as unavailable', () async {
-      final (a, _) = FakeQuicSession.pair();
+      final (a, _) = MemoryQuicSession.pair();
       a.exporterFailure = StateError('export failed');
       final connection = await QuicBindingConnection.start(a, options: fast);
       addTearDown(connection.close);
@@ -128,7 +128,7 @@ void reviewCases() {
     });
 
     test('session loss interrupts an exporter still pending', () async {
-      final (a, _) = FakeQuicSession.pair();
+      final (a, _) = MemoryQuicSession.pair();
       a.exporterGate = Completer<void>();
       final starting = QuicBindingConnection.start(a, options: fast);
       await until(() => a.exporterLabels.isNotEmpty);
@@ -252,7 +252,7 @@ void reviewCases() {
     test('peer CLOSE interrupts a write stalled at the window', () async {
       final (connection, raw) = await bindingAndRaw(
         bindingIsInitiator: true,
-        rawEnd: const FakeEndConfig(streamWindow: 100),
+        rawEnd: const MemoryQuicEndConfig(streamWindow: 100),
       );
       final channel = connection.open(Uint8List(0));
       final stream = await raw.nextStream();
@@ -265,7 +265,9 @@ void reviewCases() {
       await stream.finish();
       expect(await channel.done.timeout(limit), hasCode(StatusCode.cancelled));
       await failed;
-      expect((connection.session as FakeQuicSession).streams.last.resets, [0]);
+      expect((connection.session as MemoryQuicSession).streams.last.resets, [
+        0,
+      ]);
     });
 
     test('second HELLO is a protocol error', () async {
@@ -291,7 +293,7 @@ void reviewCases() {
       'a record exactly at the limit makes progress over a small window',
       () async {
         final (a, b) = await connectionPair(
-          acceptorEnd: const FakeEndConfig(streamWindow: 100),
+          acceptorEnd: const MemoryQuicEndConfig(streamWindow: 100),
         );
         final incoming = b.incoming.first;
         final channel = a.open(Uint8List(0));
@@ -309,7 +311,7 @@ void reviewCases() {
 
     for (final initiator in [true, false]) {
       test('missing HELLO is bounded (initiator $initiator)', () async {
-        final (a, b) = FakeQuicSession.pair();
+        final (a, b) = MemoryQuicSession.pair();
         final raw = RawPeer(initiator ? b : a);
         final connection = await QuicBindingConnection.start(
           initiator ? a : b,
@@ -364,7 +366,7 @@ void reviewCases() {
       );
       final verifier = CredentialVerifier();
       await verifier.addIssuer(issuer);
-      final (a, b) = FakeQuicSession.pair();
+      final (a, b) = MemoryQuicSession.pair();
       b.exporterXor = 1;
       final receiver = await QuicBindingConnection.start(
         b,
@@ -391,7 +393,7 @@ void reviewCases() {
       final first = await raw.openRaw([6]);
       // A header byte has arrived; the first OPEN remains incomplete.
       await until(
-        () => (connection.session as FakeQuicSession).announced.length == 2,
+        () => (connection.session as MemoryQuicSession).announced.length == 2,
       );
       final second = await raw.openRaw([6]);
       expect(
@@ -410,7 +412,7 @@ void reviewCases() {
       () async {
         final (connection, _) = await bindingAndRaw(
           bindingIsInitiator: true,
-          rawEnd: const FakeEndConfig(streamWindow: 32),
+          rawEnd: const MemoryQuicEndConfig(streamWindow: 32),
           quicOptions: const QuicBindingOptions(controlOutputMark: 128),
         );
         // Intentionally do not listen to the returned futures.
@@ -429,7 +431,7 @@ void reviewCases() {
       final incoming = connection.incoming.first;
       final stream = await raw.openRaw(encodeOpenRecord(2, []));
       final channel = await incoming;
-      (stream as FakeQuicStream).resetWithoutCode();
+      (stream as MemoryQuicStream).resetWithoutCode();
       expect(await channel.done.timeout(limit), hasCode(StatusCode.unknown));
       expect(connection.isOpen, isTrue);
     });
@@ -441,7 +443,7 @@ void reviewCases() {
         final incoming = b.incoming.first;
         final channel = a.open(Uint8List(0));
         await incoming;
-        (b.session as FakeQuicSession).drainPeer();
+        (b.session as MemoryQuicSession).drainPeer();
         expect(
           await a.peerGoAwayStatus.timeout(limit),
           hasCode(StatusCode.goingAway),
@@ -459,7 +461,7 @@ void reviewCases() {
       'unidirectional streams are refused without losing the connection',
       () async {
         final (a, b) = await connectionPair();
-        final stream = (a.session as FakeQuicSession).openUnidirectional();
+        final stream = (a.session as MemoryQuicSession).openUnidirectional();
         expect(
           await stream.stopped.future.timeout(limit),
           StatusCode.unsupported.code,
@@ -475,7 +477,7 @@ void reviewCases() {
         final channel = connection.open(Uint8List(0));
         await raw.nextStream();
         await channel.whenWritable;
-        final stream = (connection.session as FakeQuicSession).streams.last;
+        final stream = (connection.session as MemoryQuicSession).streams.last;
         final error = StateError('injected $operation failure');
         if (operation == 'write') {
           stream.writeFailure = error;
@@ -498,7 +500,7 @@ void reviewCases() {
       'stream open failure has a channel status, not CONNECTION_LOST',
       () async {
         final (connection, _) = await bindingAndRaw(bindingIsInitiator: true);
-        (connection.session as FakeQuicSession).openFailure =
+        (connection.session as MemoryQuicSession).openFailure =
             const QuicException(QuicExceptionKind.streamLimit, 'limit');
         final channel = connection.open(Uint8List(0));
         expect(
@@ -512,7 +514,7 @@ void reviewCases() {
     test('session loss resolves pending writes and writable waiters', () async {
       final (connection, raw) = await bindingAndRaw(
         bindingIsInitiator: true,
-        rawEnd: const FakeEndConfig(streamWindow: 100),
+        rawEnd: const MemoryQuicEndConfig(streamWindow: 100),
       );
       final channel = connection.open(Uint8List(0));
       await raw.nextStream();
@@ -535,7 +537,7 @@ void reviewCases() {
 
     test('incoming stream source failure ends the session', () async {
       final (connection, _) = await bindingAndRaw();
-      (connection.session as FakeQuicSession).failIncoming(
+      (connection.session as MemoryQuicSession).failIncoming(
         StateError('failed source'),
       );
       expect(

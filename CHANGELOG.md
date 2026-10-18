@@ -64,7 +64,7 @@ Authors:
   binding over the provider too, in JIT and AOT.
 * Fix: a `STOP_SENDING` arriving after the peer's CLOSE record (the peer
   gave up waiting for this side's close in turn) ends the channel at once
-  instead of at this side's own confirmation timeout. The fake provider
+  instead of at this side's own confirmation timeout. The memory provider
   gives a stopped direction no more stream credit, as a QUIC stack.
 * The node-level tests are marked `@TestOn('vm')`.
 * Handshake deadline: `handshakeTimeout` in `QuicClientConfig` and
@@ -103,7 +103,7 @@ Authors:
   to mean none), and rounds a positive one up to whole milliseconds, so
   that it never becomes none; `QuicSwitchboardBinding` throws for a
   negative `idleTimeout` or `keepAlive` when constructed. The provider
-  contract says so of its configurations, and the fake provider checks
+  contract says so of its configurations, and the memory provider checks
   it too.
 * WebTransport over HTTP/3 in the native provider. The shim (ABI 4) has
   an HTTP/3 layer of its own (no HTTP/3 or WebTransport crate): SETTINGS,

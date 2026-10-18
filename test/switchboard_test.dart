@@ -7,7 +7,7 @@ Authors:
   Claude Opus 5.5 <noreply@anthropic.com>
 */
 
-// Switchboard nodes over the QUIC binding, end to end over the fake
+// Switchboard nodes over the QUIC binding, end to end over the memory
 // provider: QuicSwitchboardBinding and QuicSwitchboardListener, Talk with
 // bulk payloads whose streams overtake their parents, whenWritable pacing,
 // identity under the rules of the binding page (a man in the middle
@@ -24,8 +24,8 @@ import 'package:switchboard/switchboard.dart';
 import 'package:switchboard_quic/switchboard_quic.dart';
 import 'package:test/test.dart';
 
-import 'fake_provider.dart';
 import 'harness.dart';
+import 'memory_provider.dart';
 
 final echo = Name('echo');
 final npc = Name('npc');
@@ -78,12 +78,12 @@ Switchboard node({
 
 /// A listener of [server] at `quic://[host]:4433`, closed after the test.
 Future<QuicSwitchboardListener> listen(
-  FakeQuicNetwork network,
+  MemoryQuicNetwork network,
   Switchboard server,
   String host, {
   ChannelPolicy? policy,
   QuicIdentityRules rules = QuicIdentityRules.listener,
-  FakeEndConfig config = const FakeEndConfig(),
+  MemoryQuicEndConfig config = const MemoryQuicEndConfig(),
   bool identifyInReturn = true,
 }) async {
   final listener = await QuicSwitchboardListener.start(
@@ -142,7 +142,7 @@ void main() {
   group('two nodes', () {
     test('Talk request and reply, each channel on a stream of its own, '
         'pooled by endpoint', () async {
-      final network = FakeQuicNetwork();
+      final network = MemoryQuicNetwork();
       final server = node();
       server.registerService(echo, echoService);
       final listener = await listen(network, server, 'echo-1');
@@ -173,7 +173,7 @@ void main() {
       expect(listener.accepted.single.peerHello, isNotNull);
       // Raw QUIC: the session was dialled with the binding's ALPN and the
       // node's windows.
-      final config = (binding.connector as FakeQuicConnector).configs.single;
+      final config = (binding.connector as MemoryQuicConnector).configs.single;
       expect(config.alpn, ['switchboard']);
       expect(config.streamReceiveWindow, fast.initialWindow);
       expect(config.verifyCertificate, isFalse);
@@ -183,7 +183,7 @@ void main() {
         'and arriving out of order', () async {
       // The first channel's stream is slow both ways: the bulk streams
       // opened after it arrive first; the others jitter.
-      final network = FakeQuicNetwork(
+      final network = MemoryQuicNetwork(
         delay: (info, {required fromInitiator}) => Duration(
           milliseconds: info.ordinal == 1 ? 60 : (info.ordinal * 7) % 5,
         ),
@@ -222,7 +222,7 @@ void main() {
     test('many channels at once over jittered streams: beyond the channels a '
         'listener states the pool opens another connection, and a burst '
         'of opens waits for stream credit', () async {
-      final network = FakeQuicNetwork(
+      final network = MemoryQuicNetwork(
         delay: (info, {required fromInitiator}) => Duration(
           microseconds:
               ((info.ordinal * 7919 + (fromInitiator ? 13 : 0)) % 97) * 50,
@@ -234,7 +234,7 @@ void main() {
         network,
         server,
         'many-1',
-        config: const FakeEndConfig(maxStreams: 101),
+        config: const MemoryQuicEndConfig(maxStreams: 101),
       );
       final binding = QuicSwitchboardBinding(network.connector());
       final client = node(bindings: [binding]);
@@ -284,7 +284,7 @@ void main() {
     });
 
     test('whenWritable paces a publisher at the stream window', () async {
-      final network = FakeQuicNetwork();
+      final network = MemoryQuicNetwork();
       final server = node();
       final received = <TalkMessage>[];
       final serving = Completer<StreamSubscription<TalkMessage>>();
@@ -297,7 +297,7 @@ void main() {
         network,
         server,
         'pace-1',
-        config: const FakeEndConfig(streamWindow: 64 * 1024),
+        config: const MemoryQuicEndConfig(streamWindow: 64 * 1024),
       );
       final client = node(
         bindings: [QuicSwitchboardBinding(network.connector())],
@@ -332,7 +332,7 @@ void main() {
 
     test('https endpoints go to the connector, which may not dial them: the '
         'node moves to the next endpoint', () async {
-      final network = FakeQuicNetwork();
+      final network = MemoryQuicNetwork();
       final server = node();
       server.registerService(echo, echoService, instance: 1);
       final listener = await listen(network, server, 'both-1');
@@ -368,7 +368,7 @@ void main() {
     test('a quic endpoint without a port is refused, an unreachable one is '
         'unavailable', () async {
       final client = node(
-        bindings: [QuicSwitchboardBinding(FakeQuicNetwork().connector())],
+        bindings: [QuicSwitchboardBinding(MemoryQuicNetwork().connector())],
       );
       await expectLater(
         client.connect(Uri.parse('quic://nowhere')),
@@ -390,7 +390,7 @@ void main() {
 
     test('a connect that outlasts the dial timeout fails UNAVAILABLE, and '
         'the session it yields later is closed CANCELLED', () async {
-      final network = FakeQuicNetwork();
+      final network = MemoryQuicNetwork();
       final server = node();
       final listener = await listen(network, server, 'slow-1');
       final connector = network.connector()..connectGate = Completer<void>();
@@ -423,7 +423,7 @@ void main() {
 
     test('through a node: its connect timeout bounds the dial, and the late '
         'session is closed CANCELLED', () async {
-      final network = FakeQuicNetwork();
+      final network = MemoryQuicNetwork();
       final server = node();
       server.registerService(echo, echoService);
       final listener = await listen(network, server, 'slow-2');
@@ -461,7 +461,7 @@ void main() {
 
     test('without a dial timeout the connect is not bounded, nor its '
         'handshake', () async {
-      final network = FakeQuicNetwork();
+      final network = MemoryQuicNetwork();
       final server = node();
       final listener = await listen(network, server, 'slow-3');
       final connector = network.connector()..connectGate = Completer<void>();
@@ -481,7 +481,7 @@ void main() {
     test('the stack keep-alive is the binding\'s: a third of the idle '
         'timeout by default, none without one, or as given, whatever the '
         'control PING interval', () async {
-      final network = FakeQuicNetwork();
+      final network = MemoryQuicNetwork();
       Future<QuicClientConfig> dialledWith(
         QuicSwitchboardBinding binding,
         MuxOptions options,
@@ -495,7 +495,7 @@ void main() {
           ),
           throwsCode(StatusCode.unavailable),
         );
-        return (binding.connector as FakeQuicConnector).configs.single;
+        return (binding.connector as MemoryQuicConnector).configs.single;
       }
 
       for (final interval in [
@@ -547,7 +547,7 @@ void main() {
     });
 
     test('a negative idle timeout or keep-alive is an ArgumentError', () {
-      final connector = FakeQuicNetwork().connector();
+      final connector = MemoryQuicNetwork().connector();
       const negative = Duration(microseconds: -1);
       expect(
         () => QuicSwitchboardBinding(connector, idleTimeout: negative),
@@ -563,7 +563,7 @@ void main() {
   group('identity', () {
     test('nodes identify both ways with exporter-bound proofs, and the '
         'scoped policy admits the identified peer', () async {
-      final network = FakeQuicNetwork();
+      final network = MemoryQuicNetwork();
       final server = node(
         verifier: await verifier(),
         credential: await credential('server-1', serverKey),
@@ -609,7 +609,7 @@ void main() {
     test('a channel that overtakes the IDENT on its own stream is held by '
         'the node until the peer identified', () async {
       // The control stream (0) is slow: the channel's stream arrives first.
-      final network = FakeQuicNetwork(
+      final network = MemoryQuicNetwork(
         delay: (info, {required fromInitiator}) =>
             Duration(milliseconds: info.ordinal == 0 ? 60 : 0),
       );
@@ -655,7 +655,7 @@ void main() {
 
     test('an initiator with a credential reaches only an acceptor that '
         'identifies in turn', () async {
-      final network = FakeQuicNetwork();
+      final network = MemoryQuicNetwork();
       // A listener without a credential cannot identify.
       final server = node(verifier: await verifier());
       server.registerService(npc, answer);
@@ -694,7 +694,7 @@ void main() {
 
     test('a node without the exporter cannot identify to a self-signed '
         'listener, and a nonce-bound IDENT is refused', () async {
-      final network = FakeQuicNetwork();
+      final network = MemoryQuicNetwork();
       final server = node(verifier: await verifier());
       server.registerService(npc, answer);
       final listener = await listen(
@@ -706,7 +706,7 @@ void main() {
       // Browser-like: the stack has no exporter. Under the rules the
       // initiator closes at once.
       final browserLike = network.connector(
-        config: const FakeEndConfig(exporter: false),
+        config: const MemoryQuicEndConfig(exporter: false),
       );
       final careful = node(
         bindings: [QuicSwitchboardBinding(browserLike)],
@@ -760,7 +760,7 @@ void main() {
 
     test('a bearer credential goes only to an authenticated end: a pin, '
         'not a self-signed certificate', () async {
-      final network = FakeQuicNetwork();
+      final network = MemoryQuicNetwork();
       final hmac = CredentialIssuer.hmac(Name('k1'), Uint8List(32));
       final bearer = await hmac.issue(
         kind: CredentialKind.node,
@@ -777,7 +777,7 @@ void main() {
         server,
         'bearer-1',
         policy: ChannelPolicies.scoped(),
-        config: FakeEndConfig(certificateHash: hash),
+        config: MemoryQuicEndConfig(certificateHash: hash),
         // The listener's clients pin its certificate.
         rules: QuicIdentityRules.none,
       );
@@ -828,7 +828,7 @@ void main() {
       /// stream by stream, clearing the EXPORTER flags of both HELLOs when
       /// [strip].
       Future<void> mitm(
-        FakeQuicNetwork network,
+        MemoryQuicNetwork network,
         Uri target, {
         required bool strip,
       }) async {
@@ -900,7 +900,7 @@ void main() {
       }
 
       Future<(Switchboard, Uri)> target(
-        FakeQuicNetwork network,
+        MemoryQuicNetwork network,
         String host, {
         QuicIdentityRules rules = QuicIdentityRules.listener,
       }) async {
@@ -921,7 +921,7 @@ void main() {
       }
 
       Future<Switchboard> victim(
-        FakeQuicNetwork network, {
+        MemoryQuicNetwork network, {
         QuicIdentityRules? rules,
       }) async => node(
         bindings: [
@@ -935,7 +935,7 @@ void main() {
 
       test('relaying the HELLOs as they are: the exporters differ, the '
           'identification fails', () async {
-        final network = FakeQuicNetwork();
+        final network = MemoryQuicNetwork();
         final (_, uri) = await target(network, 'real-1');
         await mitm(network, uri, strip: false);
         final client = await victim(network);
@@ -957,7 +957,7 @@ void main() {
 
       test('stripping the EXPORTER flags makes the identification fail, '
           'never succeed', () async {
-        final network = FakeQuicNetwork();
+        final network = MemoryQuicNetwork();
         final (_, uri) = await target(network, 'real-2');
         await mitm(network, uri, strip: true);
         final client = await victim(network);
@@ -972,7 +972,7 @@ void main() {
 
       test('without the rules on either side, stripping the flags relays '
           'the identification: what the rules prevent', () async {
-        final network = FakeQuicNetwork();
+        final network = MemoryQuicNetwork();
         final (_, uri) = await target(
           network,
           'real-3',
@@ -996,7 +996,7 @@ void main() {
   group('the proxy between the frame mux and the binding', () {
     test('a frame mux client through a proxy to a QUIC backend, bulk '
         'payloads included', () async {
-      final network = FakeQuicNetwork(
+      final network = MemoryQuicNetwork(
         delay: (info, {required fromInitiator}) =>
             Duration(milliseconds: info.ordinal == 1 ? 30 : 0),
       );
@@ -1045,7 +1045,7 @@ void main() {
         'forwarded in order', () async {
       // The parent stream is slow: the two bulk streams of the client
       // reach the proxy before their references, the second one first.
-      final network = FakeQuicNetwork(
+      final network = MemoryQuicNetwork(
         delay: (info, {required fromInitiator}) => Duration(
           milliseconds: switch (info.ordinal) {
             1 => 50,
@@ -1105,7 +1105,7 @@ void main() {
   group('the end of a connection', () {
     test('a node closing sends GOAWAY: the peer\'s channels end GOING_AWAY, '
         'and the session closes with code 0', () async {
-      final network = FakeQuicNetwork();
+      final network = MemoryQuicNetwork();
       final server = Switchboard(muxOptions: fast);
       server.registerService(echo, echoService);
       final listener = await listen(
@@ -1137,7 +1137,7 @@ void main() {
 
     test('a GOAWAY with a status reaches the peer, and the session close '
         'carries it with its reason', () async {
-      final network = FakeQuicNetwork();
+      final network = MemoryQuicNetwork();
       final server = node();
       server.registerService(echo, echoService);
       final listener = await listen(
@@ -1165,7 +1165,7 @@ void main() {
     });
 
     test('a lost session ends the channels with CONNECTION_LOST', () async {
-      final network = FakeQuicNetwork();
+      final network = MemoryQuicNetwork();
       final server = node();
       server.registerService(echo, echoService);
       final listener = await listen(

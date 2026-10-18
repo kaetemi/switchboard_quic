@@ -7,8 +7,8 @@ Authors:
   Claude Opus 5.5 <noreply@anthropic.com>
 */
 
-// Helpers of the binding's tests: connection pairs over the fake provider,
-// and a raw peer that writes and reads records by hand.
+// Helpers of the binding's tests: connection pairs over the memory
+// provider, and a raw peer that writes and reads records by hand.
 
 import 'dart:async';
 import 'dart:convert';
@@ -18,7 +18,7 @@ import 'package:switchboard/core.dart';
 import 'package:switchboard_quic/core.dart';
 import 'package:test/test.dart';
 
-import 'fake_provider.dart';
+import 'memory_provider.dart';
 
 const limit = Duration(seconds: 10);
 
@@ -56,20 +56,20 @@ Future<void> until(bool Function() condition, {Duration within = limit}) async {
 Future<void> settle([int ms = 20]) =>
     Future<void>.delayed(Duration(milliseconds: ms));
 
-/// Two connections of the binding over a fake session pair, closed after
+/// Two connections of the binding over a memory session pair, closed after
 /// the test.
 Future<(QuicBindingConnection, QuicBindingConnection)> connectionPair({
   MuxOptions initiator = fast,
   MuxOptions acceptor = fast,
   QuicBindingOptions initiatorQuic = const QuicBindingOptions(),
   QuicBindingOptions acceptorQuic = const QuicBindingOptions(),
-  FakeEndConfig initiatorEnd = const FakeEndConfig(),
-  FakeEndConfig acceptorEnd = const FakeEndConfig(),
-  FakeQuicNetwork? network,
+  MemoryQuicEndConfig initiatorEnd = const MemoryQuicEndConfig(),
+  MemoryQuicEndConfig acceptorEnd = const MemoryQuicEndConfig(),
+  MemoryQuicNetwork? network,
   String? initiatorIdentity,
   String? acceptorIdentity,
 }) async {
-  final (a, b) = FakeQuicSession.pair(
+  final (a, b) = MemoryQuicSession.pair(
     network: network,
     initiator: initiatorEnd,
     acceptor: acceptorEnd,
@@ -92,14 +92,14 @@ Future<(QuicBindingConnection, QuicBindingConnection)> connectionPair({
   return (client, accepted);
 }
 
-/// A peer that speaks the binding by hand, over the other end of a fake
+/// A peer that speaks the binding by hand, over the other end of a memory
 /// session.
 class RawPeer {
   RawPeer(this.session) {
     session.incomingStreams.listen(_incoming.add);
   }
 
-  final FakeQuicSession session;
+  final MemoryQuicSession session;
   // Fed for the session's life.
   // ignore: close_sinks
   final StreamController<QuicStream> _incoming = StreamController();
@@ -222,13 +222,13 @@ Future<(QuicBindingConnection, RawPeer)> bindingAndRaw({
   bool bindingIsInitiator = false,
   MuxOptions options = fast,
   QuicBindingOptions quicOptions = const QuicBindingOptions(),
-  FakeEndConfig bindingEnd = const FakeEndConfig(),
-  FakeEndConfig rawEnd = const FakeEndConfig(),
+  MemoryQuicEndConfig bindingEnd = const MemoryQuicEndConfig(),
+  MemoryQuicEndConfig rawEnd = const MemoryQuicEndConfig(),
   bool rawControl = true,
   QuicHello? rawHello,
   bool isWebTransport = false,
 }) async {
-  final (a, b) = FakeQuicSession.pair(
+  final (a, b) = MemoryQuicSession.pair(
     initiator: bindingIsInitiator ? bindingEnd : rawEnd,
     acceptor: bindingIsInitiator ? rawEnd : bindingEnd,
   );

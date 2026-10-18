@@ -1,5 +1,5 @@
 # `dart test` runs everything on the VM: the binding against the in-memory
-# provider of test/fake_provider.dart (vectors_test, binding_test,
+# provider of test/memory_provider.dart (vectors_test, binding_test,
 # switchboard_test, review_switchboard_test), the native provider over the
 # loopback (native_provider_test), and the binding over the native provider
 # between Switchboard nodes (native_integration_test). The native tests need

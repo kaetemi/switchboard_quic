@@ -10,4 +10,4 @@
 # to the package, where the path dependency ../switchboard finds it; move it
 # forward together with a change that needs a newer core. Lines starting with
 # # are comments; the first other line is the commit.
-3816e6f1397f7719e3e897167332015e6d56c6ba
+6ed87b4ca328ee0dc4258c54e15a53cfee2b731d
