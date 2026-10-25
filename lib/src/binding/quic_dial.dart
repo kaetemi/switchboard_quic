@@ -4,6 +4,7 @@ Microservice Network Architecture
 Copyright (C) 2018-2026  Jan BOON (Kaetemi)
 Authors:
   Jan Boon <jan.boon@kaetemi.be>
+  Claude Fable 5.1 <noreply@anthropic.com>
   Claude Opus 5.5 <noreply@anthropic.com>
 */
 
@@ -138,6 +139,14 @@ Future<QuicBindingConnection> connectQuicBinding(
           ? StatusCode.unimplemented
           : StatusCode.unavailable,
       'cannot reach $endpoint: ${e.message}',
+    );
+  } on SwitchboardException {
+    rethrow;
+  } on Object catch (e) {
+    // Any other failure of the connector, as documented.
+    throw SwitchboardException.of(
+      StatusCode.unavailable,
+      'cannot reach $endpoint: $e',
     );
   }
   final rules =

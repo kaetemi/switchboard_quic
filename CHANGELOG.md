@@ -11,6 +11,13 @@ Authors:
 
 ## 0.1.0-dev.1
 
+* Core pin moved to `91cd86f` (`tool/core_commit.txt`): refused plain
+  messages reported through `forwardMessage` and `SlotGate.serveRequest`,
+  and the in-process test binding; no code change needed, the suites pass
+  against it. `connectQuicBinding` maps a connector failure that is not a
+  `QuicException` or a `SwitchboardException` to `UNAVAILABLE`, as its
+  documentation always said (found by the alignment audit against the
+  TypeScript port, whose dial does).
 * Core pin moved to `3816e6f` (`tool/core_commit.txt`): Talk item windows
   on stream requests and the credit form of `EXTEND`, a wire change in the
   core that this package carries unchanged (Talk frames are opaque to the
